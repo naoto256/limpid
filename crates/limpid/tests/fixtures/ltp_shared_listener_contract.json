@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "peer_cardinality": "repeatable",
+  "listener_group_cases": [
+    "exact_same_bind_coalesces",
+    "duplicate_node_id_rejected",
+    "duplicate_spki_rejected",
+    "overlapping_ipv4_bind_rejected",
+    "overlapping_ipv6_bind_rejected",
+    "distinct_specific_addresses_are_separate",
+    "matching_max_connections_is_shared",
+    "mismatched_max_connections_is_rejected"
+  ],
+  "connection_cases": [
+    "declared_spki_and_matching_hello_dispatches",
+    "unknown_spki_is_rejected",
+    "wrong_hello_node_id_is_rejected",
+    "hello_timeout_releases_group_capacity",
+    "protocol_error_isolated_to_connection"
+  ],
+  "lifecycle_cases": [
+    "group_capacity_is_listener_wide",
+    "bind_failure_aborts_startup_before_partial_service",
+    "shutdown_closes_listener_and_all_connections"
+  ],
+  "e2e": {
+    "binds": 1,
+    "logical_inputs": ["ltp_jump01", "ltp_jump02"],
+    "independent_input_metrics": true,
+    "independent_pipeline_delivery": true
+  }
+}

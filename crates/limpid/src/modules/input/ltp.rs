@@ -1,8 +1,9 @@
 //! Authenticated LTP listener.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -97,37 +98,17 @@ struct PeerRegistry {
     node_by_spki: Arc<HashMap<Vec<u8>, Arc<str>>>,
 }
 
-impl PeerRegistry {
-    fn node_for_certificate(&self, certificate: &[u8]) -> Option<Arc<str>> {
-        self.node_by_spki.get(certificate).cloned()
-    }
-}
-
 pub struct LtpInput {
     name: String,
     bind_addr: String,
     node_id: Arc<str>,
+    node_key: Arc<ValidatedNodeKey>,
     peers: PeerRegistry,
-    acceptor: TlsAcceptor,
     max_hops: usize,
     max_connections: usize,
     metrics: Arc<InputMetrics>,
     ltp_metrics: Arc<LtpMetrics>,
     now: fn() -> crate::time::ClockSample,
-    #[cfg(test)]
-    hello_started: Option<Arc<tokio::sync::Notify>>,
-}
-
-#[derive(Clone)]
-struct ConnectionContext {
-    acceptor: TlsAcceptor,
-    peers: PeerRegistry,
-    node_id: Arc<str>,
-    max_hops: usize,
-    now: fn() -> crate::time::ClockSample,
-    metrics: Arc<InputMetrics>,
-    ltp_metrics: Arc<LtpMetrics>,
-    tx: tokio::sync::mpsc::Sender<Event>,
     #[cfg(test)]
     hello_started: Option<Arc<tokio::sync::Notify>>,
 }
@@ -157,7 +138,6 @@ impl Module for LtpInput {
             .as_ref()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("input '{name}': LTP metrics are unavailable"))?;
-        let acceptor = build_rpk_acceptor(node_key, &peers, Arc::clone(&ltp_metrics))?;
         let bind_addr = props::get_string(properties, "bind")
             .unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_LTP_PORT}"));
         let max_hops = props::get_positive_int(properties, "max_hops")?.unwrap_or(DEFAULT_MAX_HOPS);
@@ -171,8 +151,8 @@ impl Module for LtpInput {
             name: name.to_owned(),
             bind_addr,
             node_id,
+            node_key: Arc::clone(node_key),
             peers,
-            acceptor,
             max_hops: max_hops as usize,
             max_connections: max_connections as usize,
             metrics: InputMetrics::register(&ctx.metrics, name)?,
@@ -184,6 +164,34 @@ impl Module for LtpInput {
     }
 }
 
+#[derive(Clone)]
+struct LogicalInputContext {
+    name: Arc<str>,
+    node_id: Arc<str>,
+    max_hops: usize,
+    now: fn() -> crate::time::ClockSample,
+    metrics: Arc<InputMetrics>,
+    ltp_metrics: Arc<LtpMetrics>,
+    tx: tokio::sync::mpsc::Sender<Event>,
+    #[cfg(test)]
+    hello_started: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[derive(Clone)]
+struct PeerRoute {
+    expected_node_id: Arc<str>,
+    input: LogicalInputContext,
+}
+
+struct SharedListenerGroup {
+    bind_addr: String,
+    member_names: Vec<String>,
+    acceptor: TlsAcceptor,
+    routes: Arc<HashMap<Vec<u8>, PeerRoute>>,
+    max_connections: usize,
+    ltp_metrics: Arc<LtpMetrics>,
+}
+
 impl HasMetrics for LtpInput {
     type Stats = InputMetrics;
 
@@ -192,14 +200,88 @@ impl HasMetrics for LtpInput {
     }
 }
 
-impl LtpInput {
+impl SharedListenerGroup {
+    fn from_members(members: Vec<(LtpInput, tokio::sync::mpsc::Sender<Event>)>) -> Result<Self> {
+        let first = members
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("LTP listener group has no logical inputs"))?;
+        let bind_addr = first.0.bind_addr.clone();
+        let max_connections = first.0.max_connections;
+        let node_key = Arc::clone(&first.0.node_key);
+        let ltp_metrics = Arc::clone(&first.0.ltp_metrics);
+        let mut member_names = Vec::with_capacity(members.len());
+        let mut routes = HashMap::new();
+
+        for (input, tx) in members {
+            if input.bind_addr != bind_addr {
+                bail!("internal error: LTP listener group contains different binds");
+            }
+            if input.max_connections != max_connections {
+                bail!("internal error: LTP listener group contains different limits");
+            }
+            member_names.push(input.name.clone());
+            let logical = LogicalInputContext {
+                name: Arc::<str>::from(input.name),
+                node_id: input.node_id,
+                max_hops: input.max_hops,
+                now: input.now,
+                metrics: input.metrics,
+                ltp_metrics: Arc::clone(&input.ltp_metrics),
+                tx,
+                #[cfg(test)]
+                hello_started: input.hello_started,
+            };
+            for (spki, expected_node_id) in input.peers.node_by_spki.iter() {
+                let route = PeerRoute {
+                    expected_node_id: Arc::clone(expected_node_id),
+                    input: logical.clone(),
+                };
+                if routes.insert(spki.clone(), route).is_some() {
+                    bail!("internal error: duplicate LTP peer public key in listener group");
+                }
+            }
+        }
+        member_names.sort();
+        let peers = PeerRegistry {
+            node_by_spki: Arc::new(
+                routes
+                    .iter()
+                    .map(|(spki, route)| (spki.clone(), Arc::clone(&route.expected_node_id)))
+                    .collect(),
+            ),
+        };
+        let acceptor = build_rpk_acceptor(&node_key, &peers, Arc::clone(&ltp_metrics))?;
+        Ok(Self {
+            bind_addr,
+            member_names,
+            acceptor,
+            routes: Arc::new(routes),
+            max_connections,
+            ltp_metrics,
+        })
+    }
+
+    async fn bind(self) -> Result<(Self, TcpListener)> {
+        let listener = TcpListener::bind(&self.bind_addr).await.with_context(|| {
+            format!(
+                "LTP listener group [{}] failed to bind '{}'",
+                self.member_names.join(", "),
+                self.bind_addr
+            )
+        })?;
+        Ok((self, listener))
+    }
+
     async fn run_on_listener(
         self,
         listener: TcpListener,
-        tx: tokio::sync::mpsc::Sender<Event>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        info!("ltp input '{}' listening on {}", self.name, self.bind_addr);
+        info!(
+            "ltp listener group [{}] listening on {}",
+            self.member_names.join(", "),
+            self.bind_addr
+        );
         let mut connections = Vec::<tokio::task::JoinHandle<()>>::new();
 
         loop {
@@ -218,32 +300,76 @@ impl LtpInput {
                     let (stream, address) = accepted?;
                     connections.retain(|handle| !handle.is_finished());
                     if connections.len() >= self.max_connections {
-                        warn!("ltp input '{}': max connections reached; rejecting {}", self.name, address);
+                        warn!(
+                            "ltp listener group [{}]: max connections reached; rejecting {}",
+                            self.member_names.join(", "),
+                            address
+                        );
                         continue;
                     }
-                    let context = ConnectionContext {
-                        acceptor: self.acceptor.clone(),
-                        peers: self.peers.clone(),
-                        node_id: Arc::clone(&self.node_id),
-                        max_hops: self.max_hops,
-                        now: self.now,
-                        metrics: Arc::clone(&self.metrics),
-                        ltp_metrics: Arc::clone(&self.ltp_metrics),
-                        tx: tx.clone(),
-                        #[cfg(test)]
-                        hello_started: self.hello_started.clone(),
-                    };
-                    let name = self.name.clone();
+                    let acceptor = self.acceptor.clone();
+                    let routes = Arc::clone(&self.routes);
+                    let ltp_metrics = Arc::clone(&self.ltp_metrics);
+                    let names = self.member_names.join(", ");
                     connections.push(tokio::spawn(async move {
-                        let result = handle_connection(stream, address, context).await;
+                        let result = handle_connection(
+                            stream,
+                            address,
+                            acceptor,
+                            routes,
+                            ltp_metrics,
+                        )
+                        .await;
                         if let Err(error) = result {
-                            debug!("ltp input '{}': closing {}: {error:#}", name, address);
+                            debug!("ltp listener group '[{}]': closing {}: {error:#}", names, address);
                         }
                     }));
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Bind every distinct LTP address before spawning any listener task, then run
+/// one listener for each exact bind string. This keeps bind failure fail-closed
+/// and prevents same-address logical inputs from racing each other at startup.
+pub(crate) async fn start_listener_groups(
+    inputs: Vec<(LtpInput, tokio::sync::mpsc::Sender<Event>)>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+    let mut grouped = BTreeMap::<String, Vec<_>>::new();
+    for (input, tx) in inputs {
+        grouped
+            .entry(input.bind_addr.clone())
+            .or_default()
+            .push((input, tx));
+    }
+
+    let mut bound = Vec::with_capacity(grouped.len());
+    for (_, members) in grouped {
+        let group = SharedListenerGroup::from_members(members)?;
+        bound.push(group.bind().await?);
+    }
+
+    Ok(bound
+        .into_iter()
+        .map(|(group, listener)| {
+            let group_names = group.member_names.join(", ");
+            let group_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                report_listener_result(
+                    &group_names,
+                    group.run_on_listener(listener, group_shutdown).await,
+                );
+            })
+        })
+        .collect())
+}
+
+fn report_listener_result(group_names: &str, result: Result<()>) {
+    if let Err(error) = result {
+        warn!("ltp listener group [{}] failed: {error:#}", group_names);
     }
 }
 
@@ -254,8 +380,10 @@ impl Input for LtpInput {
         tx: tokio::sync::mpsc::Sender<Event>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        let listener = TcpListener::bind(&self.bind_addr).await?;
-        self.run_on_listener(listener, tx, shutdown).await
+        let (group, listener) = SharedListenerGroup::from_members(vec![(self, tx)])?
+            .bind()
+            .await?;
+        group.run_on_listener(listener, shutdown).await
     }
 }
 
@@ -429,6 +557,17 @@ async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     metrics: &InputMetrics,
 ) -> Result<Option<RawFrame>> {
+    read_frame_inner(reader, Some(metrics)).await
+}
+
+async fn read_frame_unmetered<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<RawFrame>> {
+    read_frame_inner(reader, None).await
+}
+
+async fn read_frame_inner<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    metrics: Option<&InputMetrics>,
+) -> Result<Option<RawFrame>> {
     let mut prefix = [0u8; FRAME_PREFIX_SIZE];
     match reader.read_exact(&mut prefix[..1]).await {
         Ok(_) => {}
@@ -476,7 +615,9 @@ async fn read_frame<R: AsyncRead + Unpin>(
         if read == 0 {
             bail!("truncated LTP payload");
         }
-        metrics.bytes_received.inc_by(read as u64);
+        if let Some(metrics) = metrics {
+            metrics.bytes_received.inc_by(read as u64);
+        }
         consumed += read;
     }
     Ok(Some(RawFrame {
@@ -488,9 +629,11 @@ async fn read_frame<R: AsyncRead + Unpin>(
 async fn handle_connection(
     stream: TcpStream,
     address: std::net::SocketAddr,
-    context: ConnectionContext,
+    acceptor: TlsAcceptor,
+    routes: Arc<HashMap<Vec<u8>, PeerRoute>>,
+    ltp_metrics: Arc<LtpMetrics>,
 ) -> Result<()> {
-    let mut stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, context.acceptor.accept(stream))
+    let mut stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
         .await
         .context("LTP TLS handshake timed out")??;
     let peer_certificate = stream
@@ -499,32 +642,37 @@ async fn handle_connection(
         .peer_certificates()
         .and_then(|certificates| certificates.first())
         .ok_or_else(|| anyhow::anyhow!("LTP peer did not present a raw public key"))?;
-    let authenticated_node_id = context
-        .peers
-        .node_for_certificate(peer_certificate.as_ref())
+    let route = routes
+        .get(peer_certificate.as_ref())
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("LTP peer raw public key is not declared"))?;
-    let peer_metrics = context
-        .ltp_metrics
-        .peer(&authenticated_node_id)
-        .ok_or_else(|| anyhow::anyhow!("LTP peer metrics were not registered"))?;
 
     #[cfg(test)]
-    if let Some(hello_started) = &context.hello_started {
+    if let Some(hello_started) = &route.input.hello_started {
         hello_started.notify_one();
     }
-    let hello_frame =
-        tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut stream, &context.metrics))
-            .await
-            .context("LTP hello timed out")??
-            .ok_or_else(|| anyhow::anyhow!("LTP peer closed before hello"))?;
+    // The HELLO selects and verifies the logical input, but is not an event
+    // payload and therefore must not contribute to that input's byte counter.
+    let hello_frame = tokio::time::timeout(HELLO_TIMEOUT, read_frame_unmetered(&mut stream))
+        .await
+        .context("LTP hello timed out")??
+        .ok_or_else(|| anyhow::anyhow!("LTP peer closed before hello"))?;
     if !hello_frame.payload.is_empty() {
         bail!("LTP hello payload must be empty");
     }
     let hello = LtpHello::decode(hello_frame.metadata).context("invalid LTP hello metadata")?;
-    if hello.node_id != authenticated_node_id.as_ref() {
-        context.ltp_metrics.rejected_unknown_peer.inc();
-        bail!("LTP hello node_id does not match the authenticated peer key");
+    if hello.node_id != route.expected_node_id.as_ref() {
+        ltp_metrics.rejected_unknown_peer.inc();
+        bail!(
+            "LTP hello node_id does not match the authenticated peer key for input '{}'",
+            route.input.name
+        );
     }
+    let peer_metrics = route
+        .input
+        .ltp_metrics
+        .peer(&route.expected_node_id)
+        .ok_or_else(|| anyhow::anyhow!("LTP peer metrics were not registered"))?;
 
     // PR #200 decision: https://github.com/naoto256/limpid/pull/200#issuecomment-5355435303
     // After mutual-RPK authentication and the bound hello, an idle connection is a valid
@@ -535,18 +683,18 @@ async fn handle_connection(
     // max_connections bounds steady-state resources. An application-level acknowledgement
     // would invalidate this premise and require revisiting the idle-connection policy.
     loop {
-        let frame = match read_frame(&mut stream, &context.metrics).await {
+        let frame = match read_frame(&mut stream, &route.input.metrics).await {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(error) => {
-                context.metrics.events_invalid.inc();
+                route.input.metrics.events_invalid.inc();
                 return Err(error);
             }
         };
         let meta = match LtpMeta::decode(frame.metadata).context("invalid LTP event metadata") {
             Ok(meta) => meta,
             Err(error) => {
-                context.metrics.events_invalid.inc();
+                route.input.metrics.events_invalid.inc();
                 return Err(error);
             }
         };
@@ -554,29 +702,28 @@ async fn handle_connection(
             meta,
             frame.payload,
             address,
-            &context.node_id,
-            context.max_hops,
-            context.now,
+            &route.input.node_id,
+            route.input.max_hops,
+            route.input.now,
             &peer_metrics,
         ) {
             Ok(decision) => decision,
             Err(error) => {
-                context.metrics.events_invalid.inc();
+                route.input.metrics.events_invalid.inc();
                 return Err(error);
             }
         };
         match decision {
             FrameDecision::Forward(event) => {
-                if context.tx.send(event).await.is_err() {
+                if route.input.tx.send(event).await.is_err() {
                     break;
                 }
-                context.metrics.events_received.inc();
+                route.input.metrics.events_received.inc();
             }
             FrameDecision::DropCycle
             | FrameDecision::DropMaxHops
             | FrameDecision::DropMetadataTooLarge => {
-                context.metrics.events_invalid.inc();
-                continue;
+                route.input.metrics.events_invalid.inc();
             }
         }
     }
@@ -657,6 +804,114 @@ pub(crate) fn validate_static_properties(name: &str, properties: &[Property]) ->
         bail!("input '{name}': max_hops must be between 1 and {DEFAULT_MAX_HOPS}");
     }
     Ok(())
+}
+
+struct ListenerSpec {
+    name: String,
+    bind_addr: String,
+    max_connections: u64,
+    peers: PeerRegistry,
+}
+
+/// Validate relationships that are only visible across logical LTP inputs.
+/// Exact bind strings form a listener group; address normalization is
+/// intentionally not used to merge operator declarations.
+pub(crate) fn validate_listener_groups<'a>(
+    inputs: impl Iterator<Item = (&'a str, &'a [Property])>,
+) -> Result<()> {
+    let mut specs = inputs
+        .map(|(name, properties)| {
+            Ok(ListenerSpec {
+                name: name.to_owned(),
+                bind_addr: props::get_string(properties, "bind")
+                    .unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_LTP_PORT}")),
+                max_connections: props::get_positive_int(properties, "max_connections")?
+                    .unwrap_or(DEFAULT_MAX_CONNECTIONS),
+                peers: parse_peers(name, properties)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    specs.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut groups = BTreeMap::<&str, Vec<&ListenerSpec>>::new();
+    for spec in &specs {
+        groups.entry(&spec.bind_addr).or_default().push(spec);
+    }
+    for (bind_addr, members) in groups {
+        let expected_max = members[0].max_connections;
+        let mut node_ids = HashMap::<&str, &str>::new();
+        let mut public_keys = HashMap::<&[u8], &str>::new();
+        for member in members {
+            if member.max_connections != expected_max {
+                bail!(
+                    "LTP listener max_connections mismatch on bind '{bind_addr}' between inputs '{}' and '{}'",
+                    members_for_bind(&specs, bind_addr)[0],
+                    member.name
+                );
+            }
+            for (spki, node_id) in member.peers.node_by_spki.iter() {
+                if let Some(previous) = node_ids.insert(node_id, &member.name) {
+                    bail!(
+                        "duplicate LTP peer node_id in listener group '{bind_addr}': inputs '{previous}' and '{}'",
+                        member.name
+                    );
+                }
+                if let Some(previous) = public_keys.insert(spki, &member.name) {
+                    bail!(
+                        "duplicate LTP peer public key in listener group '{bind_addr}': inputs '{previous}' and '{}'",
+                        member.name
+                    );
+                }
+            }
+        }
+    }
+
+    for (index, left) in specs.iter().enumerate() {
+        for right in &specs[index + 1..] {
+            if left.bind_addr == right.bind_addr {
+                continue;
+            }
+            let (Ok(left_addr), Ok(right_addr)) = (
+                left.bind_addr.parse::<SocketAddr>(),
+                right.bind_addr.parse::<SocketAddr>(),
+            ) else {
+                continue;
+            };
+            if listener_binds_overlap(left_addr, right_addr) {
+                bail!(
+                    "overlapping LTP listener binds '{}' (input '{}') and '{}' (input '{}')",
+                    left.bind_addr,
+                    left.name,
+                    right.bind_addr,
+                    right.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn members_for_bind<'a>(specs: &'a [ListenerSpec], bind_addr: &str) -> Vec<&'a str> {
+    specs
+        .iter()
+        .filter(|spec| spec.bind_addr == bind_addr)
+        .map(|spec| spec.name.as_str())
+        .collect()
+}
+
+fn listener_binds_overlap(left: SocketAddr, right: SocketAddr) -> bool {
+    if left.port() != right.port() {
+        return false;
+    }
+    match (left, right) {
+        (SocketAddr::V4(left), SocketAddr::V4(right)) => {
+            left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified()
+        }
+        (SocketAddr::V6(left), SocketAddr::V6(right)) => {
+            left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified()
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -752,16 +1007,18 @@ mod tests {
         key: [u8; 16],
         payload: &'static [u8],
     ) {
-        let mut client = connect_client(address, identity, server_spki).await;
-        client
-            .write_all(
-                &crate::ltp::encode_hello_frame(&LtpHello {
-                    node_id: "peer-a".to_owned(),
-                })
-                .unwrap(),
-            )
-            .await
-            .unwrap();
+        send_client_event_as(address, identity, server_spki, "peer-a", key, payload).await;
+    }
+
+    async fn send_client_event_as(
+        address: std::net::SocketAddr,
+        identity: &ValidatedNodeKey,
+        server_spki: &[u8],
+        node_id: &str,
+        key: [u8; 16],
+        payload: &'static [u8],
+    ) {
+        let mut client = send_hello_as(address, identity, server_spki, node_id).await;
         client
             .write_all(
                 &crate::ltp::encode_frame(
@@ -794,15 +1051,76 @@ mod tests {
     }
 
     fn test_ltp_metrics(peer: &str) -> Arc<LtpMetrics> {
+        test_ltp_metrics_for(&[peer])
+    }
+
+    fn test_ltp_metrics_for(peers: &[&str]) -> Arc<LtpMetrics> {
         LtpMetrics::register(
             &crate::metrics::Registry::new(),
-            &std::collections::BTreeSet::from([peer.to_owned()]),
+            &peers.iter().map(|peer| (*peer).to_owned()).collect(),
         )
         .unwrap()
     }
 
     fn test_peer_metrics(peer: &str) -> LtpPeerMetrics {
         test_ltp_metrics(peer).peer(peer).unwrap()
+    }
+
+    struct SharedTestContext {
+        bind_addr: String,
+        node_key: Arc<ValidatedNodeKey>,
+        max_connections: usize,
+        ltp_metrics: Arc<LtpMetrics>,
+    }
+
+    fn shared_member(
+        context: &SharedTestContext,
+        name: &str,
+        peer_id: &str,
+        peer_spki: Vec<u8>,
+        hello_started: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        LtpInput,
+        tokio::sync::mpsc::Sender<Event>,
+        tokio::sync::mpsc::Receiver<Event>,
+    ) {
+        let peers = peer_registry(peer_id, peer_spki);
+        let metrics = test_metrics();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let input = LtpInput {
+            name: name.to_owned(),
+            bind_addr: context.bind_addr.clone(),
+            node_id: Arc::<str>::from("self"),
+            node_key: Arc::clone(&context.node_key),
+            peers,
+            max_hops: 16,
+            max_connections: context.max_connections,
+            metrics,
+            ltp_metrics: Arc::clone(&context.ltp_metrics),
+            now: fixed_now,
+            hello_started,
+        };
+        (input, tx, rx)
+    }
+
+    async fn send_hello_as(
+        address: std::net::SocketAddr,
+        identity: &ValidatedNodeKey,
+        server_spki: &[u8],
+        node_id: &str,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        let mut client = connect_client(address, identity, server_spki).await;
+        client
+            .write_all(
+                &crate::ltp::encode_hello_frame(&LtpHello {
+                    node_id: node_id.to_owned(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        client
     }
 
     fn node_id_for_departed_meta_len(target: usize) -> String {
@@ -1182,29 +1500,32 @@ mod tests {
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
         let ltp_metrics = test_ltp_metrics("peer-a");
-        let acceptor =
-            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let metrics = test_metrics();
-        let server_metrics = Arc::clone(&metrics);
+        let input = LtpInput {
+            name: "in".to_owned(),
+            bind_addr: address.to_string(),
+            node_id: Arc::<str>::from("self"),
+            node_key: Arc::new(server_identity),
+            peers,
+            max_hops: 16,
+            max_connections: 1,
+            metrics: Arc::clone(&metrics),
+            ltp_metrics,
+            now: fixed_now,
+            hello_started: None,
+        };
+        let group = SharedListenerGroup::from_members(vec![(input, tx)]).unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer_address) = listener.accept().await.unwrap();
             handle_connection(
                 stream,
                 peer_address,
-                ConnectionContext {
-                    acceptor,
-                    peers,
-                    node_id: Arc::<str>::from("self"),
-                    max_hops: 16,
-                    now: fixed_now,
-                    metrics: server_metrics,
-                    ltp_metrics,
-                    tx,
-                    hello_started: None,
-                },
+                group.acceptor,
+                group.routes,
+                group.ltp_metrics,
             )
             .await
         });
@@ -1273,29 +1594,32 @@ mod tests {
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
         let ltp_metrics = test_ltp_metrics("peer-a");
-        let acceptor =
-            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let metrics = test_metrics();
-        let server_metrics = Arc::clone(&metrics);
+        let input = LtpInput {
+            name: "in".to_owned(),
+            bind_addr: address.to_string(),
+            node_id: Arc::<str>::from("self"),
+            node_key: Arc::new(server_identity),
+            peers,
+            max_hops: 16,
+            max_connections: 1,
+            metrics: Arc::clone(&metrics),
+            ltp_metrics,
+            now: fixed_now,
+            hello_started: None,
+        };
+        let group = SharedListenerGroup::from_members(vec![(input, tx)]).unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer_address) = listener.accept().await.unwrap();
             handle_connection(
                 stream,
                 peer_address,
-                ConnectionContext {
-                    acceptor,
-                    peers,
-                    node_id: Arc::<str>::from("self"),
-                    max_hops: 16,
-                    now: fixed_now,
-                    metrics: server_metrics,
-                    ltp_metrics,
-                    tx,
-                    hello_started: None,
-                },
+                group.acceptor,
+                group.routes,
+                group.ltp_metrics,
             )
             .await
         });
@@ -1353,30 +1677,33 @@ mod tests {
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
         let ltp_metrics = test_ltp_metrics("peer-a");
-        let acceptor =
-            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         let metrics = test_metrics();
-        let server_metrics = Arc::clone(&metrics);
+        let input = LtpInput {
+            name: "in".to_owned(),
+            bind_addr: address.to_string(),
+            node_id: Arc::<str>::from("self"),
+            node_key: Arc::new(server_identity),
+            peers,
+            max_hops: 16,
+            max_connections: 1,
+            metrics: Arc::clone(&metrics),
+            ltp_metrics,
+            now: fixed_now,
+            hello_started: None,
+        };
+        let group = SharedListenerGroup::from_members(vec![(input, tx)]).unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer_address) = listener.accept().await.unwrap();
             handle_connection(
                 stream,
                 peer_address,
-                ConnectionContext {
-                    acceptor,
-                    peers,
-                    node_id: Arc::<str>::from("self"),
-                    max_hops: 16,
-                    now: fixed_now,
-                    metrics: server_metrics,
-                    ltp_metrics,
-                    tx,
-                    hello_started: None,
-                },
+                group.acceptor,
+                group.routes,
+                group.ltp_metrics,
             )
             .await
         });
@@ -1416,8 +1743,6 @@ mod tests {
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
         let ltp_metrics = test_ltp_metrics("peer-a");
-        let acceptor =
-            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let metrics = test_metrics();
@@ -1426,8 +1751,8 @@ mod tests {
             name: "in".to_owned(),
             bind_addr: address.to_string(),
             node_id: Arc::<str>::from("self"),
+            node_key: Arc::new(server_identity),
             peers,
-            acceptor,
             max_hops: 16,
             max_connections: 1,
             metrics,
@@ -1437,7 +1762,8 @@ mod tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let server = tokio::spawn(input.run_on_listener(listener, tx, shutdown_rx));
+        let group = SharedListenerGroup::from_members(vec![(input, tx)]).unwrap();
+        let server = tokio::spawn(group.run_on_listener(listener, shutdown_rx));
 
         let mut stalled = connect_client(address, &client_identity, &server_spki).await;
         hello_started.notified().await;
@@ -1475,29 +1801,32 @@ mod tests {
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
         let ltp_metrics = test_ltp_metrics("peer-a");
-        let acceptor =
-            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let metrics = test_metrics();
-        let server_ltp_metrics = Arc::clone(&ltp_metrics);
+        let input = LtpInput {
+            name: "in".to_owned(),
+            bind_addr: address.to_string(),
+            node_id: Arc::<str>::from("self"),
+            node_key: Arc::new(server_identity),
+            peers,
+            max_hops: 16,
+            max_connections: 1,
+            metrics,
+            ltp_metrics: Arc::clone(&ltp_metrics),
+            now: fixed_now,
+            hello_started: None,
+        };
+        let group = SharedListenerGroup::from_members(vec![(input, tx)]).unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer_address) = listener.accept().await.unwrap();
             handle_connection(
                 stream,
                 peer_address,
-                ConnectionContext {
-                    acceptor,
-                    peers,
-                    node_id: Arc::<str>::from("self"),
-                    max_hops: 16,
-                    now: fixed_now,
-                    metrics,
-                    ltp_metrics: server_ltp_metrics,
-                    tx,
-                    hello_started: None,
-                },
+                group.acceptor,
+                group.routes,
+                group.ltp_metrics,
             )
             .await
         });
@@ -1560,6 +1889,248 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shared_listener_rejects_unknown_spki_before_logical_dispatch() {
+        let (server_identity, server_spki) = generated_identity();
+        let server_identity = Arc::new(server_identity);
+        let (_, declared_spki_a) = generated_identity();
+        let (_, declared_spki_b) = generated_identity();
+        let (unknown_identity, _) = generated_identity();
+        let ltp_metrics = test_ltp_metrics_for(&["peer-a", "peer-b"]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let context = SharedTestContext {
+            bind_addr: address.to_string(),
+            node_key: Arc::clone(&server_identity),
+            max_connections: 2,
+            ltp_metrics: Arc::clone(&ltp_metrics),
+        };
+        let (input_a, tx_a, mut rx_a) =
+            shared_member(&context, "from_a", "peer-a", declared_spki_a, None);
+        let (input_b, tx_b, mut rx_b) =
+            shared_member(&context, "from_b", "peer-b", declared_spki_b, None);
+        let group =
+            SharedListenerGroup::from_members(vec![(input_a, tx_a), (input_b, tx_b)]).unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(group.run_on_listener(listener, shutdown_rx));
+
+        let connector =
+            crate::modules::output::ltp::build_rpk_connector(&unknown_identity, &server_spki)
+                .unwrap();
+        let tcp = TcpStream::connect(address).await.unwrap();
+        let _ = connector
+            .connect("localhost".try_into().unwrap(), tcp)
+            .await;
+        for _ in 0..100 {
+            if ltp_metrics
+                .rejected_unknown_peer
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            ltp_metrics
+                .rejected_unknown_peer
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
+        shutdown_tx.send(true).unwrap();
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn shared_listener_uses_spki_owner_and_isolates_protocol_errors() {
+        let (server_identity, server_spki) = generated_identity();
+        let server_identity = Arc::new(server_identity);
+        let (peer_a, peer_a_spki) = generated_identity();
+        let (peer_b, peer_b_spki) = generated_identity();
+        let ltp_metrics = test_ltp_metrics_for(&["peer-a", "peer-b"]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let context = SharedTestContext {
+            bind_addr: address.to_string(),
+            node_key: Arc::clone(&server_identity),
+            max_connections: 4,
+            ltp_metrics: Arc::clone(&ltp_metrics),
+        };
+        let (input_a, tx_a, mut rx_a) =
+            shared_member(&context, "from_a", "peer-a", peer_a_spki, None);
+        let (input_b, tx_b, mut rx_b) =
+            shared_member(&context, "from_b", "peer-b", peer_b_spki, None);
+        let group =
+            SharedListenerGroup::from_members(vec![(input_a, tx_a), (input_b, tx_b)]).unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(group.run_on_listener(listener, shutdown_rx));
+
+        let mismatched = send_hello_as(address, &peer_a, &server_spki, "peer-b").await;
+        drop(mismatched);
+        for _ in 0..100 {
+            if ltp_metrics
+                .rejected_unknown_peer
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            ltp_metrics
+                .rejected_unknown_peer
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "peer-a's key must not select peer-b's logical input"
+        );
+
+        let mut malformed = send_hello_as(address, &peer_a, &server_spki, "peer-a").await;
+        malformed.write_all(b"BAD!").await.unwrap();
+        malformed.flush().await.unwrap();
+        drop(malformed);
+        send_client_event_as(
+            address,
+            &peer_b,
+            &server_spki,
+            "peer-b",
+            v7_key(8),
+            b"peer-b-survives",
+        )
+        .await;
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .ingress,
+            Bytes::from_static(b"peer-b-survives")
+        );
+        assert!(rx_a.try_recv().is_err());
+        shutdown_tx.send(true).unwrap();
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn shared_listener_capacity_is_group_wide_and_timeout_releases_slot() {
+        let (server_identity, server_spki) = generated_identity();
+        let server_identity = Arc::new(server_identity);
+        let (peer_a, peer_a_spki) = generated_identity();
+        let (peer_b, peer_b_spki) = generated_identity();
+        let ltp_metrics = test_ltp_metrics_for(&["peer-a", "peer-b"]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hello_started = Arc::new(tokio::sync::Notify::new());
+        let context = SharedTestContext {
+            bind_addr: address.to_string(),
+            node_key: Arc::clone(&server_identity),
+            max_connections: 1,
+            ltp_metrics: Arc::clone(&ltp_metrics),
+        };
+        let (input_a, tx_a, _rx_a) = shared_member(
+            &context,
+            "from_a",
+            "peer-a",
+            peer_a_spki,
+            Some(Arc::clone(&hello_started)),
+        );
+        let (input_b, tx_b, mut rx_b) =
+            shared_member(&context, "from_b", "peer-b", peer_b_spki, None);
+        let group =
+            SharedListenerGroup::from_members(vec![(input_a, tx_a), (input_b, tx_b)]).unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(group.run_on_listener(listener, shutdown_rx));
+
+        let mut stalled = connect_client(address, &peer_a, &server_spki).await;
+        hello_started.notified().await;
+        let connector =
+            crate::modules::output::ltp::build_rpk_connector(&peer_b, &server_spki).unwrap();
+        let tcp = TcpStream::connect(address).await.unwrap();
+        assert!(
+            connector
+                .connect("localhost".try_into().unwrap(), tcp)
+                .await
+                .is_err(),
+            "the second member must share the first member's connection cap"
+        );
+
+        let mut closed_probe = [0u8; 1];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stalled.read(&mut closed_probe),
+        )
+        .await
+        .expect("HELLO timeout must close the stalled group connection");
+        send_client_event_as(
+            address,
+            &peer_b,
+            &server_spki,
+            "peer-b",
+            v7_key(10),
+            b"released-group-slot",
+        )
+        .await;
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .ingress,
+            Bytes::from_static(b"released-group-slot")
+        );
+        shutdown_tx.send(true).unwrap();
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn shared_listener_bind_failure_names_members_and_shutdown_closes_connections() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = occupied.local_addr().unwrap();
+        let (server_identity, server_spki) = generated_identity();
+        let server_identity = Arc::new(server_identity);
+        let (peer_a, peer_a_spki) = generated_identity();
+        let (_, peer_b_spki) = generated_identity();
+        let ltp_metrics = test_ltp_metrics_for(&["peer-a", "peer-b"]);
+        let context = SharedTestContext {
+            bind_addr: address.to_string(),
+            node_key: Arc::clone(&server_identity),
+            max_connections: 2,
+            ltp_metrics: Arc::clone(&ltp_metrics),
+        };
+        let (input_a, tx_a, _rx_a) =
+            shared_member(&context, "from_a", "peer-a", peer_a_spki.clone(), None);
+        let (input_b, tx_b, _rx_b) =
+            shared_member(&context, "from_b", "peer-b", peer_b_spki.clone(), None);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let error = start_listener_groups(vec![(input_a, tx_a), (input_b, tx_b)], shutdown_rx)
+            .await
+            .expect_err("occupied group bind must fail before spawning");
+        let error = format!("{error:#}");
+        assert!(error.contains("from_a"));
+        assert!(error.contains("from_b"));
+        drop(occupied);
+
+        let listener = TcpListener::bind(address).await.unwrap();
+        let (input_a, tx_a, _rx_a) = shared_member(&context, "from_a", "peer-a", peer_a_spki, None);
+        let (input_b, tx_b, _rx_b) = shared_member(&context, "from_b", "peer-b", peer_b_spki, None);
+        let group =
+            SharedListenerGroup::from_members(vec![(input_a, tx_a), (input_b, tx_b)]).unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(group.run_on_listener(listener, shutdown_rx));
+        let _stalled = connect_client(address, &peer_a, &server_spki).await;
+        shutdown_tx.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+        assert!(TcpStream::connect(address).await.is_err());
+    }
+
     #[test]
     fn non_rpk_and_intermediate_certificate_failures_do_not_count_unknown_peers() {
         let (_, declared_spki) = generated_identity();
@@ -1600,12 +2171,24 @@ mod tests {
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
         let ltp_metrics = test_ltp_metrics("peer-a");
-        let acceptor =
-            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let metrics = test_metrics();
+        let input = LtpInput {
+            name: "in".to_owned(),
+            bind_addr: address.to_string(),
+            node_id: Arc::<str>::from("self"),
+            node_key: Arc::new(server_identity),
+            peers,
+            max_hops: 16,
+            max_connections: 2,
+            metrics,
+            ltp_metrics,
+            now: fixed_now,
+            hello_started: None,
+        };
+        let group = SharedListenerGroup::from_members(vec![(input, tx)]).unwrap();
         let server = tokio::spawn(async move {
             let mut connections = Vec::new();
             for _ in 0..2 {
@@ -1613,17 +2196,9 @@ mod tests {
                 connections.push(tokio::spawn(handle_connection(
                     stream,
                     peer_address,
-                    ConnectionContext {
-                        acceptor: acceptor.clone(),
-                        peers: peers.clone(),
-                        node_id: Arc::<str>::from("self"),
-                        max_hops: 16,
-                        now: fixed_now,
-                        metrics: Arc::clone(&metrics),
-                        ltp_metrics: Arc::clone(&ltp_metrics),
-                        tx: tx.clone(),
-                        hello_started: None,
-                    },
+                    group.acceptor.clone(),
+                    Arc::clone(&group.routes),
+                    Arc::clone(&group.ltp_metrics),
                 )));
             }
             let first = connections.remove(0).await.unwrap();
@@ -1666,15 +2241,13 @@ mod tests {
         let (_, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
         let ltp_metrics = test_ltp_metrics("peer-a");
-        let acceptor =
-            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let context = crate::modules::BuildContext::for_testing();
         let input = LtpInput {
             name: "in".to_owned(),
             bind_addr: "127.0.0.1:0".to_owned(),
             node_id: Arc::<str>::from("self"),
+            node_key: Arc::new(server_identity),
             peers,
-            acceptor,
             max_hops: 16,
             max_connections: 2,
             metrics: InputMetrics::register(&context.metrics, "in").unwrap(),
@@ -1692,5 +2265,16 @@ mod tests {
             .expect("listener must stop on shutdown")
             .unwrap();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn listener_task_error_does_not_broadcast_daemon_shutdown() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        report_listener_result("in", Err(anyhow::anyhow!("deterministic listener failure")));
+
+        assert!(!*shutdown_tx.borrow());
+        assert!(!*shutdown_rx.borrow_and_update());
+        assert!(!shutdown_rx.has_changed().unwrap());
     }
 }
