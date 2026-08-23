@@ -838,14 +838,16 @@ pub(crate) fn validate_listener_groups<'a>(
         groups.entry(&spec.bind_addr).or_default().push(spec);
     }
     for (bind_addr, members) in groups {
-        let expected_max = members[0].max_connections;
+        let first_member = members[0];
+        let expected_max = first_member.max_connections;
+        let first_member_name = first_member.name.as_str();
         let mut node_ids = HashMap::<&str, &str>::new();
         let mut public_keys = HashMap::<&[u8], &str>::new();
         for member in members {
             if member.max_connections != expected_max {
                 bail!(
                     "LTP listener max_connections mismatch on bind '{bind_addr}' between inputs '{}' and '{}'",
-                    members_for_bind(&specs, bind_addr)[0],
+                    first_member_name,
                     member.name
                 );
             }
@@ -889,14 +891,6 @@ pub(crate) fn validate_listener_groups<'a>(
         }
     }
     Ok(())
-}
-
-fn members_for_bind<'a>(specs: &'a [ListenerSpec], bind_addr: &str) -> Vec<&'a str> {
-    specs
-        .iter()
-        .filter(|spec| spec.bind_addr == bind_addr)
-        .map(|spec| spec.name.as_str())
-        .collect()
 }
 
 fn listener_binds_overlap(left: SocketAddr, right: SocketAddr) -> bool {
