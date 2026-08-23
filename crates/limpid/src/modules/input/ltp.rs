@@ -526,6 +526,14 @@ async fn handle_connection(
         bail!("LTP hello node_id does not match the authenticated peer key");
     }
 
+    // PR #200 decision: https://github.com/naoto256/limpid/pull/200#issuecomment-5355435303
+    // After mutual-RPK authentication and the bound hello, an idle connection is a valid
+    // persistent steady state. LTP has no application-level acknowledgement, so the output
+    // caches this TLS stream and treats local write/flush success as delivery. If the server
+    // closes an idle connection, the next local write can still be reported delivered while
+    // its event is silently lost. HELLO_TIMEOUT therefore bounds only pre-protocol state;
+    // max_connections bounds steady-state resources. An application-level acknowledgement
+    // would invalidate this premise and require revisiting the idle-connection policy.
     loop {
         let frame = match read_frame(&mut stream, &context.metrics).await {
             Ok(Some(frame)) => frame,
