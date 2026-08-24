@@ -20,6 +20,13 @@ use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
 
+async fn shutdown_change_is_terminal(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    match shutdown.changed().await {
+        Ok(()) => *shutdown.borrow(),
+        Err(_) => true,
+    }
+}
+
 const UNIX_SOURCE: &str = "127.0.0.1:0";
 
 /// True when the parent dir's mode lets an outside-the-owner
@@ -353,6 +360,8 @@ impl Input for UnixSocketInput {
             }
         }
 
+        crate::modules::input_startup_ready();
+
         let source_addr = UNIX_SOURCE.parse().unwrap();
         let mut buf = vec![0u8; 65536];
 
@@ -360,8 +369,8 @@ impl Input for UnixSocketInput {
             tokio::select! {
                 biased;
 
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                terminal = shutdown_change_is_terminal(&mut shutdown) => {
+                    if terminal {
                         info!("unix_socket {}: shutting down", self.path);
                         #[cfg(unix)]
                         {
@@ -873,6 +882,36 @@ mod tests {
             post_meta.ino(),
             swapped_meta.ino(),
             "swapped inode must not have been unlinked by shutdown",
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_shutdown_watch_is_terminal_for_unix_socket_loop() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                shutdown_change_is_terminal(&mut receiver),
+            )
+            .await
+            .expect("closed watch must resolve without spinning")
+        );
+        let marker = ["shutdown_change_is_terminal", "(&mut shutdown)"].concat();
+        assert!(include_str!("unix_socket.rs").contains(&marker));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("closed-watch.sock");
+        let (handle, shutdown, _events) = spawn_with_path(&path);
+        drop(shutdown);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("actual Unix socket loop must terminate on a closed watch")
+            .expect("Unix socket task must join")
+            .expect("Unix socket loop must exit cleanly");
+        assert!(
+            !path.exists(),
+            "closed-watch cleanup must unlink owned socket"
         );
     }
 }

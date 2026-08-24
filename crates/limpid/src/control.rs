@@ -57,6 +57,13 @@ const MAX_CONTROL_CONNECTIONS: usize = 8;
 /// pressure.
 const MAX_INJECT_BYTES: u64 = 16 * 1024 * 1024;
 
+async fn shutdown_change_is_terminal(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    match shutdown.changed().await {
+        Ok(()) => *shutdown.borrow(),
+        Err(_) => true,
+    }
+}
+
 /// Per-input inject target: event channel + metrics handle (for events_injected).
 pub type InputInjectTarget = (mpsc::Sender<Event>, Arc<crate::metrics::InputMetrics>);
 
@@ -443,7 +450,11 @@ impl ControlServer {
         }
     }
 
-    pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    pub async fn run(
+        self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        mut startup: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
+    ) {
         // Parent directory has already been validated and (when absent)
         // created at 0o750 under a trusted ancestor by
         // `validate_control_socket_parent`, called from `Runtime::start`
@@ -467,10 +478,15 @@ impl ControlServer {
                 Ok(meta) => {
                     let ft = meta.file_type();
                     if ft.is_symlink() {
+                        let diagnostic = format!(
+                            "control socket: {:?} is a symlink — refusing to remove",
+                            self.socket_path
+                        );
                         error!(
                             "control socket: {:?} is a symlink — refusing to remove",
                             self.socket_path
                         );
+                        send_control_startup(&mut startup, Err(diagnostic));
                         return;
                     }
                     if !ft.is_socket() {
@@ -494,17 +510,68 @@ impl ControlServer {
                              is correct.",
                             self.socket_path, shape
                         );
+                        send_control_startup(
+                            &mut startup,
+                            Err(format!(
+                                "control socket: {:?} is a {shape}; refusing to remove",
+                                self.socket_path
+                            )),
+                        );
                         return;
                     }
-                    // Actual stale socket — safe to unlink.
-                    let _ = std::fs::remove_file(&self.socket_path);
+                    // Do not steal a live daemon's control path. A successful
+                    // stream connection proves an active owner; only the
+                    // connection-refused/not-found stale shapes may be
+                    // unlinked under the already-validated parent boundary.
+                    match std::os::unix::net::UnixStream::connect(&self.socket_path) {
+                        Ok(stream) => {
+                            drop(stream);
+                            let diagnostic = format!(
+                                "control socket: {:?} is already owned by an active listener",
+                                self.socket_path
+                            );
+                            error!("{diagnostic}");
+                            send_control_startup(&mut startup, Err(diagnostic));
+                            return;
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionRefused
+                                    | std::io::ErrorKind::NotFound
+                            ) =>
+                        {
+                            if let Err(error) = std::fs::remove_file(&self.socket_path) {
+                                let diagnostic = format!(
+                                    "control socket: failed to remove stale socket {:?}: {error}",
+                                    self.socket_path
+                                );
+                                error!("{diagnostic}");
+                                send_control_startup(&mut startup, Err(diagnostic));
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let diagnostic = format!(
+                                "control socket: cannot prove existing socket {:?} is stale: {error}",
+                                self.socket_path
+                            );
+                            error!("{diagnostic}");
+                            send_control_startup(&mut startup, Err(diagnostic));
+                            return;
+                        }
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // No node at the path — `bind(2)` will create it
                     // fresh.
                 }
                 Err(e) => {
-                    warn!("control socket: cannot stat {:?}: {}", self.socket_path, e);
+                    let diagnostic =
+                        format!("control socket: cannot stat {:?}: {e}", self.socket_path);
+                    error!("{diagnostic}");
+                    send_control_startup(&mut startup, Err(diagnostic));
+                    return;
                 }
             }
         }
@@ -512,10 +579,13 @@ impl ControlServer {
         let listener = match UnixListener::bind(&self.socket_path) {
             Ok(l) => l,
             Err(e) => {
+                let diagnostic =
+                    format!("control socket: failed to bind {:?}: {e}", self.socket_path);
                 error!(
                     "control socket: failed to bind {:?}: {}",
                     self.socket_path, e
                 );
+                send_control_startup(&mut startup, Err(diagnostic));
                 return;
             }
         };
@@ -584,13 +654,9 @@ impl ControlServer {
         //   3. return without entering the accept loop so no client
         //      connects to a mis-moded socket.
         //
-        // The daemon as a whole remains up (control is a fire-and-
-        // forget task and cannot abort daemon startup from here);
-        // operator response is `journalctl -u limpid | grep chmod`
-        // + reconfigure and restart. That is a narrowing over the
-        // previous warn-and-continue shape, which let the daemon
-        // appear healthy while the control socket carried the
-        // wrong mode.
+        // The startup readiness channel makes this fatal to the daemon
+        // transaction as well as to the control task: Runtime::start rolls
+        // back every earlier owner and returns the chmod error.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -628,9 +694,18 @@ impl ControlServer {
                         ),
                     }
                 }
+                send_control_startup(
+                    &mut startup,
+                    Err(format!(
+                        "control socket: chmod 0o660 failed on {:?}: {e}",
+                        self.socket_path
+                    )),
+                );
                 return;
             }
         }
+
+        send_control_startup(&mut startup, Ok(()));
 
         info!("control socket listening on {:?}", self.socket_path);
 
@@ -650,8 +725,8 @@ impl ControlServer {
             tokio::select! {
                 biased;
 
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                terminal = shutdown_change_is_terminal(&mut shutdown) => {
+                    if terminal {
                         info!("control socket: shutting down");
                         for h in &conn_handles {
                             h.abort();
@@ -745,6 +820,15 @@ impl ControlServer {
         {
             let _ = std::fs::remove_file(&self.socket_path);
         }
+    }
+}
+
+fn send_control_startup(
+    startup: &mut Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
+    result: std::result::Result<(), String>,
+) {
+    if let Some(sender) = startup.take() {
+        let _ = sender.send(result);
     }
 }
 
@@ -1280,7 +1364,7 @@ def pipeline p { input i; output o }
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(server.run(shutdown_rx));
+        tokio::spawn(server.run(shutdown_rx, None));
 
         // Poll for the socket file to appear instead of a fixed sleep —
         // bind happens early in `run` but is still async relative to
@@ -1734,7 +1818,7 @@ mod tests {
         // fn signature and stop at the module-scope closer that
         // follows the `impl ControlServer` block.
         let run_start = src
-            .find("pub async fn run(self")
+            .find("pub async fn run(\n        self,")
             .expect("ControlServer::run must exist");
         // The body is not enormous; take a generous slice.
         let slice_end = (run_start + 20_000).min(src.len());
@@ -1755,6 +1839,50 @@ mod tests {
             body.contains("(bound_dev, bound_ino)"),
             "chmod-failure cleanup must be gated by a bound (dev, ino) match so a swapped \
              entry is not blindly unlinked"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_shutdown_watch_is_terminal_for_control_accept_loop() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                shutdown_change_is_terminal(&mut receiver),
+            )
+            .await
+            .expect("closed watch must resolve without spinning")
+        );
+        let marker = ["shutdown_change_is_terminal", "(&mut shutdown)"].concat();
+        assert!(include_str!("control.rs").contains(&marker));
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("closed-watch.sock");
+        let config = CompiledConfig::from_config(
+            crate::dsl::parser::parse_config("").expect("empty config parses"),
+        )
+        .expect("empty config compiles");
+        let server = ControlServer::new(
+            Some(socket.to_string_lossy().into_owned()),
+            TapRegistry::new(),
+            Arc::new(crate::metrics::Registry::new()),
+            Arc::new(config),
+            HashMap::new(),
+            Arc::new(HashMap::new()),
+            Instant::now(),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        drop(shutdown_tx);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.run(shutdown_rx, None),
+        )
+        .await
+        .expect("actual control accept loop must terminate on a closed watch");
+        assert!(
+            !socket.exists(),
+            "control cleanup must unlink the owned socket"
         );
     }
 }
