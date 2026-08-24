@@ -113,6 +113,13 @@ the hello `node_id` must match the identity assigned to the presented public
 key. Protocol errors close that connection; subsequent valid connections are
 independent.
 
+After a valid hello, Limpid permits at most two established connections for
+each authenticated public key. The first two coexist; a valid third connection
+evicts the oldest established connection for that key. A candidate that fails
+TLS authentication, sends an invalid hello, or times out before completing the
+hello does not affect either established connection. Established frame reads
+retain the existing no-completion-timeout policy.
+
 ## Send to one peer
 
 An LTP output is unbatched and declares exactly one destination:
