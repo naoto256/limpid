@@ -27,6 +27,13 @@ use crate::event::{AckHandle, AckPosition, Event};
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
 
+async fn shutdown_change_is_terminal(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    match shutdown.changed().await {
+        Ok(()) => *shutdown.borrow(),
+        Err(_) => true,
+    }
+}
+
 const TAIL_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "path",
@@ -128,6 +135,7 @@ impl Input for TailInput {
         let mut read_offset = self.initial_offset().await;
         let mut acked_offset = read_offset;
         let mut last_inode = get_inode(&self.path);
+        crate::modules::input_startup_ready();
 
         // Generation namespace for `AckPosition::Offset`. Bumps on every
         // rotation / truncation so that late acks still travelling inside
@@ -150,8 +158,8 @@ impl Input for TailInput {
             // Check for shutdown
             tokio::select! {
                 biased;
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                terminal = shutdown_change_is_terminal(&mut shutdown) => {
+                    if terminal {
                         info!("tail {}: shutting down", self.path.display());
                         // Drain any in-flight acks before the final save so
                         // events that finished between the last periodic
@@ -1044,5 +1052,33 @@ mod tests {
         // would be flaky. Accept either outcome as "valid system
         // behaviour" but pin that get_inode returns Some on both.
         let _ = (ino1, ino2);
+    }
+
+    #[tokio::test]
+    async fn closed_shutdown_watch_is_terminal_for_tail_loop() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                shutdown_change_is_terminal(&mut receiver),
+            )
+            .await
+            .expect("closed watch must resolve without spinning")
+        );
+        let marker = ["shutdown_change_is_terminal", "(&mut shutdown)"].concat();
+        assert!(include_str!("tail.rs").contains(&marker));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("closed-watch.log");
+        std::fs::write(&path, b"queued-before-close\n").unwrap();
+        let input = make_input(&path, None);
+        let (event_tx, _events) = tokio::sync::mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        drop(shutdown_tx);
+        tokio::time::timeout(Duration::from_secs(2), input.run(event_tx, shutdown_rx))
+            .await
+            .expect("actual tail loop must terminate on a closed watch")
+            .expect("tail loop must exit cleanly");
     }
 }

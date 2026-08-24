@@ -1210,6 +1210,30 @@ pub async fn route_event_to_dlq(
 pub struct CreatedInput {
     pub handle: tokio::task::JoinHandle<()>,
     pub metrics: Arc<InputMetrics>,
+    pub(crate) startup: tokio::sync::oneshot::Receiver<Result<()>>,
+}
+
+tokio::task_local! {
+    static INPUT_STARTUP_SIGNAL: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<Result<()>>>>;
+}
+
+/// Complete the private startup handshake after an input has acquired the
+/// resource its run loop owns. This deliberately stays below the public
+/// `Input` trait: it is only the built-in registry/runtime transaction seam.
+pub(crate) fn input_startup_ready() {
+    let _ = INPUT_STARTUP_SIGNAL.try_with(|slot| {
+        if let Some(sender) = slot.borrow_mut().take() {
+            let _ = sender.send(Ok(()));
+        }
+    });
+}
+
+fn input_startup_failed(error: anyhow::Error) {
+    let _ = INPUT_STARTUP_SIGNAL.try_with(|slot| {
+        if let Some(sender) = slot.borrow_mut().take() {
+            let _ = sender.send(Err(error));
+        }
+    });
 }
 
 /// Returned by output factory: the constructed sink + metrics handle.
@@ -1458,12 +1482,29 @@ where
             let input = T::from_properties(name, properties, ctx)?;
             let metrics = HasMetrics::metrics(&input);
             let input_name = name.to_string();
+            let (startup_tx, startup) = tokio::sync::oneshot::channel();
             let handle = tokio::spawn(async move {
-                if let Err(e) = Input::run(input, tx, shutdown).await {
-                    tracing::error!("input '{}' failed: {}", input_name, e);
-                }
+                INPUT_STARTUP_SIGNAL
+                    .scope(std::cell::RefCell::new(Some(startup_tx)), async move {
+                        match Input::run(input, tx, shutdown).await {
+                            Ok(()) => input_startup_failed(anyhow::anyhow!(
+                                "input '{}' exited before reporting startup readiness",
+                                input_name
+                            )),
+                            Err(error) => {
+                                let diagnostic = format!("{error:#}");
+                                input_startup_failed(error);
+                                tracing::error!("input '{}' failed: {}", input_name, diagnostic);
+                            }
+                        }
+                    })
+                    .await;
             });
-            Ok(CreatedInput { handle, metrics })
+            Ok(CreatedInput {
+                handle,
+                metrics,
+                startup,
+            })
         },
     );
 }

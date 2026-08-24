@@ -44,7 +44,7 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::info;
 
 use super::split_request;
 use crate::dsl::props;
@@ -159,15 +159,16 @@ impl Input for OtlpGrpcInput {
                 .tls_config(tls)
                 .context("otlp_grpc: failed to install server TLS config")?;
         }
+        let incoming = tonic::transport::server::TcpIncoming::bind(addr)
+            .with_context(|| format!("otlp_grpc: failed to bind {addr}"))?;
+        crate::modules::input_startup_ready();
         let server = builder
             .add_service(LogsServiceServer::new(svc))
-            .serve_with_shutdown(addr, async move {
+            .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown.changed().await;
             });
 
-        if let Err(e) = server.await {
-            warn!("otlp_grpc server error: {}", e);
-        }
+        server.await.context("otlp_grpc server failed")?;
         info!("otlp_grpc: shutting down");
         Ok(())
     }

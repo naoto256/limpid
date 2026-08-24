@@ -38,6 +38,13 @@ use std::time::Duration;
 
 use super::journal_sys::Journal;
 use anyhow::Result;
+
+async fn shutdown_change_is_terminal(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    match shutdown.changed().await {
+        Ok(()) => *shutdown.borrow(),
+        Err(_) => true,
+    }
+}
 use bytes::Bytes;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::{error, info, warn};
@@ -186,6 +193,7 @@ impl Input for JournalInput {
         // which may never arrive on a quiet system.
         let reader_shutdown = Arc::new(AtomicBool::new(false));
         let reader_shutdown_for_thread = Arc::clone(&reader_shutdown);
+        let (reader_startup_tx, reader_startup_rx) = tokio::sync::oneshot::channel();
 
         let journal_handle = tokio::task::spawn_blocking(move || {
             run_journal_reader(
@@ -194,8 +202,23 @@ impl Input for JournalInput {
                 poll_interval,
                 entry_tx,
                 reader_shutdown_for_thread,
+                reader_startup_tx,
             )
         });
+
+        match reader_startup_rx.await {
+            Ok(Ok(())) => crate::modules::input_startup_ready(),
+            Ok(Err(error)) => {
+                reader_shutdown.store(true, Ordering::Relaxed);
+                let _ = journal_handle.await;
+                anyhow::bail!(error);
+            }
+            Err(_) => {
+                reader_shutdown.store(true, Ordering::Relaxed);
+                let _ = journal_handle.await;
+                anyhow::bail!("journal reader exited before startup readiness");
+            }
+        }
 
         // Ack channel: pipeline workers drop the per-event AckHandle on
         // completion, which sends the carried journald cursor back here.
@@ -211,21 +234,14 @@ impl Input for JournalInput {
             tokio::select! {
                 biased;
 
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                terminal = shutdown_change_is_terminal(&mut shutdown) => {
+                    if terminal {
                         info!("journal: shutting down");
-                        // Tell the blocking reader to exit; `abort()`
-                        // alone would not (the reader is already
-                        // running on a blocking thread).
+                        // Tell the blocking reader to exit. Its handle
+                        // is awaited below before this input actor can
+                        // finish, so the runtime's MustJoin ownership
+                        // includes the actual reader thread.
                         reader_shutdown.store(true, Ordering::Relaxed);
-                        journal_handle.abort();
-                        // Drain in-flight acks one last time so the
-                        // most-recent processed cursor lands on disk.
-                        if let Some(last) = drain_cursor_acks(&mut ack_rx)
-                            && let Some(ref sf) = self.state_file
-                        {
-                            save_cursor(sf, &last);
-                        }
                         break;
                     }
                 }
@@ -276,6 +292,25 @@ impl Input for JournalInput {
                     }
                 }
             }
+        }
+
+        // Every exit path (watch closure, downstream closure, reader
+        // completion, or explicit shutdown) cooperatively stops and
+        // joins the blocking reader. Dropping a spawn_blocking handle
+        // would detach it, and aborting a running blocking task is a
+        // no-op, so neither is an acceptable resource disposition.
+        reader_shutdown.store(true, Ordering::Relaxed);
+        match journal_handle.await {
+            Ok(()) => {}
+            Err(error) => error!("journal reader task failed: {error}"),
+        }
+
+        // Drain in-flight acks after the reader is fully stopped so the
+        // most-recent processed cursor lands on disk exactly once.
+        if let Some(last) = drain_cursor_acks(&mut ack_rx)
+            && let Some(ref sf) = self.state_file
+        {
+            save_cursor(sf, &last);
         }
 
         Ok(())
@@ -402,11 +437,17 @@ fn run_journal_reader(
     poll_interval: Duration,
     tx: tokio::sync::mpsc::Sender<(Vec<u8>, String)>,
     shutdown: Arc<AtomicBool>,
+    startup: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 ) {
+    let mut startup = Some(startup);
     let mut journal = match Journal::open() {
         Ok(j) => j,
         Err(e) => {
             error!("journal: failed to open: {}", e);
+            let _ = startup
+                .take()
+                .expect("journal startup sender")
+                .send(Err(format!("journal: failed to open: {e}")));
             return;
         }
     };
@@ -431,6 +472,12 @@ fn run_journal_reader(
                  load time; reader terminating",
                 m
             );
+            let _ = startup
+                .take()
+                .expect("journal startup sender")
+                .send(Err(format!(
+                    "journal input: match '{m}' has no '=' separator"
+                )));
             return;
         };
         if let Err(e) = journal.match_add(key, val) {
@@ -448,6 +495,9 @@ fn run_journal_reader(
              terminating (semantics: no journal entry can satisfy the specified configuration, \
              so zero events is the correct output — fix the offending filter(s) and restart)"
         );
+        let _ = startup.take().expect("journal startup sender").send(Err(
+            "journal input: one or more match filters were rejected by libsystemd".to_string(),
+        ));
         return;
     }
 
@@ -479,6 +529,8 @@ fn run_journal_reader(
     } else {
         anchor_at_tail_or_head(&mut journal);
     }
+
+    let _ = startup.take().expect("journal startup sender").send(Ok(()));
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -898,5 +950,44 @@ def pipeline p { input j; output o }
             "should not over-sleep wildly; took {:?}",
             elapsed
         );
+    }
+
+    #[tokio::test]
+    async fn closed_shutdown_watch_is_terminal_for_journal_loop() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                shutdown_change_is_terminal(&mut receiver),
+            )
+            .await
+            .expect("closed watch must resolve without spinning")
+        );
+        let marker = ["shutdown_change_is_terminal", "(&mut shutdown)"].concat();
+        assert!(include_str!("journal.rs").contains(&marker));
+    }
+
+    #[tokio::test]
+    async fn closed_watch_stops_and_joins_actual_journal_reader() {
+        let registry = crate::metrics::Registry::new();
+        let input = JournalInput {
+            matches: Vec::new(),
+            state_file: None,
+            poll_interval: Duration::from_secs(30),
+            metrics: InputMetrics::register(&registry, "journal-closed-watch").unwrap(),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        drop(shutdown_tx);
+
+        tokio::time::timeout(Duration::from_secs(2), input.run(event_tx, shutdown_rx))
+            .await
+            .expect("closed watch must stop and join the blocking journal reader")
+            .expect("journal input shutdown must be clean");
+
+        let source = include_str!("journal.rs");
+        assert!(source.contains("journal_handle.await"));
+        assert!(!source.contains(&["journal_handle", ".abort()"].concat()));
     }
 }

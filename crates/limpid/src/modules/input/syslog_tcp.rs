@@ -30,6 +30,13 @@ use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
 use crate::tls::TlsConfig;
 
+async fn shutdown_change_is_terminal(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    match shutdown.changed().await {
+        Ok(()) => *shutdown.borrow(),
+        Err(_) => true,
+    }
+}
+
 const SYSLOG_TCP_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "bind",
@@ -229,6 +236,7 @@ impl Input for SyslogTcpInput {
         };
 
         let listener = TcpListener::bind(&self.bind_addr).await?;
+        crate::modules::input_startup_ready();
         info!(
             "syslog_tcp listening on {} ({})",
             self.bind_addr,
@@ -253,8 +261,8 @@ impl Input for SyslogTcpInput {
             tokio::select! {
                 biased;
 
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                terminal = shutdown_change_is_terminal(&mut shutdown) => {
+                    if terminal {
                         info!("syslog_tcp: shutting down ({} active connections)", conn_handles.len());
                         for h in &conn_handles {
                             h.abort();
@@ -1531,5 +1539,30 @@ mod tests {
         let _ = held;
         let _ = sd_tx.send(true);
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn closed_shutdown_watch_is_terminal_for_syslog_tcp_loop() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                shutdown_change_is_terminal(&mut receiver),
+            )
+            .await
+            .expect("closed watch must resolve without spinning")
+        );
+        let marker = ["shutdown_change_is_terminal", "(&mut shutdown)"].concat();
+        assert!(include_str!("syslog_tcp.rs").contains(&marker));
+
+        let (handle, shutdown, _events, _metrics) =
+            spawn_plain_input(format!("127.0.0.1:{}", pick_port()), 1);
+        drop(shutdown);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("actual TCP loop must terminate on a closed watch")
+            .expect("TCP task must join")
+            .expect("TCP loop must exit cleanly");
     }
 }
