@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
@@ -23,11 +23,384 @@ use crate::pipeline::CompiledConfig;
 use crate::queue::{self, QueueConfig, QueueSender};
 use crate::tap::TapRegistry;
 
+async fn shutdown_change_is_terminal(shutdown: &mut watch::Receiver<bool>) -> bool {
+    match shutdown.changed().await {
+        Ok(()) => *shutdown.borrow(),
+        Err(_) => true,
+    }
+}
+
 pub struct Runtime {
     shutdown_tx: watch::Sender<bool>,
-    handles: Vec<tokio::task::JoinHandle<()>>,
+    handles: Vec<TrackedTask>,
     config_file: PathBuf,
     compiled_config: CompiledConfig,
+}
+
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const ABORT_JOIN_RESERVE: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CleanupOutcome {
+    forced_abort: bool,
+    abort_safe_incomplete: usize,
+    must_join_exceeded_threshold: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskKind {
+    AbortSafe,
+    MustJoin,
+}
+
+fn output_task_kind(
+    output_type: &str,
+    queue_type: &queue::QueueType,
+    has_error_log: bool,
+    stdout_regular_file: bool,
+) -> TaskKind {
+    if output_type == "file"
+        || (output_type == "stdout" && stdout_regular_file)
+        || matches!(queue_type, queue::QueueType::Disk { .. })
+        || has_error_log
+    {
+        TaskKind::MustJoin
+    } else {
+        TaskKind::AbortSafe
+    }
+}
+
+fn pipeline_task_kind(has_error_log: bool, has_disk_output: bool) -> TaskKind {
+    if has_error_log || has_disk_output {
+        TaskKind::MustJoin
+    } else {
+        TaskKind::AbortSafe
+    }
+}
+
+fn input_task_kind(input_type: &str) -> TaskKind {
+    if input_type == "journal" {
+        TaskKind::MustJoin
+    } else {
+        TaskKind::AbortSafe
+    }
+}
+
+struct TrackedTask {
+    kind: TaskKind,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Owns every task created during startup until the runtime is fully committed.
+/// Any explicit startup error uses [`Self::rollback`]; cancellation or panic is
+/// covered by `Drop`, which transfers cleanup to the current Tokio runtime.
+struct StartupGuard {
+    shutdown_tx: Option<watch::Sender<bool>>,
+    handles: Vec<TrackedTask>,
+    cleanup_executor: tokio::runtime::Handle,
+    #[cfg(test)]
+    drop_cleanup_observer: Option<Arc<DropCleanupObserver>>,
+}
+
+impl StartupGuard {
+    fn new(shutdown_tx: watch::Sender<bool>) -> Self {
+        Self {
+            shutdown_tx: Some(shutdown_tx),
+            handles: Vec::new(),
+            cleanup_executor: tokio::runtime::Handle::current(),
+            #[cfg(test)]
+            drop_cleanup_observer: DROP_CLEANUP_RESULT.try_with(Arc::clone).ok(),
+        }
+    }
+
+    fn track(&mut self, kind: TaskKind, handle: tokio::task::JoinHandle<()>) {
+        self.handles.push(TrackedTask {
+            kind,
+            handle: Some(handle),
+        });
+    }
+
+    fn extend(
+        &mut self,
+        kind: TaskKind,
+        handles: impl IntoIterator<Item = tokio::task::JoinHandle<()>>,
+    ) {
+        self.handles
+            .extend(handles.into_iter().map(|handle| TrackedTask {
+                kind,
+                handle: Some(handle),
+            }));
+    }
+
+    async fn rollback(self, original: anyhow::Error) -> anyhow::Error {
+        self.rollback_with_timeout(original, SHUTDOWN_TIMEOUT).await
+    }
+
+    async fn rollback_with_timeout(
+        mut self,
+        original: anyhow::Error,
+        timeout: std::time::Duration,
+    ) -> anyhow::Error {
+        let shutdown_tx = self.shutdown_tx.take().expect("startup guard sender");
+        let mut handles = std::mem::take(&mut self.handles);
+        let cleanup = shutdown_tasks_with_timeout(&shutdown_tx, &mut handles, timeout).await;
+        drop(shutdown_tx);
+        if cleanup.abort_safe_incomplete != 0 {
+            original.context(format!(
+                "runtime startup rollback reached the hard cleanup deadline; {} abort-safe task(s) remain incomplete after abort",
+                cleanup.abort_safe_incomplete
+            ))
+        } else if cleanup.must_join_exceeded_threshold {
+            original.context(
+                "runtime startup rollback exceeded the 10s health threshold; must-join resource owners completed before return",
+            )
+        } else if cleanup.forced_abort {
+            original.context(
+                "runtime startup rollback exceeded the graceful phase; pending tasks were aborted and joined within the global cleanup deadline",
+            )
+        } else {
+            original.context("runtime startup rolled back all started tasks")
+        }
+    }
+
+    fn commit(mut self) -> (watch::Sender<bool>, Vec<TrackedTask>) {
+        let shutdown_tx = self.shutdown_tx.take().expect("startup guard sender");
+        let handles = std::mem::take(&mut self.handles);
+        (shutdown_tx, handles)
+    }
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        let Some(shutdown_tx) = self.shutdown_tx.take() else {
+            return;
+        };
+        let mut handles = std::mem::take(&mut self.handles);
+        let _ = shutdown_tx.send(true);
+        if handles.is_empty() {
+            #[cfg(test)]
+            if let Some(observer) = self.drop_cleanup_observer.take() {
+                observer.complete(CleanupOutcome::default());
+            }
+            return;
+        }
+        #[cfg(test)]
+        let observer = self.drop_cleanup_observer.take();
+        // The originating runtime must remain alive until this cleanup task
+        // completes. Dropping the runtime itself cancels all tasks by Tokio's
+        // contract; no handle can extend an executor beyond that boundary.
+        self.cleanup_executor.spawn(async move {
+            let outcome = shutdown_tasks(&shutdown_tx, &mut handles).await;
+            #[cfg(test)]
+            if let Some(observer) = observer {
+                observer.complete(outcome);
+            }
+            #[cfg(not(test))]
+            let _ = outcome;
+        });
+    }
+}
+
+fn record_join_result(result: std::result::Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result
+        && error.is_panic()
+    {
+        error!("task panicked during shutdown: {error}");
+    }
+}
+
+async fn shutdown_tasks(
+    shutdown_tx: &watch::Sender<bool>,
+    handles: &mut [TrackedTask],
+) -> CleanupOutcome {
+    shutdown_tasks_with_timeout(shutdown_tx, handles, SHUTDOWN_TIMEOUT).await
+}
+
+async fn shutdown_tasks_with_timeout(
+    shutdown_tx: &watch::Sender<bool>,
+    handles: &mut [TrackedTask],
+    total_timeout: std::time::Duration,
+) -> CleanupOutcome {
+    let _ = shutdown_tx.send(true);
+    let started = tokio::time::Instant::now();
+    let overall_deadline = started + total_timeout;
+    let abort_reserve = ABORT_JOIN_RESERVE.min(total_timeout / 2);
+    let graceful_deadline = overall_deadline - abort_reserve;
+
+    for task in handles.iter_mut() {
+        let Some(handle) = task.handle.as_mut() else {
+            continue;
+        };
+        match tokio::time::timeout_at(graceful_deadline, handle).await {
+            Ok(result) => {
+                record_join_result(result);
+                task.handle = None;
+            }
+            Err(_) => break,
+        }
+    }
+
+    let forced_abort = handles
+        .iter()
+        .any(|task| task.kind == TaskKind::AbortSafe && task.handle.is_some());
+    for task in handles.iter() {
+        if task.kind == TaskKind::AbortSafe
+            && let Some(handle) = &task.handle
+        {
+            handle.abort();
+        }
+    }
+
+    for task in handles.iter_mut() {
+        if task.kind != TaskKind::AbortSafe {
+            continue;
+        }
+        let Some(handle) = task.handle.as_mut() else {
+            continue;
+        };
+        match tokio::time::timeout_at(overall_deadline, handle).await {
+            Ok(result) => {
+                record_join_result(result);
+                task.handle = None;
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Consume MustJoin handles that completed by the health threshold before
+    // deciding whether the threshold was exceeded. This also preserves the
+    // one-poll ownership invariant for every completed handle.
+    for task in handles.iter_mut() {
+        if task.kind == TaskKind::MustJoin
+            && task
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+            && let Some(handle) = task.handle.take()
+        {
+            record_join_result(handle.await);
+        }
+    }
+
+    let abort_safe_incomplete = handles
+        .iter()
+        .filter(|task| task.kind == TaskKind::AbortSafe && task.handle.is_some())
+        .count();
+    let must_join_exceeded_threshold = handles
+        .iter()
+        .any(|task| task.kind == TaskKind::MustJoin && task.handle.is_some());
+
+    // Must-join tasks own durability or disposition state. The 10-second
+    // deadline is a health threshold for them, never permission to abort or
+    // detach. Await every remaining owner before returning.
+    for task in handles.iter_mut() {
+        if task.kind != TaskKind::MustJoin {
+            continue;
+        }
+        if let Some(handle) = task.handle.as_mut() {
+            record_join_result(handle.await);
+            task.handle = None;
+        }
+    }
+
+    CleanupOutcome {
+        forced_abort,
+        abort_safe_incomplete,
+        must_join_exceeded_threshold,
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static LATE_POST_LISTENER_FAILURE: std::cell::Cell<bool>;
+    static DROP_CLEANUP_RESULT: Arc<DropCleanupObserver>;
+    static POST_OUTPUT_PREACTIVATION_FAILURE: std::cell::RefCell<Option<PostOutputFailure>>;
+    static STARTUP_TASK_COMPLETIONS: Arc<StartupTaskCompletionObserver>;
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DropCleanupObserver {
+    outcome: std::sync::Mutex<Option<CleanupOutcome>>,
+    completed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl DropCleanupObserver {
+    fn complete(&self, outcome: CleanupOutcome) {
+        *self.outcome.lock().expect("drop cleanup observer") = Some(outcome);
+        self.completed.notify_one();
+    }
+
+    async fn wait(&self) -> CleanupOutcome {
+        loop {
+            if let Some(outcome) = *self.outcome.lock().expect("drop cleanup observer") {
+                return outcome;
+            }
+            self.completed.notified().await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct StartupTaskCompletionObserver {
+    output_queues: std::sync::atomic::AtomicUsize,
+    pipelines: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+enum PostOutputFailureMode {
+    Error,
+    Park,
+}
+
+#[cfg(test)]
+struct PostOutputFailure {
+    mode: PostOutputFailureMode,
+    reached: Arc<tokio::sync::Notify>,
+    enqueue_probe: bool,
+}
+
+async fn post_output_preactivation_failure(_sender: &mut QueueSender) -> Result<()> {
+    #[cfg(test)]
+    if let Some(failure) = POST_OUTPUT_PREACTIVATION_FAILURE
+        .try_with(|slot| slot.borrow_mut().take())
+        .ok()
+        .flatten()
+    {
+        if failure.enqueue_probe {
+            _sender
+                .send(crate::event::QueuedEvent::new(
+                    Event::new(
+                        bytes::Bytes::from_static(b"startup-rollback-probe"),
+                        "127.0.0.1:1".parse().expect("static probe address"),
+                    ),
+                    crate::time::UnixNanos::now(),
+                ))
+                .await
+                .context("failed to enqueue startup rollback probe")?;
+        }
+        failure.reached.notify_one();
+        match failure.mode {
+            PostOutputFailureMode::Error => {
+                anyhow::bail!("test failpoint: post-output preactivation failure");
+            }
+            PostOutputFailureMode::Park => std::future::pending::<()>().await,
+        }
+    }
+    Ok(())
+}
+
+fn late_post_listener_failure() -> Result<()> {
+    #[cfg(test)]
+    if LATE_POST_LISTENER_FAILURE
+        .try_with(|armed| armed.replace(false))
+        .unwrap_or(false)
+    {
+        anyhow::bail!("test failpoint: late post-listener startup failure");
+    }
+    Ok(())
 }
 
 fn configured_ltp_peer_ids(config: &CompiledConfig) -> Result<BTreeSet<String>> {
@@ -92,7 +465,6 @@ impl Runtime {
         F: FnOnce() -> Result<String>,
     {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         let mut registry = ModuleRegistry::new();
         modules::register_builtins(&mut registry);
@@ -205,97 +577,34 @@ impl Runtime {
             ltp_metrics,
         };
 
-        // --- 1. Create outputs (each output owns its own OutputMetrics) ---
-        let mut output_senders: HashMap<String, QueueSender> = HashMap::new();
-        let mut output_receivers = Vec::new();
-        // Populated in the loop below alongside the queue creation so
-        // the same `QueueConfig` decides which set of outputs need a
-        // workspace-carrying snapshot at `output` statement time. See
-        // `PipelineContext::disk_outputs` for the runtime contract.
-        let mut disk_outputs: HashSet<String> = HashSet::new();
+        // Complete every deterministic plan named by the startup contract
+        // before an output factory can acquire a resource.
+        let compiled_config = config.clone();
+        let control_path = config
+            .global_blocks
+            .get("control")
+            .and_then(|p| props::get_string(p, "socket"));
+        crate::control::validate_control_socket_parent(control_path.as_deref())?;
+        let stdout_regular_file = if config
+            .outputs
+            .values()
+            .any(|output| output.properties.type_name() == "stdout")
+        {
+            crate::modules::output::stdout::stdout_is_regular_file()
+                .context("failed to classify stdout backend")?
+        } else {
+            false
+        };
 
-        for (name, output_def) in &config.outputs {
-            let queue_config =
-                QueueConfig::from_output_properties(name, output_def.properties.user_properties())?;
-            if matches!(queue_config.queue_type, queue::QueueType::Disk { .. }) {
-                disk_outputs.insert(name.clone());
-            }
-            // Retry config is parsed by each output's `from_properties`
-            // (outputs own retry + DLQ). The runtime no longer needs a
-            // copy here.
-            let (mut sender, receiver) = queue::create_queue(name.clone(), queue_config)?;
-
-            // `output_def.properties` is a `ModuleProperties`: it carries the
-            // resolved `type` already, so `create_output` doesn't take a
-            // separate type_name argument (and can't be passed one — the
-            // strip is the whole point). `BuildContext` carries `funcs` and
-            // the optional `error_log` so outputs can stash them at
-            // construction time.
-            let created = match registry.create_output(name, &output_def.properties, &build_ctx) {
-                Ok(c) => c,
-                Err(e) => {
-                    error!(
-                        "failed to create output '{}': {} — aborting startup",
-                        name, e
-                    );
-                    for h in &handles {
-                        h.abort();
-                    }
-                    for h in handles {
-                        let _ = h.await;
-                    }
-                    return Err(e);
-                }
-            };
-
-            // Attach metrics so QueueSender::send counts events_received.
-            sender.attach_metrics(Arc::clone(&created.metrics));
-            output_senders.insert(name.clone(), sender);
-
-            let output_metrics = Arc::clone(&created.metrics);
-            tap.register(&format!("output {}", name)).await;
-
-            output_receivers.push((name.clone(), receiver, created.output, output_metrics));
-        }
-
-        // Start queue consumers (no metrics counting here — output does it)
-        for (_name, receiver, writer, output_metrics) in output_receivers {
-            let shutdown = shutdown_rx.clone();
-            let tap_clone = tap.clone();
-            let error_log_for_consumer = error_log.as_ref().map(Arc::clone);
-            handles.push(tokio::spawn(async move {
-                queue::run_queue_consumer(
-                    receiver,
-                    writer,
-                    Some(tap_clone),
-                    output_metrics,
-                    error_log_for_consumer,
-                    shutdown,
-                )
-                .await;
-            }));
-        }
-
-        let output_senders = Arc::new(output_senders);
-        let disk_outputs = Arc::new(disk_outputs);
-
-        // --- 2. Group pipelines by input ---
-        //
-        // A pipeline with `input a, b;` (fan-in) is registered under every listed
-        // input. Events from each input are still fed into the pipeline's
-        // per-input worker dispatcher; since a single `PipelineWorker` instance
-        // is shared across inputs (wrapped in Arc at spawn time), its metrics
-        // aggregate across inputs without per-input attribution — by design.
+        // Group pipelines by input and compile every process-metric plan.
         let mut input_pipelines: HashMap<String, Vec<Arc<PipelineWorker>>> = HashMap::new();
-
         for pipeline_def in config.pipelines.values() {
             let worker = Arc::new(PipelineWorker::new_with_process_metrics(
                 pipeline_def.clone(),
                 &config.processes,
                 &metrics_registry,
             )?);
-            let input_names = get_pipeline_inputs(pipeline_def);
-            for input_name in input_names {
+            for input_name in get_pipeline_inputs(pipeline_def) {
                 input_pipelines
                     .entry(input_name.clone())
                     .or_default()
@@ -303,7 +612,29 @@ impl Runtime {
             }
         }
 
-        // --- 2b. Register tap points for inputs and processes ---
+        let mut input_queue_sizes = HashMap::new();
+        let mut prepared_ltp_inputs = HashMap::new();
+        for input_name in input_pipelines.keys() {
+            let input_def = config
+                .inputs
+                .get(input_name)
+                .ok_or_else(|| anyhow::anyhow!("input '{}' not found", input_name))?;
+            let queue_size =
+                props::get_positive_int(input_def.properties.user_properties(), "queue_size")?
+                    .unwrap_or(4096) as usize;
+            input_queue_sizes.insert(input_name.clone(), queue_size);
+            if input_def.properties.type_name() == "ltp" {
+                let input = modules::input::ltp::LtpInput::build(
+                    input_name,
+                    &input_def.properties,
+                    &build_ctx,
+                )
+                .with_context(|| format!("failed to create input '{input_name}'"))?;
+                prepared_ltp_inputs.insert(input_name.clone(), input);
+            }
+        }
+
+        // Tap registration does not create runtime actors or output resources.
         for input_name in input_pipelines.keys() {
             tap.register(&format!("input {}", input_name)).await;
         }
@@ -311,9 +642,101 @@ impl Runtime {
             tap.register(&format!("process {}", proc_name)).await;
         }
 
-        // --- 3. Start inputs (each input owns its own InputMetrics) ---
-        let compiled_config = config.clone();
+        // From this point on, every acquired output resource is transactionally
+        // owned. Each real queue consumer is spawned and registered immediately
+        // after its output factory succeeds, before the next await or fallible
+        // edge.
+        let mut startup_guard = StartupGuard::new(shutdown_tx);
+
+        // --- 1. Create outputs (each output owns its own OutputMetrics) ---
+        let mut output_senders: HashMap<String, QueueSender> = HashMap::new();
+        // Populated in the loop below alongside the queue creation so
+        // the same `QueueConfig` decides which set of outputs need a
+        // workspace-carrying snapshot at `output` statement time. See
+        // `PipelineContext::disk_outputs` for the runtime contract.
+        let mut disk_outputs: HashSet<String> = HashSet::new();
+
+        for (name, output_def) in &config.outputs {
+            let queue_config = match QueueConfig::from_output_properties(
+                name,
+                output_def.properties.user_properties(),
+            ) {
+                Ok(config) => config,
+                Err(error) => return Err(startup_guard.rollback(error).await),
+            };
+            let output_task_kind = output_task_kind(
+                output_def.properties.type_name(),
+                &queue_config.queue_type,
+                error_log.is_some(),
+                stdout_regular_file,
+            );
+            if matches!(queue_config.queue_type, queue::QueueType::Disk { .. }) {
+                disk_outputs.insert(name.clone());
+            }
+            // Retry config is parsed by each output's `from_properties`
+            // (outputs own retry + DLQ). The runtime no longer needs a
+            // copy here.
+            let (mut sender, receiver) = match queue::create_queue(name.clone(), queue_config) {
+                Ok(queue) => queue,
+                Err(error) => return Err(startup_guard.rollback(error).await),
+            };
+
+            // `output_def.properties` is a `ModuleProperties`: it carries the
+            // resolved `type` already, so `create_output` doesn't take a
+            // separate type_name argument (and can't be passed one — the
+            // strip is the whole point). `BuildContext` carries `funcs` and
+            // the optional `error_log` so outputs can stash them at
+            // construction time.
+            let created = match registry
+                .create_output(name, &output_def.properties, &build_ctx)
+                .with_context(|| format!("failed to create output '{name}'"))
+            {
+                Ok(created) => created,
+                Err(error) => return Err(startup_guard.rollback(error).await),
+            };
+
+            // Attach metrics so QueueSender::send counts events_received.
+            sender.attach_metrics(Arc::clone(&created.metrics));
+            let output_metrics = Arc::clone(&created.metrics);
+            let shutdown = shutdown_rx.clone();
+            let tap_clone = tap.clone();
+            let error_log_for_consumer = error_log.as_ref().map(Arc::clone);
+            #[cfg(test)]
+            let completion_observer = STARTUP_TASK_COMPLETIONS.try_with(Arc::clone).ok();
+            startup_guard.track(
+                output_task_kind,
+                tokio::spawn(async move {
+                    queue::run_queue_consumer(
+                        receiver,
+                        created.output,
+                        Some(tap_clone),
+                        output_metrics,
+                        error_log_for_consumer,
+                        shutdown,
+                    )
+                    .await;
+                    #[cfg(test)]
+                    if let Some(observer) = completion_observer {
+                        observer
+                            .output_queues
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }),
+            );
+            if let Err(error) = post_output_preactivation_failure(&mut sender).await {
+                return Err(startup_guard.rollback(error).await);
+            }
+            output_senders.insert(name.clone(), sender);
+            tap.register(&format!("output {}", name)).await;
+        }
+
+        let output_senders = Arc::new(output_senders);
+        let has_disk_output = !disk_outputs.is_empty();
+        let disk_outputs = Arc::new(disk_outputs);
+
         let config = Arc::new(config);
+
+        // --- 3. Start inputs (each input owns its own InputMetrics) ---
 
         let mut input_senders: HashMap<
             String,
@@ -322,14 +745,10 @@ impl Runtime {
         let mut ltp_inputs = Vec::new();
 
         for (input_name, pipelines) in input_pipelines {
-            let input_def = config
-                .inputs
-                .get(&input_name)
-                .ok_or_else(|| anyhow::anyhow!("input '{}' not found", input_name))?;
-
-            let queue_size =
-                props::get_positive_int(input_def.properties.user_properties(), "queue_size")?
-                    .unwrap_or(4096) as usize;
+            let input_def = config.inputs.get(&input_name).expect("input preflight");
+            let queue_size = input_queue_sizes
+                .remove(&input_name)
+                .expect("input queue-size preflight");
             let (event_tx, event_rx) = mpsc::channel::<Event>(queue_size);
 
             // Pipeline workers subscribed to this input. A pipeline with fan-in
@@ -350,31 +769,47 @@ impl Runtime {
             let iname = input_name.clone();
             let shutdown_for_worker = shutdown_rx.clone();
             let sender_for_inject = event_tx.clone();
-            handles.push(tokio::spawn(async move {
-                run_pipeline_workers(event_rx, &workers, &ctx, &iname, shutdown_for_worker).await;
-            }));
+            #[cfg(test)]
+            let completion_observer = STARTUP_TASK_COMPLETIONS.try_with(Arc::clone).ok();
+            #[cfg(test)]
+            let wal_barrier = queue::current_test_wal_barrier();
+            let pipeline_task_kind = pipeline_task_kind(error_log.is_some(), has_disk_output);
+            startup_guard.track(
+                pipeline_task_kind,
+                tokio::spawn(async move {
+                    #[cfg(test)]
+                    if let Some(barrier) = wal_barrier {
+                        queue::with_test_wal_barrier(
+                            barrier,
+                            run_pipeline_workers(
+                                event_rx,
+                                &workers,
+                                &ctx,
+                                &iname,
+                                shutdown_for_worker,
+                            ),
+                        )
+                        .await;
+                    } else {
+                        run_pipeline_workers(event_rx, &workers, &ctx, &iname, shutdown_for_worker)
+                            .await;
+                    }
+                    #[cfg(not(test))]
+                    run_pipeline_workers(event_rx, &workers, &ctx, &iname, shutdown_for_worker)
+                        .await;
+                    #[cfg(test)]
+                    if let Some(observer) = completion_observer {
+                        observer
+                            .pipelines
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }),
+            );
 
             if input_def.properties.type_name() == "ltp" {
-                let input = match modules::input::ltp::LtpInput::build(
-                    &input_name,
-                    &input_def.properties,
-                    &build_ctx,
-                ) {
-                    Ok(input) => input,
-                    Err(error) => {
-                        error!(
-                            "failed to create input '{}': {} — aborting startup",
-                            input_name, error
-                        );
-                        for handle in &handles {
-                            handle.abort();
-                        }
-                        for handle in handles {
-                            let _ = handle.await;
-                        }
-                        return Err(error);
-                    }
-                };
+                let input = prepared_ltp_inputs
+                    .remove(&input_name)
+                    .expect("LTP input preflight");
                 input_senders.insert(input_name.clone(), (sender_for_inject, input.metrics()));
                 ltp_inputs.push((input, event_tx));
                 continue;
@@ -392,24 +827,29 @@ impl Runtime {
             ) {
                 Ok(c) => c,
                 Err(e) => {
-                    error!(
-                        "failed to start input '{}': {} — aborting startup",
-                        input_name, e
-                    );
-                    for h in &handles {
-                        h.abort();
-                    }
-                    for h in handles {
-                        let _ = h.await;
-                    }
-                    return Err(e);
+                    let error = e.context(format!("failed to start input '{input_name}'"));
+                    return Err(startup_guard.rollback(error).await);
                 }
             };
             input_senders.insert(
                 input_name.clone(),
                 (sender_for_inject, Arc::clone(&created.metrics)),
             );
-            handles.push(created.handle);
+            let input_task_kind = input_task_kind(input_def.properties.type_name());
+            startup_guard.track(input_task_kind, created.handle);
+            match created.startup.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let error = error.context(format!("failed to start input '{input_name}'"));
+                    return Err(startup_guard.rollback(error).await);
+                }
+                Err(_) => {
+                    let error = anyhow::anyhow!(
+                        "input '{input_name}' task exited before startup readiness"
+                    );
+                    return Err(startup_guard.rollback(error).await);
+                }
+            }
         }
 
         let ltp_handles =
@@ -417,31 +857,18 @@ impl Runtime {
             {
                 Ok(handles) => handles,
                 Err(error) => {
-                    error!("failed to start LTP listener groups: {error:#} — aborting startup");
-                    for handle in &handles {
-                        handle.abort();
-                    }
-                    for handle in handles {
-                        let _ = handle.await;
-                    }
-                    return Err(error);
+                    return Err(startup_guard
+                        .rollback(error.context("failed to start LTP listener groups"))
+                        .await);
                 }
             };
-        handles.extend(ltp_handles);
+        startup_guard.extend(TaskKind::AbortSafe, ltp_handles);
+
+        if let Err(error) = late_post_listener_failure() {
+            return Err(startup_guard.rollback(error).await);
+        }
 
         // --- 4. Start control socket (after all metrics are registered) ---
-        let control_path = config
-            .global_blocks
-            .get("control")
-            .and_then(|p| props::get_string(p, "socket"));
-        // Validate the control socket's parent BEFORE the control
-        // task is spawned. `ControlServer::run` returns `()` and is
-        // fire-and-forget from the runtime's perspective, so a
-        // fail-closed check inside the task would just make the
-        // control socket die silently while the daemon runs on.
-        // Bailing here stops the whole startup — the same shape as
-        // `ErrorLogWriter::validate_at_startup`.
-        crate::control::validate_control_socket_parent(control_path.as_deref())?;
         let started_at = std::time::Instant::now();
         let control = ControlServer::new(
             control_path,
@@ -453,10 +880,28 @@ impl Runtime {
             started_at,
         );
         let s = shutdown_rx.clone();
-        handles.push(tokio::spawn(async move {
-            control.run(s).await;
-        }));
+        let (control_startup_tx, control_startup_rx) = tokio::sync::oneshot::channel();
+        startup_guard.track(
+            TaskKind::AbortSafe,
+            tokio::spawn(async move {
+                control.run(s, Some(control_startup_tx)).await;
+            }),
+        );
+        match control_startup_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(diagnostic)) => {
+                return Err(startup_guard.rollback(anyhow::anyhow!(diagnostic)).await);
+            }
+            Err(_) => {
+                return Err(startup_guard
+                    .rollback(anyhow::anyhow!(
+                        "control task exited before startup readiness"
+                    ))
+                    .await);
+            }
+        }
 
+        let (shutdown_tx, handles) = startup_guard.commit();
         info!("limpid daemon started");
         Ok(Self {
             shutdown_tx,
@@ -475,43 +920,27 @@ impl Runtime {
     }
 
     pub async fn shutdown(self) {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-
         info!(
             "initiating graceful shutdown (timeout: {}s)",
             SHUTDOWN_TIMEOUT.as_secs()
         );
-        let _ = self.shutdown_tx.send(true);
-
-        // Collect abort handles before moving JoinHandles into join_all
-        let abort_handles: Vec<_> = self.handles.iter().map(|h| h.abort_handle()).collect();
-
-        match timeout(SHUTDOWN_TIMEOUT, Self::join_all(self.handles)).await {
-            Ok(()) => {
-                info!("shutdown complete");
-            }
-            Err(_) => {
-                error!(
-                    "shutdown timed out after {}s — aborting remaining tasks",
-                    SHUTDOWN_TIMEOUT.as_secs()
-                );
-                for ah in &abort_handles {
-                    ah.abort();
-                }
-            }
-        }
-    }
-
-    async fn join_all(handles: Vec<tokio::task::JoinHandle<()>>) {
-        for handle in handles {
-            if let Err(e) = handle.await
-                && e.is_panic()
-            {
-                error!("task panicked during shutdown: {}", e);
-            }
+        let mut handles = self.handles;
+        let cleanup = shutdown_tasks(&self.shutdown_tx, &mut handles).await;
+        if cleanup.abort_safe_incomplete != 0 {
+            error!(
+                "shutdown reached the {}s hard deadline — {} abort-safe task(s) remain incomplete after abort",
+                SHUTDOWN_TIMEOUT.as_secs(),
+                cleanup.abort_safe_incomplete,
+            );
+        } else if cleanup.must_join_exceeded_threshold {
+            warn!(
+                "shutdown exceeded the {}s health threshold; must-join resource owners completed before return",
+                SHUTDOWN_TIMEOUT.as_secs(),
+            );
+        } else if cleanup.forced_abort {
+            warn!("shutdown exceeded the graceful phase; pending tasks were aborted and joined");
+        } else {
+            info!("shutdown complete");
         }
     }
 }
@@ -733,8 +1162,8 @@ async fn run_pipeline_workers(
         let event = tokio::select! {
             biased;
 
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            terminal = shutdown_change_is_terminal(&mut shutdown) => {
+                if terminal {
                     // Close the receiver first, then drain with
                     // `recv().await` until `None`. The previous
                     // `try_recv()` snapshot loop raced with input
@@ -1094,11 +1523,47 @@ mod tests {
     use crate::dsl::parser::parse_config;
     use crate::event::Event;
     use crate::metrics::{MetricsError, OutputMetrics, Registry};
+    use crate::modules::Output;
+    use crate::queue::{QueueAckHandle, QueueType};
     use bytes::Bytes;
     use std::net::SocketAddr;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::str::FromStr;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
+
+    fn full_stdout_pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1; 2];
+        // SAFETY: pipe initializes both integers on success.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: successful pipe returned two uniquely-owned descriptors.
+        let (read_fd, write_fd) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let flags = unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_ne!(
+            unsafe {
+                libc::fcntl(
+                    write_fd.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            },
+            -1
+        );
+        let chunk = [b'x'; 8192];
+        loop {
+            // SAFETY: descriptor and chunk are live for write(2).
+            let written =
+                unsafe { libc::write(write_fd.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) };
+            if written == -1 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                break;
+            }
+        }
+        (read_fd, write_fd)
+    }
 
     fn assert_output_duplicate(error: &MetricsError, label_value: &str, diagnostic: &str) {
         let (name, labelset) = match error {
@@ -1137,6 +1602,706 @@ mod tests {
             .expect("compile config")
     }
 
+    struct ShutdownCountingOutput {
+        metrics: Arc<crate::metrics::OutputMetrics>,
+        shutdown_calls: std::sync::atomic::AtomicUsize,
+        resolved: std::sync::atomic::AtomicUsize,
+        parked: std::sync::Mutex<Vec<QueueAckHandle>>,
+        consumed: tokio::sync::Notify,
+    }
+
+    impl ShutdownCountingOutput {
+        fn new() -> Self {
+            Self {
+                metrics: crate::metrics::OutputMetrics::for_testing(),
+                shutdown_calls: std::sync::atomic::AtomicUsize::new(0),
+                resolved: std::sync::atomic::AtomicUsize::new(0),
+                parked: std::sync::Mutex::new(Vec::new()),
+                consumed: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl HasMetrics for ShutdownCountingOutput {
+        type Stats = crate::metrics::OutputMetrics;
+
+        fn metrics(&self) -> Arc<Self::Stats> {
+            Arc::clone(&self.metrics)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Output for ShutdownCountingOutput {
+        async fn consume(&self, _event: &Event, ack: QueueAckHandle) -> Result<()> {
+            self.parked.lock().unwrap().push(ack);
+            self.consumed.notify_one();
+            Ok(())
+        }
+
+        async fn consume_shutdown(&self, _event: &Event, ack: QueueAckHandle) -> Result<()> {
+            self.parked.lock().unwrap().push(ack);
+            self.consumed.notify_one();
+            Ok(())
+        }
+
+        async fn shutdown(
+            &self,
+            _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+        ) -> Result<()> {
+            self.shutdown_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for ack in self.parked.lock().unwrap().drain(..) {
+                ack.resolve_delivered();
+                self.resolved
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_rollback_calls_output_shutdown_once_and_resolves_parked_ack() {
+        let (mut sender, receiver) = queue::create_queue(
+            "rollback-output".to_owned(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 4,
+            },
+        )
+        .unwrap();
+        let writer = Arc::new(ShutdownCountingOutput::new());
+        sender.attach_metrics(writer.metrics());
+        sender
+            .send(crate::event::QueuedEvent::new(
+                Event::new(
+                    bytes::Bytes::from_static(b"parked"),
+                    "127.0.0.1:1".parse().unwrap(),
+                ),
+                crate::time::UnixNanos::now(),
+            ))
+            .await
+            .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut guard = StartupGuard::new(shutdown_tx);
+        let metrics = writer.metrics();
+        let writer_for_task: Arc<dyn Output> = writer.clone();
+        guard.track(
+            TaskKind::MustJoin,
+            tokio::spawn(async move {
+                queue::run_queue_consumer(
+                    receiver,
+                    writer_for_task,
+                    None,
+                    metrics,
+                    None,
+                    shutdown_rx,
+                )
+                .await;
+            }),
+        );
+        writer.consumed.notified().await;
+
+        let error = guard.rollback(anyhow::anyhow!("late failure")).await;
+        assert!(error.to_string().contains("rolled back"));
+        assert_eq!(
+            writer
+                .shutdown_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+        );
+        assert!(writer.parked.lock().unwrap().is_empty());
+        assert_eq!(writer.resolved.load(std::sync::atomic::Ordering::SeqCst), 1,);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn startup_success_regression_delivers_and_shuts_output_down_once() {
+        let (mut sender, receiver) = queue::create_queue(
+            "success-output".to_owned(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 4,
+            },
+        )
+        .unwrap();
+        let writer = Arc::new(ShutdownCountingOutput::new());
+        sender.attach_metrics(writer.metrics());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut guard = StartupGuard::new(shutdown_tx);
+        let metrics = writer.metrics();
+        let writer_for_task: Arc<dyn Output> = writer.clone();
+        guard.track(
+            TaskKind::MustJoin,
+            tokio::spawn(async move {
+                queue::run_queue_consumer(
+                    receiver,
+                    writer_for_task,
+                    None,
+                    metrics,
+                    None,
+                    shutdown_rx,
+                )
+                .await;
+            }),
+        );
+        let (shutdown_tx, handles) = guard.commit();
+        let runtime = Runtime {
+            shutdown_tx,
+            handles,
+            config_file: PathBuf::from("success-test.limpid"),
+            compiled_config: compiled_config(""),
+        };
+
+        sender
+            .send(crate::event::QueuedEvent::new(
+                Event::new(
+                    bytes::Bytes::from_static(b"delivered"),
+                    "127.0.0.1:1".parse().unwrap(),
+                ),
+                crate::time::UnixNanos::now(),
+            ))
+            .await
+            .unwrap();
+        writer.consumed.notified().await;
+        runtime.shutdown().await;
+
+        assert_eq!(
+            writer
+                .shutdown_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+        );
+        assert_eq!(writer.resolved.load(std::sync::atomic::Ordering::SeqCst), 1,);
+        assert!(writer.parked.lock().unwrap().is_empty());
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn cancelled_startup_guard_transfers_bounded_cleanup_to_runtime() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let cleanup_observer = Arc::new(DropCleanupObserver::default());
+        DROP_CLEANUP_RESULT
+            .scope(Arc::clone(&cleanup_observer), async move {
+                let mut guard = StartupGuard::new(shutdown_tx);
+                guard.track(
+                    TaskKind::AbortSafe,
+                    tokio::spawn(async move {
+                        let terminal = shutdown_change_is_terminal(&mut shutdown_rx).await;
+                        let _ = done_tx.send(terminal);
+                    }),
+                );
+                drop(guard);
+            })
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), done_rx)
+                .await
+                .expect("drop cleanup must not orphan the tracked task")
+                .expect("tracked task must report terminal shutdown")
+        );
+        let cleanup = tokio::time::timeout(Duration::from_millis(100), cleanup_observer.wait())
+            .await
+            .expect("drop cleanup task must finish");
+        assert_eq!(cleanup.abort_safe_incomplete, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_guard_dropped_on_external_thread_uses_captured_executor() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let owners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cleanup_observer = Arc::new(DropCleanupObserver::default());
+        let guard = DROP_CLEANUP_RESULT
+            .scope(Arc::clone(&cleanup_observer), async {
+                let mut guard = StartupGuard::new(shutdown_tx);
+                let owners_in_task = Arc::clone(&owners);
+                guard.track(
+                    TaskKind::AbortSafe,
+                    tokio::spawn(async move {
+                        struct Owner(Arc<std::sync::atomic::AtomicUsize>);
+                        impl Drop for Owner {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::SeqCst);
+                            }
+                        }
+                        owners_in_task.fetch_add(1, Ordering::SeqCst);
+                        let _owner = Owner(owners_in_task);
+                        let _ = shutdown_change_is_terminal(&mut shutdown_rx).await;
+                    }),
+                );
+                tokio::task::yield_now().await;
+                guard
+            })
+            .await;
+        assert_eq!(owners.load(Ordering::SeqCst), 1);
+
+        std::thread::spawn(move || drop(guard)).join().unwrap();
+        let cleanup = tokio::time::timeout(Duration::from_secs(1), cleanup_observer.wait())
+            .await
+            .expect("captured runtime must complete externally-triggered cleanup");
+        assert_eq!(cleanup.abort_safe_incomplete, 0);
+        assert_eq!(owners.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_consumes_completed_handles_once_and_aborts_only_pending_tasks() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct EndOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for EndOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let first = tokio::spawn(async {});
+        let ended_in_task = Arc::clone(&ended);
+        let blocked = tokio::spawn(async move {
+            let _reservation = reservation;
+            let _end = EndOnDrop(ended_in_task);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let mut handles = vec![
+            TrackedTask {
+                kind: TaskKind::AbortSafe,
+                handle: Some(first),
+            },
+            TrackedTask {
+                kind: TaskKind::AbortSafe,
+                handle: Some(blocked),
+            },
+        ];
+        let cleanup =
+            shutdown_tasks_with_timeout(&shutdown_tx, &mut handles, Duration::from_millis(80))
+                .await;
+
+        assert!(cleanup.forced_abort);
+        assert_eq!(cleanup.abort_safe_incomplete, 0);
+        assert!(handles.iter().all(|task| task.handle.is_none()));
+        assert!(ended.load(Ordering::SeqCst));
+        std::net::TcpListener::bind(address)
+            .expect("aborted cooperative owner must release its socket before return");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_health_threshold_never_detaches_or_aborts_must_join_task() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_in_task = Arc::clone(&finished);
+        let handle = tokio::spawn(async move {
+            let _ = release_rx.await;
+            finished_in_task.store(true, Ordering::SeqCst);
+        });
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let mut guard = StartupGuard::new(shutdown_tx);
+        guard.track(TaskKind::MustJoin, handle);
+
+        let rollback = tokio::spawn(async move {
+            guard
+                .rollback_with_timeout(
+                    anyhow::anyhow!("original startup error"),
+                    Duration::from_millis(50),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        assert!(!rollback.is_finished());
+        assert!(!finished.load(Ordering::SeqCst));
+
+        release_tx.send(()).unwrap();
+        let error = rollback.await.unwrap();
+        let chain = format!("{error:#}");
+        assert!(chain.contains("original startup error"), "{chain}");
+        assert!(chain.contains("health threshold"), "{chain}");
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn durability_owners_are_must_join_and_private_network_tasks_are_abort_safe() {
+        let memory = QueueType::Memory;
+        let disk = QueueType::Disk {
+            path: "/tmp/test-wal".to_owned(),
+            max_size: 1024,
+        };
+        assert_eq!(
+            output_task_kind("file", &memory, false, false),
+            TaskKind::MustJoin
+        );
+        assert_eq!(
+            output_task_kind("stdout", &disk, false, false),
+            TaskKind::MustJoin
+        );
+        assert_eq!(
+            output_task_kind("stdout", &memory, true, false),
+            TaskKind::MustJoin
+        );
+        assert_eq!(
+            output_task_kind("stdout", &memory, false, true),
+            TaskKind::MustJoin
+        );
+        assert_eq!(pipeline_task_kind(true, false), TaskKind::MustJoin);
+        assert_eq!(pipeline_task_kind(false, true), TaskKind::MustJoin);
+        assert_eq!(input_task_kind("journal"), TaskKind::MustJoin);
+
+        assert_eq!(
+            output_task_kind("stdout", &memory, false, false),
+            TaskKind::AbortSafe
+        );
+        assert_eq!(
+            output_task_kind("syslog_tcp", &memory, false, false),
+            TaskKind::AbortSafe
+        );
+        assert_eq!(pipeline_task_kind(false, false), TaskKind::AbortSafe);
+        assert_eq!(input_task_kind("syslog_tcp"), TaskKind::AbortSafe);
+    }
+
+    #[tokio::test]
+    async fn startup_rollback_with_full_stdout_pipe_resolves_current_ack() {
+        let (read_fd, write_fd) = full_stdout_pipe();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut ctx = crate::modules::BuildContext::for_testing();
+        ctx.shutdown_signal = shutdown_rx;
+        let properties =
+            crate::dsl::module_props::ModuleProperties::from_parts("stdout", Vec::new());
+        let output = Arc::new(
+            crate::modules::output::stdout::StdoutOutput::from_properties(
+                "rollback-stdout",
+                &properties,
+                &ctx,
+            )
+            .unwrap(),
+        );
+        let event = Event::new(
+            Bytes::from_static(b"blocked-rollback"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, mut ack_rx) = QueueAckHandle::for_test();
+        let mut guard = StartupGuard::new(shutdown_tx);
+        guard.track(
+            TaskKind::AbortSafe,
+            tokio::spawn(async move {
+                crate::modules::output::stdout::with_test_stdout_fd(write_fd, async move {
+                    output.consume(&event, ack).await.unwrap();
+                })
+                .await
+                .unwrap();
+            }),
+        );
+        tokio::task::yield_now().await;
+
+        let error = guard
+            .rollback(anyhow::anyhow!("late startup failure"))
+            .await;
+        assert!(format!("{error:#}").contains("late startup failure"));
+        assert!(matches!(
+            ack_rx.recv().await,
+            Some((_, crate::queue::AckDisposition::Recovered))
+        ));
+        drop(read_fd);
+    }
+
+    #[tokio::test]
+    async fn normal_shutdown_with_full_stdout_pipe_resolves_current_ack() {
+        let (read_fd, write_fd) = full_stdout_pipe();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut ctx = crate::modules::BuildContext::for_testing();
+        ctx.shutdown_signal = shutdown_rx;
+        let properties =
+            crate::dsl::module_props::ModuleProperties::from_parts("stdout", Vec::new());
+        let output = Arc::new(
+            crate::modules::output::stdout::StdoutOutput::from_properties(
+                "shutdown-stdout",
+                &properties,
+                &ctx,
+            )
+            .unwrap(),
+        );
+        let event = Event::new(
+            Bytes::from_static(b"blocked-shutdown"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, mut ack_rx) = QueueAckHandle::for_test();
+        let handle = tokio::spawn(async move {
+            crate::modules::output::stdout::with_test_stdout_fd(write_fd, async move {
+                output.consume(&event, ack).await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        let runtime = Runtime {
+            shutdown_tx,
+            handles: vec![TrackedTask {
+                kind: TaskKind::AbortSafe,
+                handle: Some(handle),
+            }],
+            config_file: PathBuf::from("stdout-shutdown-test.limpid"),
+            compiled_config: compiled_config(""),
+        };
+        tokio::task::yield_now().await;
+
+        runtime.shutdown().await;
+        assert!(matches!(
+            ack_rx.recv().await,
+            Some((_, crate::queue::AckDisposition::Recovered))
+        ));
+        drop(read_fd);
+    }
+
+    #[tokio::test]
+    async fn full_pipe_queue_consumer_is_bounded_and_disposes_once_on_abort() {
+        let (read_fd, write_fd) = full_stdout_pipe();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut ctx = crate::modules::BuildContext::for_testing();
+        ctx.shutdown_signal = shutdown_rx.clone();
+        let properties =
+            crate::dsl::module_props::ModuleProperties::from_parts("stdout", Vec::new());
+        let output = Arc::new(
+            crate::modules::output::stdout::StdoutOutput::from_properties(
+                "shutdown-drain-full-pipe",
+                &properties,
+                &ctx,
+            )
+            .unwrap(),
+        );
+        let (sender, receiver) = queue::create_queue(
+            "shutdown-drain-full-pipe".to_string(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 1,
+            },
+        )
+        .unwrap();
+        sender
+            .send(crate::event::QueuedEvent::new(
+                Event::new(
+                    Bytes::from_static(b"blocked-drain"),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
+                crate::time::UnixNanos::now(),
+            ))
+            .await
+            .unwrap();
+        drop(sender);
+        shutdown_tx.send(true).unwrap();
+
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops_in_task = Arc::clone(&drops);
+        let writer: Arc<dyn Output> = output.clone();
+        let metrics = output.metrics();
+        let handle = tokio::spawn(async move {
+            crate::modules::output::stdout::with_test_stdout_fd(write_fd, async move {
+                queue::with_test_implicit_drop_count(drops_in_task, async move {
+                    queue::run_queue_consumer(receiver, writer, None, metrics, None, shutdown_rx)
+                        .await;
+                })
+                .await;
+            })
+            .await
+            .unwrap();
+        });
+        let mut guard = StartupGuard::new(shutdown_tx);
+        guard.track(TaskKind::AbortSafe, handle);
+
+        let started = std::time::Instant::now();
+        let error = guard
+            .rollback_with_timeout(
+                anyhow::anyhow!("forced shutdown"),
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(format!("{error:#}").contains("forced shutdown"));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(output.metrics().events_written.load(Ordering::SeqCst), 0);
+        drop(read_fd);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disk_pipeline_wal_barrier_remains_must_join_past_ten_seconds() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let wal = dir.path().join("queue");
+        let config = compiled_config(&format!(
+            r#"
+control {{ socket {:?} }}
+def input source {{ type syslog_udp bind "{addr}" }}
+def output sink {{
+    type file
+    path {:?}
+    queue {{ type disk path {:?} max_size "1MB" }}
+}}
+def pipeline p {{ input source; output sink }}
+"#,
+            dir.path().join("control.sock"),
+            dir.path().join("delivered.log"),
+            wal,
+        ));
+        let barrier = queue::TestWalBarrier::new();
+        let completions = Arc::new(StartupTaskCompletionObserver::default());
+        let runtime = STARTUP_TASK_COMPLETIONS
+            .scope(
+                Arc::clone(&completions),
+                queue::with_test_wal_barrier(
+                    Arc::clone(&barrier),
+                    Runtime::start(config, dir.path().join("wal-barrier.limpid")),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"<13>wal-exact", addr).unwrap();
+        barrier.wait_reached().await;
+
+        let shutdown = tokio::spawn(runtime.shutdown());
+        while completions.output_queues.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "WAL producer must remain MustJoin after 10s"
+        );
+
+        barrier.release();
+        shutdown.await.unwrap();
+
+        let (_sender, mut receiver) = queue::create_queue(
+            "wal-proof".to_string(),
+            QueueConfig {
+                queue_type: QueueType::Disk {
+                    path: wal.to_string_lossy().into_owned(),
+                    max_size: 1024 * 1024,
+                },
+                capacity: 1,
+            },
+        )
+        .unwrap();
+        let (persisted, _) = receiver
+            .recv()
+            .await
+            .expect("released WAL write must persist");
+        assert_eq!(&persisted.egress[..], b"<13>wal-exact");
+        assert!(
+            receiver.try_recv().is_none(),
+            "WAL barrier must persist exactly once"
+        );
+    }
+
+    fn batched_output_only_config(name: &str, control_socket: &Path) -> CompiledConfig {
+        compiled_config(&format!(
+            r#"
+control {{ socket {control_socket:?} }}
+def output {name} {{
+    type http
+    peer {{ url "http://127.0.0.1:1/" }}
+    batch_size 100
+}}
+"#
+        ))
+    }
+
+    #[tokio::test]
+    async fn post_output_preactivation_error_shuts_real_batched_actor_once() {
+        let output_name = "preactivation_error_batched";
+        let observer = crate::modules::output::batched::observe_shutdown_for_testing(output_name);
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let result = POST_OUTPUT_PREACTIVATION_FAILURE
+            .scope(
+                std::cell::RefCell::new(Some(PostOutputFailure {
+                    mode: PostOutputFailureMode::Error,
+                    reached,
+                    enqueue_probe: true,
+                })),
+                Runtime::start(
+                    batched_output_only_config(output_name, &dir.path().join("control.sock")),
+                    PathBuf::from("preactivation-error.limpid"),
+                ),
+            )
+            .await;
+        let error = match result {
+            Ok(runtime) => {
+                runtime.shutdown().await;
+                panic!("failpoint must reject startup");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("post-output preactivation failure"),
+            "{error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), observer.wait_for_completion())
+            .await
+            .expect("real batched output shutdown must complete");
+        assert_eq!(observer.calls(), 1);
+        assert_eq!(observer.completions(), 1);
+        assert_eq!(observer.resolved_dispositions(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_output_preactivation_cancellation_completes_guard_and_batched_actor_cleanup() {
+        let output_name = "preactivation_cancel_batched";
+        let observer = crate::modules::output::batched::observe_shutdown_for_testing(output_name);
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let reached_for_task = Arc::clone(&reached);
+        let cleanup_observer = Arc::new(DropCleanupObserver::default());
+        let startup = tokio::spawn(DROP_CLEANUP_RESULT.scope(
+            Arc::clone(&cleanup_observer),
+            POST_OUTPUT_PREACTIVATION_FAILURE.scope(
+                std::cell::RefCell::new(Some(PostOutputFailure {
+                    mode: PostOutputFailureMode::Park,
+                    reached: reached_for_task,
+                    enqueue_probe: true,
+                })),
+                Runtime::start(
+                    batched_output_only_config(output_name, &dir.path().join("control.sock")),
+                    PathBuf::from("preactivation-cancel.limpid"),
+                ),
+            ),
+        ));
+
+        reached.notified().await;
+        startup.abort();
+        let cancellation = startup.await;
+        assert!(matches!(cancellation, Err(error) if error.is_cancelled()));
+        let cleanup = tokio::time::timeout(Duration::from_secs(2), cleanup_observer.wait())
+            .await
+            .expect("drop fallback cleanup must finish");
+        assert_eq!(cleanup.abort_safe_incomplete, 0);
+        tokio::time::timeout(Duration::from_secs(2), observer.wait_for_completion())
+            .await
+            .expect("real batched output actor must complete after cancellation");
+        assert_eq!(observer.calls(), 1);
+        assert_eq!(observer.completions(), 1);
+        assert_eq!(observer.resolved_dispositions(), 1);
+    }
+
     #[cfg(unix)]
     fn write_ltp_test_identity(path: &Path) -> String {
         use base64::Engine as _;
@@ -1156,6 +2321,103 @@ mod tests {
         let mut spki = crate::ltp::ED25519_SPKI_PREFIX.to_vec();
         spki.extend_from_slice(pair.public_key().as_ref());
         base64::engine::general_purpose::STANDARD.encode(spki)
+    }
+
+    #[cfg(unix)]
+    async fn assert_late_failure_scenario() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node_key = dir.path().join("node.pem");
+        let peer_key = dir.path().join("peer.pem");
+        let _node_spki = write_ltp_test_identity(&node_key);
+        let peer_spki = write_ltp_test_identity(&peer_key);
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = reservation.local_addr().unwrap();
+        drop(reservation);
+        let control_socket = dir.path().join("control.sock");
+        let delivered = dir.path().join("delivered.log");
+        let source = format!(
+            r#"
+node_id "node"
+node_key {node_key:?}
+control {{ socket {control_socket:?} }}
+def input inbound {{
+    type ltp
+    bind "{bind}"
+    peer {{ node_id "peer" pubkey {peer_spki:?} }}
+}}
+def output delivered {{ type file path {delivered:?} }}
+def pipeline receive {{ input inbound; output delivered }}
+"#,
+        );
+
+        // Establish and stop the old runtime first: this is the reload shape
+        // whose same-port restoration must remain possible after a candidate
+        // fails late in startup.
+        let old = Runtime::start(compiled_config(&source), dir.path().join("old.limpid"))
+            .await
+            .unwrap();
+        old.shutdown().await;
+
+        let completions = Arc::new(StartupTaskCompletionObserver::default());
+        let candidate = STARTUP_TASK_COMPLETIONS
+            .scope(
+                Arc::clone(&completions),
+                LATE_POST_LISTENER_FAILURE.scope(
+                    std::cell::Cell::new(true),
+                    Runtime::start(
+                        compiled_config(&source),
+                        dir.path().join("candidate.limpid"),
+                    ),
+                ),
+            )
+            .await;
+        let error = match candidate {
+            Ok(runtime) => {
+                runtime.shutdown().await;
+                panic!("late failpoint must reject candidate");
+            }
+            Err(error) => error,
+        };
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("late post-listener startup failure"),
+            "{chain}"
+        );
+        assert!(chain.contains("rolled back all started tasks"), "{chain}");
+        assert_eq!(completions.output_queues.load(Ordering::SeqCst), 1);
+        assert_eq!(completions.pipelines.load(Ordering::SeqCst), 1);
+
+        let probe = std::net::TcpListener::bind(bind)
+            .expect("candidate rollback must release the real LTP listener immediately");
+        drop(probe);
+
+        let restored = Runtime::start(compiled_config(&source), dir.path().join("restored.limpid"))
+            .await
+            .expect("old runtime must restore on the same port after candidate rollback");
+        restored.shutdown().await;
+        std::net::TcpListener::bind(bind)
+            .expect("normal shutdown must leave no orphan listener or runtime task");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn late_post_listener_failure_rolls_back_all_started_tasks() {
+        assert_late_failure_scenario().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_candidate_releases_same_port_before_old_restore() {
+        assert_late_failure_scenario().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_error_leaves_no_orphan_socket_or_task() {
+        assert_late_failure_scenario().await;
     }
 
     #[cfg(unix)]
@@ -2311,8 +3573,19 @@ def pipeline p { process a }
 
     #[tokio::test]
     async fn startup_preserves_metric_registration_errors_from_real_factories() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let config = CompiledConfig::from_config(
-            parse_config("def output conflicting { type stdout }").expect("parse"),
+            parse_config(&format!(
+                "control {{ socket {:?} }} def output conflicting {{ type stdout }}",
+                dir.path().join("control.sock")
+            ))
+            .expect("parse"),
         )
         .expect("compile");
         let registry = Arc::new(Registry::new());
@@ -2357,6 +3630,140 @@ def pipeline p { process a }
             .await
             .expect("public start must use the working registry-wired startup path");
         runtime.shutdown().await;
+    }
+
+    fn listener_startup_config(
+        input_body: &str,
+        control_socket: &Path,
+        output_path: &Path,
+    ) -> CompiledConfig {
+        compiled_config(&format!(
+            r#"
+control {{ socket {control_socket:?} }}
+def input source {{ {input_body} }}
+def output sink {{ type file path {output_path:?} }}
+def pipeline p {{ input source; output sink }}
+"#
+        ))
+    }
+
+    async fn runtime_start_error(config: CompiledConfig, path: PathBuf) -> anyhow::Error {
+        match Runtime::start(config, path).await {
+            Ok(runtime) => {
+                runtime.shutdown().await;
+                panic!("runtime startup unexpectedly succeeded")
+            }
+            Err(error) => error,
+        }
+    }
+
+    #[tokio::test]
+    async fn occupied_syslog_tcp_and_udp_fail_runtime_start_before_commit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_addr = tcp.local_addr().unwrap();
+        let tcp_error = runtime_start_error(
+            listener_startup_config(
+                &format!("type syslog_tcp bind \"{tcp_addr}\""),
+                &dir.path().join("tcp-control.sock"),
+                &dir.path().join("tcp.log"),
+            ),
+            dir.path().join("tcp.limpid"),
+        )
+        .await;
+        assert!(format!("{tcp_error:#}").contains("failed to start input 'source'"));
+
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        let udp_error = runtime_start_error(
+            listener_startup_config(
+                &format!("type syslog_udp bind \"{udp_addr}\""),
+                &dir.path().join("udp-control.sock"),
+                &dir.path().join("udp.log"),
+            ),
+            dir.path().join("udp.limpid"),
+        )
+        .await;
+        assert!(format!("{udp_error:#}").contains("failed to start input 'source'"));
+    }
+
+    #[tokio::test]
+    async fn invalid_syslog_tls_and_unix_bind_fail_runtime_start_before_commit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let tls_body = format!(
+            "type syslog_tcp bind \"127.0.0.1:0\" tls {{ cert {:?} key {:?} }}",
+            dir.path().join("missing-cert.pem"),
+            dir.path().join("missing-key.pem")
+        );
+        let tls_error = runtime_start_error(
+            listener_startup_config(
+                &tls_body,
+                &dir.path().join("tls-control.sock"),
+                &dir.path().join("tls.log"),
+            ),
+            dir.path().join("tls.limpid"),
+        )
+        .await;
+        assert!(format!("{tls_error:#}").contains("failed to start input 'source'"));
+
+        let long_name = "s".repeat(140);
+        let unix_path = dir.path().join(long_name);
+        let unix_error = runtime_start_error(
+            listener_startup_config(
+                &format!("type unix_socket path {unix_path:?}"),
+                &dir.path().join("unix-control.sock"),
+                &dir.path().join("unix.log"),
+            ),
+            dir.path().join("unix.limpid"),
+        )
+        .await;
+        assert!(format!("{unix_error:#}").contains("failed to start input 'source'"));
+        assert!(!unix_path.exists());
+    }
+
+    #[tokio::test]
+    async fn control_bind_failure_rolls_back_started_resources() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let control_path = dir.path().join("c".repeat(140));
+        let config = compiled_config(&format!(
+            "control {{ socket {control_path:?} }} def output sink {{ type file path {:?} }}",
+            dir.path().join("sink.log")
+        ));
+        let error = runtime_start_error(config, dir.path().join("control-fail.limpid")).await;
+        assert!(format!("{error:#}").contains("failed to bind"));
+        assert!(!control_path.exists());
+    }
+
+    #[tokio::test]
+    async fn occupied_control_socket_rejects_start_and_preserves_active_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let control_path = dir.path().join("control.sock");
+        let active = std::os::unix::net::UnixListener::bind(&control_path).unwrap();
+        let config = compiled_config(&format!(
+            "control {{ socket {control_path:?} }} def output sink {{ type file path {:?} }}",
+            dir.path().join("sink.log")
+        ));
+
+        let error = runtime_start_error(config, dir.path().join("occupied-control.limpid")).await;
+        assert!(format!("{error:#}").contains("active listener"));
+        std::os::unix::net::UnixStream::connect(&control_path)
+            .expect("failed startup must not unlink the active owner's socket");
+
+        drop(active);
+        std::fs::remove_file(&control_path).unwrap();
+        let rebound = std::os::unix::net::UnixListener::bind(&control_path)
+            .expect("failed startup must permit immediate same-resource rebind");
+        drop(rebound);
     }
 
     async fn assert_startup_build_info(
@@ -2995,5 +4402,121 @@ def pipeline p { process a }
             !body.contains("event_rx.try_recv()"),
             "pipeline worker shutdown must not use try_recv() — permit-holder race",
         );
+    }
+
+    #[test]
+    fn startup_is_guarded_until_all_listener_handles_are_registered() {
+        let src = include_str!("runtime.rs");
+        assert!(src.contains(&["struct Startup", "Guard"].concat()));
+        assert!(src.contains(&["startup_guard.", "commit"].concat()));
+        assert!(src.contains(&["late_post_listener", "_failure"].concat()));
+    }
+
+    #[test]
+    fn startup_transaction_mutant_sensitivity() {
+        let src = include_str!("runtime.rs");
+        let production = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        let guard = production.find("StartupGuard::new").unwrap();
+        assert!(
+            production.find("validate_control_socket_parent").unwrap() < guard,
+            "control validation must stay before the first guarded task spawn",
+        );
+        assert!(
+            production
+                .find("PipelineWorker::new_with_process_metrics")
+                .unwrap()
+                < guard,
+            "pipeline/process-metric planning must stay pre-spawn",
+        );
+        assert!(
+            production.find("input_queue_sizes.insert").unwrap() < guard,
+            "input existence and queue-size parsing must stay pre-spawn",
+        );
+        let output_factory = production.find(".create_output(").unwrap();
+        assert!(guard < output_factory, "guard must own output resources");
+        let output_consumer = production[output_factory..]
+            .find("startup_guard.track(")
+            .unwrap()
+            + output_factory;
+        let post_output_edge = production[output_consumer..]
+            .find("post_output_preactivation_failure(&mut sender)")
+            .unwrap()
+            + output_consumer;
+        assert!(output_factory < output_consumer && output_consumer < post_output_edge);
+        assert!(production[output_consumer..post_output_edge].contains("output_task_kind"));
+        let listeners = production.find("start_listener_groups").unwrap();
+        let failpoint = production.rfind("late_post_listener_failure()").unwrap();
+        let commit = production.rfind("startup_guard.commit()").unwrap();
+        assert!(listeners < failpoint && failpoint < commit);
+        let rollback = production.find("async fn rollback").unwrap();
+        let rollback_body = &production[rollback..production.find("fn commit").unwrap()];
+        assert!(rollback_body.contains("shutdown_tasks"));
+        assert!(!rollback_body.contains(".abort()"));
+        let cleanup = &production[production.find("shutdown_tasks_with_timeout").unwrap()..guard];
+        assert!(cleanup.contains("task.handle = None"));
+        assert!(cleanup.contains("task.handle.take()"));
+        assert!(cleanup.contains("graceful_deadline"));
+        assert!(cleanup.contains("overall_deadline"));
+        assert!(cleanup.contains("TaskKind::AbortSafe"));
+        assert!(cleanup.contains("TaskKind::MustJoin"));
+        assert!(cleanup.contains("Await every remaining owner before returning"));
+    }
+
+    #[tokio::test]
+    async fn closed_shutdown_watch_is_terminal_for_pipeline_worker() {
+        let (sender, mut receiver) = watch::channel(false);
+        drop(sender);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                shutdown_change_is_terminal(&mut receiver),
+            )
+            .await
+            .expect("closed watch must resolve without spinning")
+        );
+        let marker = ["shutdown_change_is_terminal", "(&mut shutdown)"].concat();
+        assert!(include_str!("runtime.rs").contains(&marker));
+    }
+
+    #[tokio::test]
+    async fn closed_pipeline_watch_drains_already_queued_event_before_exit() {
+        let registry = Registry::new();
+        let worker = Arc::new(
+            PipelineWorker::new(
+                pipeline_def("def pipeline p { input i; finish }"),
+                &registry,
+            )
+            .unwrap(),
+        );
+        let workers = vec![Arc::clone(&worker)];
+        let ctx = PipelineContext {
+            output_senders: Arc::new(HashMap::new()),
+            disk_outputs: Arc::new(HashSet::new()),
+            config: Arc::new(compiled_config("")),
+            funcs: Arc::new(FunctionRegistry::new()),
+            tap: TapRegistry::new(),
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+        };
+        let (event_tx, event_rx) = mpsc::channel(1);
+        event_tx
+            .send(Event::new(
+                Bytes::from_static(b"queued-before-watch-close"),
+                "127.0.0.1:1".parse().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        drop(shutdown_tx);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_pipeline_workers(event_rx, &workers, &ctx, "i", shutdown_rx),
+        )
+        .await
+        .expect("closed watch must terminate after draining the input channel");
+        assert_eq!(worker.metrics.events_received.load(Ordering::Relaxed), 1);
+        assert_eq!(worker.metrics.events_discarded.load(Ordering::Relaxed), 1);
+        assert!(event_tx.is_closed());
     }
 }

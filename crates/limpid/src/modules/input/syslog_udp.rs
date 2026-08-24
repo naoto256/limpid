@@ -18,6 +18,13 @@ use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
 
+async fn shutdown_change_is_terminal(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    match shutdown.changed().await {
+        Ok(()) => *shutdown.borrow(),
+        Err(_) => true,
+    }
+}
+
 const SYSLOG_UDP_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "bind",
@@ -78,6 +85,7 @@ impl Input for SyslogUdpInput {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         let socket = UdpSocket::bind(&self.bind_addr).await?;
+        crate::modules::input_startup_ready();
         info!("syslog_udp listening on {}", self.bind_addr);
 
         let limiter = self.rate_limit.map(RateLimiter::new);
@@ -91,8 +99,8 @@ impl Input for SyslogUdpInput {
             tokio::select! {
                 biased;
 
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                terminal = shutdown_change_is_terminal(&mut shutdown) => {
+                    if terminal {
                         info!("syslog_udp: shutting down");
                         break;
                     }
@@ -279,5 +287,30 @@ mod tests {
             result.is_ok(),
             "run loop did not terminate after receiver drop"
         );
+    }
+
+    #[tokio::test]
+    async fn closed_shutdown_watch_is_terminal_for_syslog_udp_loop() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                shutdown_change_is_terminal(&mut receiver),
+            )
+            .await
+            .expect("closed watch must resolve without spinning")
+        );
+        let marker = ["shutdown_change_is_terminal", "(&mut shutdown)"].concat();
+        assert!(include_str!("syslog_udp.rs").contains(&marker));
+
+        let (handle, shutdown, _events, _metrics) =
+            spawn_input(format!("127.0.0.1:{}", pick_port()));
+        drop(shutdown);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("actual UDP loop must terminate on a closed watch")
+            .expect("UDP task must join")
+            .expect("UDP loop must exit cleanly");
     }
 }

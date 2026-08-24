@@ -313,25 +313,42 @@ impl Input for OtlpHttpInput {
         let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
         let result = match rustls {
             Some(config) => {
-                axum_server::bind_rustls(addr, config)
-                    .handle(handle)
-                    .serve(make_service)
-                    .await
+                let server = axum_server::bind_rustls(addr, config)
+                    .handle(handle.clone())
+                    .serve(make_service);
+                serve_after_listening(handle, server).await
             }
             None => {
-                axum_server::bind(addr)
-                    .handle(handle)
-                    .serve(make_service)
-                    .await
+                let server = axum_server::bind(addr)
+                    .handle(handle.clone())
+                    .serve(make_service);
+                serve_after_listening(handle, server).await
             }
         };
         shutdown_task.abort();
 
-        if let Err(e) = result {
-            warn!("otlp_http server error: {}", e);
-        }
+        result.context("otlp_http server failed")?;
         info!("otlp_http: shutting down");
         Ok(())
+    }
+}
+
+async fn serve_after_listening<F>(handle: Handle, server: F) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        listening = handle.listening() => {
+            if listening.is_none() {
+                return Err(std::io::Error::other(
+                    "otlp_http server stopped before acquiring its listener",
+                ));
+            }
+            crate::modules::input_startup_ready();
+            server.await
+        }
     }
 }
 

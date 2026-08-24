@@ -275,7 +275,11 @@ impl QueueSender {
                 .send(event)
                 .await
                 .map_err(|_| QueueSendError::ChannelClosed),
-            SenderInner::Disk(tx) => tx.send(event).await,
+            SenderInner::Disk(tx) => {
+                #[cfg(test)]
+                wait_on_test_wal_barrier().await;
+                tx.send(event).await
+            }
         };
         if let Some(m) = &self.metrics {
             if result.is_ok() {
@@ -305,6 +309,70 @@ impl QueueSender {
     /// Access the attached metrics (e.g. to increment `events_injected` on inject).
     pub fn metrics(&self) -> Option<&Arc<crate::metrics::OutputMetrics>> {
         self.metrics.as_ref()
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestWalBarrier {
+    reached: tokio::sync::Notify,
+    was_reached: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl TestWalBarrier {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            reached: tokio::sync::Notify::new(),
+            was_reached: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+            released: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) async fn wait_reached(&self) {
+        while !self.was_reached.load(std::sync::atomic::Ordering::SeqCst) {
+            self.reached.notified().await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_WAL_BARRIER: Arc<TestWalBarrier>;
+}
+
+#[cfg(test)]
+pub(crate) fn current_test_wal_barrier() -> Option<Arc<TestWalBarrier>> {
+    TEST_WAL_BARRIER.try_with(Arc::clone).ok()
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_wal_barrier<T>(
+    barrier: Arc<TestWalBarrier>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_WAL_BARRIER.scope(barrier, future).await
+}
+
+#[cfg(test)]
+async fn wait_on_test_wal_barrier() {
+    let barrier = current_test_wal_barrier();
+    if let Some(barrier) = barrier {
+        barrier
+            .was_reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        barrier.reached.notify_waiters();
+        while !barrier.released.load(std::sync::atomic::Ordering::SeqCst) {
+            barrier.release.notified().await;
+        }
     }
 }
 
@@ -927,6 +995,11 @@ pub struct QueueAckHandle {
     metrics: Arc<crate::metrics::OutputMetrics>,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_IMPLICIT_DROP_COUNT: Arc<std::sync::atomic::AtomicUsize>;
+}
+
 impl QueueAckHandle {
     pub fn new(
         tx: tokio::sync::mpsc::UnboundedSender<(AckPosition, AckDisposition)>,
@@ -1009,6 +1082,13 @@ impl QueueAckHandle {
         }
     }
 
+    /// Mark cancellation of the owning AbortSafe future as an intentional
+    /// `Dropped` disposition. The transmitter remains armed, so `Drop` emits
+    /// exactly one disposition unless a normal resolve method consumes it.
+    pub(crate) fn allow_abort_drop(&mut self) {
+        self.resolved = true;
+    }
+
     /// Test-only constructor returning the handle and the receiving
     /// half of its ack channel, so tests can assert on the disposition.
     #[cfg(test)]
@@ -1057,9 +1137,21 @@ impl Drop for QueueAckHandle {
              — bug: outputs MUST explicitly resolve their disposition"
         );
         if let Some(tx) = self.tx.take() {
+            #[cfg(test)]
+            let _ = TEST_IMPLICIT_DROP_COUNT.try_with(|count| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
             let _ = tx.send((self.position, AckDisposition::Dropped));
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_implicit_drop_count<T>(
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_IMPLICIT_DROP_COUNT.scope(count, future).await
 }
 
 /// Maximum number of events drained per [`QueueReceiver::recv_many`]
@@ -1082,6 +1174,13 @@ const RECV_BATCH_MAX: usize = 64;
 /// the queue cursor when its disposition comes back". The cursor
 /// only advances after the output's handle resolves, which for
 /// batched outputs happens at flush time, not at buffer-accept time.
+async fn shutdown_change_is_terminal(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    match shutdown.changed().await {
+        Ok(()) => *shutdown.borrow(),
+        Err(_) => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_queue_consumer(
     mut receiver: QueueReceiver,
@@ -1120,8 +1219,8 @@ pub async fn run_queue_consumer(
         tokio::select! {
             biased;
 
-            _ = shutdown.changed(), if accepting || wedged => {
-                if *shutdown.borrow() {
+            terminal = shutdown_change_is_terminal(&mut shutdown), if accepting || wedged => {
+                if terminal {
                     // Wedged path: skip the drain and break immediately.
                     // The consumer is not accepting new events (that is
                     // the wedge contract), and any handles still parked
@@ -1705,6 +1804,33 @@ mod consumer_lifecycle_tests {
     }
 
     // ---- queue boundary error tests ----
+
+    #[tokio::test]
+    async fn closed_watch_drains_memory_queue_and_terminates_consumer() {
+        let (sender, receiver) = create_queue(
+            "closed-watch".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 4,
+            },
+        )
+        .unwrap();
+        sender.send(owned_event()).await.unwrap();
+        let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Delivered]));
+        let metrics = writer.metrics();
+        let writer_for_task: Arc<dyn Output> = writer.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        drop(shutdown_tx);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_queue_consumer(receiver, writer_for_task, None, metrics, None, shutdown_rx),
+        )
+        .await
+        .expect("closed watch must drain and terminate the queue consumer");
+        assert_eq!(writer.calls(), 1);
+        drop(sender);
+    }
 
     #[tokio::test]
     async fn queue_sender_send_returns_channel_closed_when_receiver_dropped() {
@@ -3311,7 +3437,9 @@ mod consumer_lifecycle_tests {
     fn shutdown_drain_arm_is_backend_aware_and_uses_close_recv_pattern() {
         let src = include_str!("mod.rs");
         let arm_start = src
-            .find("_ = shutdown.changed(), if accepting || wedged =>")
+            .find(
+                "terminal = shutdown_change_is_terminal(&mut shutdown), if accepting || wedged =>",
+            )
             .expect("shutdown arm marker must exist");
         // Isolate the arm body from the wedge-shutdown early-break
         // to the next `break;` — the exit of the memory drain — and
@@ -3507,5 +3635,21 @@ mod schema_splice_tests {
         assert_eq!(cfg.initial_wait, std::time::Duration::from_millis(100));
         assert_eq!(cfg.max_wait, std::time::Duration::from_secs(5));
         assert!(matches!(cfg.backoff, BackoffStrategy::Exponential));
+    }
+
+    #[tokio::test]
+    async fn closed_shutdown_watch_is_terminal_for_queue_consumer() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                super::shutdown_change_is_terminal(&mut receiver),
+            )
+            .await
+            .expect("closed watch must resolve without spinning")
+        );
+        let marker = ["shutdown_change_is_terminal", "(&mut shutdown)"].concat();
+        assert!(include_str!("mod.rs").contains(&marker));
     }
 }

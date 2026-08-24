@@ -54,6 +54,67 @@ use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::queue::{QueueAckHandle, RetryConfig};
 
+#[cfg(test)]
+pub(crate) struct ShutdownTestObserver {
+    calls: std::sync::atomic::AtomicUsize,
+    completions: std::sync::atomic::AtomicUsize,
+    resolved_dispositions: std::sync::atomic::AtomicU64,
+    completed: Notify,
+}
+
+#[cfg(test)]
+impl ShutdownTestObserver {
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn completions(&self) -> usize {
+        self.completions.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn resolved_dispositions(&self) -> u64 {
+        self.resolved_dispositions.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn wait_for_completion(&self) {
+        while self.completions() == 0 {
+            self.completed.notified().await;
+        }
+    }
+}
+
+#[cfg(test)]
+fn shutdown_test_observers()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<ShutdownTestObserver>>> {
+    static OBSERVERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<ShutdownTestObserver>>>,
+    > = std::sync::OnceLock::new();
+    OBSERVERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn observe_shutdown_for_testing(name: &str) -> Arc<ShutdownTestObserver> {
+    let observer = Arc::new(ShutdownTestObserver {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        completions: std::sync::atomic::AtomicUsize::new(0),
+        resolved_dispositions: std::sync::atomic::AtomicU64::new(0),
+        completed: Notify::new(),
+    });
+    shutdown_test_observers()
+        .lock()
+        .expect("batched shutdown observer registry")
+        .insert(name.to_owned(), Arc::clone(&observer));
+    observer
+}
+
+#[cfg(test)]
+fn take_shutdown_test_observer(name: &str) -> Option<Arc<ShutdownTestObserver>> {
+    shutdown_test_observers()
+        .lock()
+        .expect("batched shutdown observer registry")
+        .remove(name)
+}
+
 /// One parked event in the batched sink's buffer: the event, the ack
 /// handle whose disposition it drives, and an optional bounded-ownership
 /// permit.
@@ -364,6 +425,13 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
     }
 
     pub(crate) async fn shutdown(&self) -> Result<()> {
+        #[cfg(test)]
+        let shutdown_observer = take_shutdown_test_observer(&self.inner.name);
+        #[cfg(test)]
+        if let Some(observer) = &shutdown_observer {
+            observer.calls.fetch_add(1, Ordering::SeqCst);
+        }
+
         // 1. Signal cooperative shutdown. `is_shutting_down`
         //    propagates to the actor's outer `select!`, to the
         //    retry sleep race, and (via the transport-cancel race
@@ -406,6 +474,16 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
         //    DLQ + Recovered.
         let leftover = std::mem::take(&mut *self.inner.batch.lock().await);
         self.inner.flush_events_at_shutdown(leftover).await;
+        #[cfg(test)]
+        if let Some(observer) = shutdown_observer {
+            observer.resolved_dispositions.store(
+                self.inner.metrics.events_written.load(Ordering::SeqCst)
+                    + self.inner.metrics.events_failed.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            observer.completions.fetch_add(1, Ordering::SeqCst);
+            observer.completed.notify_one();
+        }
         Ok(())
     }
 
