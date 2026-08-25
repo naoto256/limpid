@@ -541,11 +541,10 @@ impl ControlServer {
                                     | std::io::ErrorKind::NotFound
                             ) =>
                         {
-                            if let Err(error) = std::fs::remove_file(&self.socket_path) {
-                                let diagnostic = format!(
-                                    "control socket: failed to remove stale socket {:?}: {error}",
-                                    self.socket_path
-                                );
+                            if let Err(diagnostic) = classify_stale_socket_removal(
+                                &self.socket_path,
+                                std::fs::remove_file(&self.socket_path),
+                            ) {
                                 error!("{diagnostic}");
                                 send_control_startup(&mut startup, Err(diagnostic));
                                 return;
@@ -1512,9 +1511,44 @@ def pipeline p { input i; output o }
     }
 }
 
+#[cfg(unix)]
+fn classify_stale_socket_removal(
+    socket_path: &std::path::Path,
+    removal: std::io::Result<()>,
+) -> Result<(), String> {
+    match removal {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "control socket: failed to remove stale socket {socket_path:?}: {error}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_socket_removal_accepts_not_found_race_but_preserves_other_errors() {
+        let socket = std::path::Path::new("/run/limpid/control.sock");
+        assert!(
+            classify_stale_socket_removal(
+                socket,
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            )
+            .is_ok()
+        );
+
+        let error = classify_stale_socket_removal(
+            socket,
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .expect_err("non-NotFound removal failures must remain fatal");
+        assert!(error.contains("failed to remove stale socket"));
+        assert!(error.to_lowercase().contains("permission denied"));
+    }
 
     #[test]
     #[cfg(unix)]
