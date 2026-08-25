@@ -1298,15 +1298,23 @@ mod metrics_registration_tests {
     #[test]
     fn stdout_transport_mutant_sensitivity_pins_nonblocking_worker_path() {
         let source = include_str!("stdout.rs");
-        assert!(!source.contains(&["std::io::", "stdout"].concat()));
-        assert_eq!(source.matches(&["spawn_", "blocking"].concat()).count(), 1);
-        assert!(source.contains("StdoutBackend::Regular"));
-        assert!(source.contains("StdoutBackend::Async"));
-        assert!(source.contains("fd.writable()"));
-        assert!(source.contains("readiness.try_io"));
-        assert!(source.contains("let mut offset = 0usize"));
-        assert!(source.contains("let _serial = tokio::select!"));
-        assert!(source.contains("error.written != 0"));
+        let test_module = ["#[cfg(", "test)]\nmod metrics_registration_tests"].concat();
+        let production = source
+            .split_once(&test_module)
+            .expect("test module boundary must remain explicit")
+            .0;
+        assert!(!production.contains(&["std::io::", "stdout"].concat()));
+        assert_eq!(
+            production.matches(&["spawn_", "blocking"].concat()).count(),
+            1
+        );
+        assert!(production.contains(&["StdoutBackend::", "Regular"].concat()));
+        assert!(production.contains(&["StdoutBackend::", "Async"].concat()));
+        assert!(production.contains(&["fd.", "writable()"].concat()));
+        assert!(production.contains(&["readiness.", "try_io"].concat()));
+        assert!(production.contains(&["let mut ", "offset = 0usize"].concat()));
+        assert!(production.contains(&["let _serial = if ", "drain {"].concat()));
+        assert!(production.contains(&["error.", "written != 0"].concat()));
     }
 
     #[test]
