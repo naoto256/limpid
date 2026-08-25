@@ -58,6 +58,19 @@ use crate::modules::{HasMetrics, Input, Module};
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const JOURNAL_SOURCE: &str = "127.0.0.1:0";
 
+#[cfg(test)]
+#[derive(Default)]
+struct ControlledJournalReader {
+    started: AtomicBool,
+    stopped: AtomicBool,
+    join_observed: AtomicBool,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_JOURNAL_READER: Arc<ControlledJournalReader>;
+}
+
 const JOURNAL_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "match",
@@ -195,7 +208,23 @@ impl Input for JournalInput {
         let reader_shutdown_for_thread = Arc::clone(&reader_shutdown);
         let (reader_startup_tx, reader_startup_rx) = tokio::sync::oneshot::channel();
 
+        #[cfg(test)]
+        let controlled_reader = TEST_JOURNAL_READER.try_with(Arc::clone).ok();
+        #[cfg(test)]
+        let controlled_reader_for_thread = controlled_reader.clone();
+
         let journal_handle = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(control) = controlled_reader_for_thread {
+                control.started.store(true, Ordering::SeqCst);
+                let _ = reader_startup_tx.send(Ok(()));
+                while !reader_shutdown_for_thread.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                control.stopped.store(true, Ordering::SeqCst);
+                return;
+            }
+
             run_journal_reader(
                 matches,
                 state_file,
@@ -300,7 +329,12 @@ impl Input for JournalInput {
         // would detach it, and aborting a running blocking task is a
         // no-op, so neither is an acceptable resource disposition.
         reader_shutdown.store(true, Ordering::Relaxed);
-        match journal_handle.await {
+        let join_result = journal_handle.await;
+        #[cfg(test)]
+        if let Some(control) = controlled_reader {
+            control.join_observed.store(true, Ordering::SeqCst);
+        }
+        match join_result {
             Ok(()) => {}
             Err(error) => error!("journal reader task failed: {error}"),
         }
@@ -969,7 +1003,8 @@ def pipeline p { input j; output o }
     }
 
     #[tokio::test]
-    async fn closed_watch_stops_and_joins_actual_journal_reader() {
+    async fn closed_watch_stops_and_joins_controlled_blocking_reader() {
+        let control = Arc::new(ControlledJournalReader::default());
         let registry = crate::metrics::Registry::new();
         let input = JournalInput {
             matches: Vec::new(),
@@ -981,13 +1016,16 @@ def pipeline p { input j; output o }
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         drop(shutdown_tx);
 
-        tokio::time::timeout(Duration::from_secs(2), input.run(event_tx, shutdown_rx))
-            .await
-            .expect("closed watch must stop and join the blocking journal reader")
-            .expect("journal input shutdown must be clean");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            TEST_JOURNAL_READER.scope(Arc::clone(&control), input.run(event_tx, shutdown_rx)),
+        )
+        .await
+        .expect("closed watch must stop and join the controlled blocking reader")
+        .expect("journal input shutdown must be clean");
 
-        let source = include_str!("journal.rs");
-        assert!(source.contains("journal_handle.await"));
-        assert!(!source.contains(&["journal_handle", ".abort()"].concat()));
+        assert!(control.started.load(Ordering::SeqCst));
+        assert!(control.stopped.load(Ordering::SeqCst));
+        assert!(control.join_observed.load(Ordering::SeqCst));
     }
 }

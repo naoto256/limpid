@@ -160,7 +160,8 @@ impl Input for OtlpGrpcInput {
                 .context("otlp_grpc: failed to install server TLS config")?;
         }
         let incoming = tonic::transport::server::TcpIncoming::bind(addr)
-            .with_context(|| format!("otlp_grpc: failed to bind {addr}"))?;
+            .with_context(|| format!("otlp_grpc: failed to bind {addr}"))?
+            .with_nodelay(Some(true));
         crate::modules::input_startup_ready();
         let server = builder
             .add_service(LogsServiceServer::new(svc))
@@ -268,6 +269,56 @@ fn empty_response() -> ExportLogsServiceResponse {
 mod tests {
     use super::*;
     use crate::dsl::ast::Property;
+
+    #[test]
+    fn manual_tcp_incoming_preserves_tonic_nodelay_default() {
+        let source = include_str!("grpc.rs");
+        let test_module = ["#[cfg(", "test)]\nmod tests"].concat();
+        let production = source
+            .split_once(&test_module)
+            .expect("test module boundary must remain explicit")
+            .0;
+        let bind = ["TcpIncoming::", "bind(addr)"].concat();
+        let nodelay = [".with_", "nodelay(Some(true))"].concat();
+        let bind_at = production
+            .find(&bind)
+            .expect("manual TcpIncoming bind must remain in production");
+        let configured = &production[bind_at..];
+        let nodelay_at = configured
+            .find(&nodelay)
+            .expect("the configured incoming must enable TCP_NODELAY");
+        let serve = ["serve_with_", "incoming_shutdown(incoming"].concat();
+        let serve_at = configured
+            .find(&serve)
+            .expect("the configured incoming must be served");
+        assert!(
+            nodelay_at < serve_at,
+            "TCP_NODELAY must be set before serving"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_tcp_incoming_sets_nodelay_on_accepted_socket() {
+        use tokio_stream::StreamExt as _;
+
+        let mut incoming = tonic::transport::server::TcpIncoming::bind(
+            "127.0.0.1:0".parse().expect("loopback address"),
+        )
+        .expect("bind test incoming")
+        .with_nodelay(Some(true));
+        let address = incoming.local_addr().expect("bound address");
+        let client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect to test incoming");
+        let accepted = incoming
+            .next()
+            .await
+            .expect("incoming stream must yield")
+            .expect("accept must succeed");
+
+        assert!(accepted.nodelay().expect("read accepted TCP_NODELAY"));
+        drop(client);
+    }
 
     /// Wrap a property list in a `ModuleProperties` shaped for this test module.
     /// Mirrors what the parser produces for `def input/output ... { type otlp_grpc; ... }`
