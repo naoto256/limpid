@@ -506,6 +506,12 @@ place the rendered JSON under a Grafana dashboard provider's configured path.
 Validate the resulting dashboard has the intended datasource before restarting
 or reloading Grafana.
 
+The dashboard keeps the three local latency stages separate: input queue wait
+(T0→T1), pipeline processing (T1→T2), and output delivery (T2→T3). The panels
+below use example traffic; the metric boundaries are defined above.
+
+![Full Limpid Health & Flow Grafana dashboard](../assets/limpid-dashboard.png)
+
 Before deploying the alert rules, validate them with the same Prometheus
 version that will load them:
 
