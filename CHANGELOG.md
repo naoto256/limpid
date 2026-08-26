@@ -82,6 +82,20 @@ canonical sidecar checkpoint exercises the real control-socket and HTTP scrape
 path at three payload scales; detailed machine observations remain in the
 benchmark harness receipt rather than this product changelog.
 
+### Changed — latency metrics use non-overlapping stage boundaries
+
+`limpid_input_queue_wait_seconds{input}` now measures local input arrival to
+the shared pipeline dispatch start (T0→T1), with
+`limpid_input_queue_wait_negative_delta_total{input}` counting wall-clock
+reversals clamped to zero. `limpid_pipeline_processing_seconds{pipeline,output}`
+keeps its name, labels, and buckets, but now measures that shared dispatch start
+to each output snapshot (T1→T2) instead of starting at local input arrival.
+Output delivery remains the snapshot-to-Delivered stage (T2→T3).
+
+Pipeline-processing histogram values collected before and after this upgrade
+are not directly comparable because its start boundary changed despite the
+unchanged metric name and labels.
+
 ## [0.7.15] - 2026-07-20
 
 ### Changed — transport / format unwrapping separated from vocabulary parsing (breaking)

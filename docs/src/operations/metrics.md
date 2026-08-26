@@ -101,6 +101,20 @@ for the same-host multi-instance deployment caveat.
 
 ### Pipelines
 
+The input-queue boundary is measured before pipeline execution:
+
+| Metric | Label | Meaning |
+| --- | --- | --- |
+| `limpid_input_queue_wait_seconds` | `input` | Local input arrival to pipeline dispatch start after the event is dequeued. |
+| `limpid_input_queue_wait_negative_delta_total` | `input` | Input-queue wait durations clamped to zero after a wall-clock reversal. |
+
+Every dequeued event records exactly one input-queue observation, including
+events consumed while draining after shutdown begins. Its finite bucket bounds
+are `0.0001`, `0.001`, `0.005`, `0.025`, `0.1`, `0.5`, `2.5`, and `10`
+seconds. If the wall clock moves backward between local input arrival and
+dispatch start, the duration is clamped to zero and
+`limpid_input_queue_wait_negative_delta_total` increments.
+
 | Metric | Label | Meaning |
 | --- | --- | --- |
 | `limpid_pipeline_events_received_total` | `pipeline` | Events entering the pipeline. |
@@ -109,7 +123,7 @@ for the same-host multi-instance deployment caveat.
 | `limpid_pipeline_events_errored_total` | `pipeline` | Events that failed at a pipeline-side producer site and were routed to the [error log](./error-log.md). |
 | `limpid_pipeline_events_errored_unwritable_total` | `pipeline` | Pipeline-side error-log writes that failed. |
 | `limpid_pipeline_inflight` | `pipeline` | Pipeline executions currently in progress, including terminal bookkeeping. |
-| `limpid_pipeline_processing_seconds` | `pipeline`, `output` | Local input arrival to the emission of that output statement's event snapshot. |
+| `limpid_pipeline_processing_seconds` | `pipeline`, `output` | Pipeline dispatch start to the emission of that output statement's event snapshot. |
 | `limpid_pipeline_processing_negative_delta_total` | `pipeline`, `output` | Processing durations clamped to zero after a wall-clock reversal. |
 
 `events_discarded` is a possible routing-misconfiguration signal: the event
@@ -124,13 +138,16 @@ original event is preserved when the configured error-log write succeeds; see
 
 `limpid_pipeline_processing_seconds` is registered once for every configured
 `pipeline`/`output` pair. Each Output statement observes the interval from the
-event's local input `received_at` to that statement's snapshot; repeated calls
-to the same output share one series, while fan-out outputs observe independent
+event's single dispatch-start timestamp to that statement's snapshot. The same
+dispatch timestamp is shared by every configured pipeline handling that event,
+so input taps and time spent in earlier serial fan-out pipelines belong to the
+pipeline stage rather than creating a gap between stages. Repeated calls to the
+same output share one series, while fan-out outputs observe independent
 snapshots. Reaching an Output statement therefore adds one processing
 observation, including each branch of a fan-out. Its finite bucket bounds are
 `0.0001`, `0.001`, `0.005`, `0.025`,
 `0.1`, `0.5`, `2.5`, and `10` seconds.
-If the wall clock moves backward between input arrival and output emission, the
+If the wall clock moves backward between dispatch start and output emission, the
 duration is clamped to zero and
 `limpid_pipeline_processing_negative_delta_total` increments.
 
@@ -456,11 +473,12 @@ portable across one or several jobs; its `job` and `instance` variables are
 derived from `limpid_build_info` rather than fixed deployment names.
 
 After Prometheus reloads the checked configuration, verify all expected nodes
-and both latency boundaries:
+and all three local latency boundaries:
 
 ```promql
 count(up{job="limpid"} == 1)
 count(limpid_build_info{job="limpid"})
+sum by (instance) (limpid_input_queue_wait_seconds_count{job="limpid"})
 sum by (instance) (limpid_pipeline_processing_seconds_count{job="limpid"})
 sum by (instance) (limpid_output_delivery_seconds_count{job="limpid"})
 sum by (instance, segment) (limpid_ltp_hop_latency_seconds_count{job="limpid"})

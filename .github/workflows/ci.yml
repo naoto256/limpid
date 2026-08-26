@@ -173,10 +173,11 @@ jobs:
             ([.panels[].id] | length == (unique | length)) and
             ([.panels[] | [.gridPos.x, .gridPos.y, .gridPos.w, .gridPos.h] | @csv] | length == (unique | length)) and
             (all(.panels[]; .gridPos.x >= 0 and .gridPos.y >= 0 and .gridPos.w > 0 and .gridPos.h > 0 and (.gridPos.x + .gridPos.w) <= 24)) and
-            ([.panels[] | select(.type != "row")] | length == 23) and
-            ([.panels[].targets[]?.expr] | length == 32) and
+            ([.panels[] | select(.type != "row")] | length == 24) and
+            ([.panels[].targets[]?.expr] | length == 34) and
             ([$rows[].title] == ["Health","Inputs","Pipelines","Processes","Loss & recovery","Outputs","LTP"]) and
-            ([.panels[] | select(.id == 18)] | length == 1 and all(.title == "Input byte rate" and .gridPos.x == 0 and .gridPos.w == 24 and .gridPos.y > $rows[1].gridPos.y and (.gridPos.y + .gridPos.h) <= $rows[2].gridPos.y)) and
+            ([.panels[] | select(.id == 18)] | length == 1 and all(.gridPos.x == 0 and .gridPos.w == 24 and .gridPos.y > $rows[1].gridPos.y)) and
+            ([.panels[] | select(.id == 31)] | length == 1 and all(.gridPos.x == 0 and .gridPos.w == 24 and .gridPos.y == ($dashboard.panels[] | select(.id == 18) | (.gridPos.y + .gridPos.h)) and (.gridPos.y + .gridPos.h) <= $rows[2].gridPos.y)) and
             (all(.panels[] | select(.id as $id | [2,3,4,5] | index($id)); .gridPos.y > $rows[0].gridPos.y and (.gridPos.y + .gridPos.h) <= $rows[1].gridPos.y)) and
             (all(.panels[] | select(.id as $id | [7,8,9,28] | index($id)); .gridPos.y > $rows[2].gridPos.y and (.gridPos.y + .gridPos.h) <= $rows[3].gridPos.y)) and
             (all(.panels[] | select(.id as $id | [15,16] | index($id)); .gridPos.y > $rows[3].gridPos.y and (.gridPos.y + .gridPos.h) <= $rows[4].gridPos.y)) and
@@ -204,11 +205,14 @@ jobs:
             ([.panels[].targets[]?.expr | select(contains("limpid_ltp_rejected_unknown_peer_total"))] | length == 1 and all(contains("sum by (instance)") and (contains("peer=~") | not) and (contains("by (instance, peer)") | not))) and
             ([.panels[].targets[]?.expr | select(contains("limpid_ltp_hop_latency_seconds_bucket"))] | length == 2 and any(contains("segment=\"network\"") and contains("sum by (le)")) and any(contains("segment=\"intra\"") and contains("sum by (le)")) and all(contains("segment)") | not))
             and ([.panels[] | select(.id == 28) | .targets[]?.expr] | length == 1 and all(contains("limpid_pipeline_processing_seconds_bucket") and contains("pipeline=~\"$pipeline\"") and contains("output=~\"$output\"") and contains("sum by (le)")))
+            and ([.panels[] | select(.id == 28) | .description] | length == 1 and all(contains("shared dispatch start") and contains("earlier serial fan-out pipelines")))
             and ([.panels[] | select(.id == 29) | .targets[]?.expr] | length == 1 and all(contains("limpid_output_delivery_seconds_bucket") and contains("output=~\"$output\"") and contains("sum by (le)")))
+            and ([.panels[] | select(.id == 31 and .title == "Input queue wait latency distribution") | .targets[]?.expr] | length == 1 and all(contains("limpid_input_queue_wait_seconds_bucket") and contains("input=~\"$input\"") and contains("sum by (le)")))
             and ([.panels[] | select(.id == 30 and .title == "Clock-reversed latency observations")] | length == 1)
-            and ([.panels[] | select(.id == 30) | .targets[]] | length == 2)
+            and ([.panels[] | select(.id == 30) | .targets[]] | length == 3)
             and ([.panels[] | select(.id == 30) | .targets[] | select(.refId == "A")] | length == 1 and all((.expr | contains("limpid_pipeline_processing_negative_delta_total") and contains("job=~\"$job\"") and contains("instance=~\"$instance\"") and contains("pipeline=~\"$pipeline\"") and contains("output=~\"$output\"") and contains("sum by (instance, pipeline, output)")) and (.legendFormat | startswith("pipeline clamp "))))
             and ([.panels[] | select(.id == 30) | .targets[] | select(.refId == "B")] | length == 1 and all((.expr | contains("limpid_output_delivery_negative_delta_total") and contains("job=~\"$job\"") and contains("instance=~\"$instance\"") and contains("output=~\"$output\"") and contains("sum by (instance, output)")) and (.legendFormat | startswith("output clamp "))))
+            and ([.panels[] | select(.id == 30) | .targets[] | select(.refId == "C")] | length == 1 and all((.expr | contains("limpid_input_queue_wait_negative_delta_total") and contains("job=~\"$job\"") and contains("instance=~\"$instance\"") and contains("input=~\"$input\"") and contains("sum by (instance, input)")) and (.legendFormat | startswith("input clamp "))))
           ' "$dashboard"
           jq -e '
             [.. | strings] |
