@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::journal_sys::Journal;
+use super::journal_sys::{Journal, JournalWaitResult};
 use anyhow::Result;
 
 async fn shutdown_change_is_terminal(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
@@ -464,6 +464,34 @@ fn interruptible_sleep(shutdown: &AtomicBool, total: Duration) {
     }
 }
 
+/// Wait for journal change notification without letting libsystemd
+/// hide the reader from shutdown for longer than one sleep quantum.
+/// Returning `None` means shutdown was already requested and the
+/// caller should leave the reader loop without entering the wait.
+fn wait_for_journal_change<F>(
+    shutdown: &AtomicBool,
+    poll_interval: Duration,
+    wait: F,
+) -> Result<Option<JournalWaitResult>>
+where
+    F: FnOnce(u64) -> Result<JournalWaitResult>,
+{
+    const MAX_WAIT: Duration = Duration::from_millis(100);
+    const MIN_WAIT: Duration = Duration::from_micros(1);
+
+    if shutdown.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+
+    // The historical idle sleep checked shutdown every 100 ms. Keep
+    // that bound while using libsystemd's canonical change processing
+    // path. A zero poll interval is raised to one microsecond so a
+    // misconfigured reader cannot turn EOF into a pure userspace loop.
+    let timeout = poll_interval.min(MAX_WAIT).max(MIN_WAIT);
+    let timeout_usec = u64::try_from(timeout.as_micros()).expect("bounded timeout fits in u64");
+    wait(timeout_usec).map(Some)
+}
+
 /// Synchronous journal reader running in a blocking thread.
 fn run_journal_reader(
     matches: Vec<String>,
@@ -600,8 +628,25 @@ fn run_journal_reader(
                 }
             }
             Ok(_) => {
-                // No more entries, wait
-                interruptible_sleep(&shutdown, poll_interval);
+                // At EOF, libsystemd must process its inotify state so
+                // APPEND and, critically, rotation INVALIDATE events
+                // refresh this same long-lived handle's file set.
+                match wait_for_journal_change(&shutdown, poll_interval, |timeout_usec| {
+                    journal.wait(timeout_usec)
+                }) {
+                    Ok(Some(
+                        JournalWaitResult::Nop
+                        | JournalWaitResult::Append
+                        | JournalWaitResult::Invalidate,
+                    )) => {}
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("journal: wait error: {}", e);
+                        // A persistent libsystemd error must not turn
+                        // the reader into a busy loop.
+                        interruptible_sleep(&shutdown, poll_interval);
+                    }
+                }
             }
             Err(e) => {
                 warn!("journal: read error: {}", e);
@@ -708,8 +753,143 @@ fn save_cursor(path: &PathBuf, cursor: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::journal_sys::JournalWaitResult;
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn journal_wait_timeout_is_bounded_and_nop_is_preserved() {
+        let shutdown = AtomicBool::new(false);
+        let mut observed_timeout = None;
+        let result = wait_for_journal_change(&shutdown, Duration::from_secs(30), |timeout_usec| {
+            observed_timeout = Some(timeout_usec);
+            Ok(JournalWaitResult::Nop)
+        })
+        .unwrap();
+
+        assert_eq!(result, Some(JournalWaitResult::Nop));
+        assert_eq!(observed_timeout, Some(100_000));
+    }
+
+    #[test]
+    fn journal_wait_skips_blocking_call_after_shutdown() {
+        let shutdown = AtomicBool::new(true);
+        let result = wait_for_journal_change(&shutdown, Duration::from_secs(30), |_| {
+            panic!("shutdown must be checked before entering sd_journal_wait")
+        })
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn journal_wait_preserves_append_and_invalidate_notifications() {
+        let shutdown = AtomicBool::new(false);
+        for expected in [JournalWaitResult::Append, JournalWaitResult::Invalidate] {
+            let result =
+                wait_for_journal_change(&shutdown, Duration::from_secs(1), |_| Ok(expected))
+                    .unwrap();
+            assert_eq!(result, Some(expected));
+        }
+    }
+
+    #[test]
+    fn journal_wait_propagates_libsystemd_errors() {
+        let shutdown = AtomicBool::new(false);
+        let error = wait_for_journal_change(&shutdown, Duration::from_secs(1), |_| {
+            anyhow::bail!("synthetic sd_journal_wait failure")
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic sd_journal_wait failure")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "mutates the host journal; run explicitly on the controlled Linux builder"]
+    fn long_lived_reader_follows_journal_rotation_without_restart() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let identifier = format!("limpid-rotation-test-{}-{nonce}", std::process::id());
+        let before = format!("before-rotation-{nonce}");
+        let after = format!("after-rotation-{nonce}");
+
+        let (entry_tx, mut entry_rx) = tokio::sync::mpsc::channel(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let reader_shutdown = Arc::clone(&shutdown);
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let reader_identifier = identifier.clone();
+        let reader = std::thread::spawn(move || {
+            run_journal_reader(
+                vec![format!("SYSLOG_IDENTIFIER={reader_identifier}")],
+                None,
+                Duration::from_secs(2),
+                entry_tx,
+                reader_shutdown,
+                startup_tx,
+            );
+        });
+
+        assert_eq!(startup_rx.blocking_recv().unwrap(), Ok(()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let emit = |message: &str| {
+            let status = Command::new("logger")
+                .args(["-t", &identifier, message])
+                .status()
+                .expect("logger must be installed on the controlled builder");
+            assert!(status.success(), "logger failed with {status}");
+        };
+        let receive = |rx: &mut tokio::sync::mpsc::Receiver<(Vec<u8>, String)>, expected: &str| {
+            runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(10), rx.recv()).await })
+                .unwrap_or_else(|_| {
+                    panic!("reader timed out waiting for controlled journal entry: {expected}")
+                })
+                .expect("reader channel closed unexpectedly")
+        };
+
+        emit(&before);
+        let (before_bytes, before_cursor) = receive(&mut entry_rx, "before rotation");
+        assert!(
+            String::from_utf8_lossy(&before_bytes).contains(&before),
+            "pre-rotation entry must be consumed"
+        );
+
+        let rotate = Command::new("sudo")
+            .args(["-n", "journalctl", "--rotate"])
+            .status()
+            .expect("sudo and journalctl must be installed on the controlled builder");
+        assert!(rotate.success(), "journalctl --rotate failed with {rotate}");
+
+        emit(&after);
+        let (after_bytes, after_cursor) = receive(&mut entry_rx, "after rotation");
+        assert!(
+            String::from_utf8_lossy(&after_bytes).contains(&after),
+            "same reader must consume the post-rotation entry"
+        );
+        assert_ne!(
+            before_cursor, after_cursor,
+            "the long-lived reader cursor must advance across rotation"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        reader
+            .join()
+            .expect("journal reader must stop cooperatively");
+    }
 
     #[test]
     fn interruptible_sleep_returns_promptly_when_flag_set_before_call() {
