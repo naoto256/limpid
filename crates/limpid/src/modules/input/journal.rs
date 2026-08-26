@@ -442,6 +442,8 @@ fn collect_entry_fields(journal: &mut Journal) -> Result<JsonMap<String, JsonVal
     Ok(map)
 }
 
+const JOURNAL_SHUTDOWN_QUANTUM: Duration = Duration::from_millis(100);
+
 /// Sleep up to `total` but wake early when `shutdown` is set.
 ///
 /// The journal reader's idle path used to be a plain
@@ -452,16 +454,32 @@ fn collect_entry_fields(journal: &mut Journal) -> Result<JsonMap<String, JsonVal
 /// in small quanta and re-checking the flag bounds shutdown latency
 /// to roughly one quantum regardless of `poll_interval`.
 fn interruptible_sleep(shutdown: &AtomicBool, total: Duration) {
-    const QUANTUM: Duration = Duration::from_millis(100);
     let mut remaining = total;
     while remaining > Duration::ZERO {
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let nap = remaining.min(QUANTUM);
+        let nap = remaining.min(JOURNAL_SHUTDOWN_QUANTUM);
         std::thread::sleep(nap);
         remaining = remaining.saturating_sub(nap);
     }
+}
+
+/// Back off after an immediate `sd_journal_wait` failure.
+///
+/// Positive configured intervals retain their exact behavior. Only
+/// zero is raised to the existing shutdown quantum so a persistent
+/// libsystemd error cannot busy-spin while shutdown remains bounded.
+fn backoff_after_journal_wait_error<F>(shutdown: &AtomicBool, poll_interval: Duration, sleep: F)
+where
+    F: FnOnce(&AtomicBool, Duration),
+{
+    let delay = if poll_interval.is_zero() {
+        JOURNAL_SHUTDOWN_QUANTUM
+    } else {
+        poll_interval
+    };
+    sleep(shutdown, delay);
 }
 
 /// Wait for journal change notification without letting libsystemd
@@ -644,7 +662,11 @@ fn run_journal_reader(
                         warn!("journal: wait error: {}", e);
                         // A persistent libsystemd error must not turn
                         // the reader into a busy loop.
-                        interruptible_sleep(&shutdown, poll_interval);
+                        backoff_after_journal_wait_error(
+                            &shutdown,
+                            poll_interval,
+                            interruptible_sleep,
+                        );
                     }
                 }
             }
@@ -806,6 +828,31 @@ mod tests {
                 .to_string()
                 .contains("synthetic sd_journal_wait failure")
         );
+    }
+
+    #[test]
+    fn journal_wait_error_backoff_clamps_only_zero_across_immediate_retries() {
+        let shutdown = AtomicBool::new(false);
+        let mut observed = Vec::new();
+
+        // Model repeated sd_journal_wait failures that return without
+        // blocking. Every retry must still request a real delay; a
+        // Duration::ZERO mutant makes all four observations zero.
+        for _ in 0..4 {
+            backoff_after_journal_wait_error(&shutdown, Duration::ZERO, |_, delay| {
+                observed.push(delay);
+            });
+        }
+        assert_eq!(observed, vec![Duration::from_millis(100); 4]);
+
+        // Existing positive configuration is authoritative and must
+        // pass through byte-for-byte rather than being rounded to the
+        // error floor.
+        let configured = Duration::from_micros(37);
+        backoff_after_journal_wait_error(&shutdown, configured, |_, delay| {
+            observed.push(delay);
+        });
+        assert_eq!(observed.last(), Some(&configured));
     }
 
     #[cfg(target_os = "linux")]
