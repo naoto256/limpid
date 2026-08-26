@@ -24,6 +24,10 @@ use std::ptr;
 
 use anyhow::{Result, bail};
 
+const SD_JOURNAL_NOP: c_int = 0;
+const SD_JOURNAL_APPEND: c_int = 1;
+const SD_JOURNAL_INVALIDATE: c_int = 2;
+
 /// Opaque `sd_journal` handle. Only ever touched behind a pointer —
 /// its layout is libsystemd's business, not ours.
 #[repr(C)]
@@ -35,6 +39,7 @@ unsafe extern "C" {
     fn sd_journal_open(ret: *mut *mut SdJournal, flags: c_int) -> c_int;
     fn sd_journal_close(j: *mut SdJournal);
     fn sd_journal_next(j: *mut SdJournal) -> c_int;
+    fn sd_journal_wait(j: *mut SdJournal, timeout_usec: u64) -> c_int;
     fn sd_journal_previous(j: *mut SdJournal) -> c_int;
     fn sd_journal_add_match(j: *mut SdJournal, data: *const c_void, size: usize) -> c_int;
     fn sd_journal_seek_tail(j: *mut SdJournal) -> c_int;
@@ -93,6 +98,16 @@ impl<'a> JournalField<'a> {
 
 pub struct Journal {
     ptr: *mut SdJournal,
+}
+
+/// Change classification returned by `sd_journal_wait` (and
+/// `sd_journal_process`). `Invalidate` includes journal rotation and
+/// vacuuming; callers must re-check the same handle with `next()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalWaitResult {
+    Nop,
+    Append,
+    Invalidate,
 }
 
 impl Journal {
@@ -159,6 +174,17 @@ impl Journal {
             bail!("sd_journal_next failed: {}", errno_msg(rc));
         }
         Ok(rc)
+    }
+
+    /// Wait for journal changes for at most `timeout_usec` microseconds.
+    ///
+    /// `sd_journal_wait` performs the required `sd_journal_process`
+    /// step internally and returns its `NOP` / `APPEND` / `INVALIDATE`
+    /// classification. In particular, `INVALIDATE` is the rotation
+    /// signal that makes a long-lived handle notice the new active file.
+    pub fn wait(&mut self, timeout_usec: u64) -> Result<JournalWaitResult> {
+        let rc = unsafe { sd_journal_wait(self.ptr, timeout_usec) };
+        classify_wait_result(rc)
     }
 
     pub fn previous(&mut self) -> Result<c_int> {
@@ -251,4 +277,35 @@ impl Drop for Journal {
 /// negative errno-style code on failure (`sd-journal(3)`).
 fn errno_msg(rc: c_int) -> String {
     std::io::Error::from_raw_os_error(-rc).to_string()
+}
+
+fn classify_wait_result(rc: c_int) -> Result<JournalWaitResult> {
+    match rc {
+        SD_JOURNAL_NOP => Ok(JournalWaitResult::Nop),
+        SD_JOURNAL_APPEND => Ok(JournalWaitResult::Append),
+        SD_JOURNAL_INVALIDATE => Ok(JournalWaitResult::Invalidate),
+        rc if rc < 0 => bail!("sd_journal_wait failed: {}", errno_msg(rc)),
+        rc => bail!("sd_journal_wait returned unexpected result: {rc}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_result_constants_match_the_sd_journal_contract() {
+        assert_eq!(classify_wait_result(0).unwrap(), JournalWaitResult::Nop);
+        assert_eq!(classify_wait_result(1).unwrap(), JournalWaitResult::Append);
+        assert_eq!(
+            classify_wait_result(2).unwrap(),
+            JournalWaitResult::Invalidate
+        );
+    }
+
+    #[test]
+    fn wait_result_rejects_errno_and_unknown_positive_values() {
+        assert!(classify_wait_result(-libc::EIO).is_err());
+        assert!(classify_wait_result(3).is_err());
+    }
 }
