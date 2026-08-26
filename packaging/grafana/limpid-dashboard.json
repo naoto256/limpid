@@ -91,7 +91,7 @@
       "title": "Pipelines",
       "description": "How quickly are events entering, finishing, and dropping at pipeline roots?",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
       "panels": []
     },
     {
@@ -105,7 +105,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 }
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 }
     },
     {
       "id": 8,
@@ -118,7 +118,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 }
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 }
     },
     {
       "id": 9,
@@ -131,20 +131,20 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 }
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 }
     },
     {
       "id": 28,
       "type": "heatmap",
       "title": "Pipeline processing latency distribution",
-      "description": "Rate of local processing-latency histogram buckets in seconds, from this daemon's input receipt to each reached Output statement. Fan-out contributes one observation per reached output.",
+      "description": "Rate of pipeline-stage histogram buckets in seconds, from the event's shared dispatch start to each reached Output statement. Input taps and earlier serial fan-out pipelines are included; fan-out contributes one observation per reached output.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         { "refId": "A", "expr": "sum by (le) (rate(limpid_pipeline_processing_seconds_bucket{job=~\"$job\",instance=~\"$instance\",pipeline=~\"$pipeline\",output=~\"$output\"}[$__rate_interval]))", "format": "heatmap", "legendFormat": "processing" }
       ],
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "options": { "calculate": false, "cellGap": 1, "color": { "exponent": 0.5, "fill": "dark-orange", "mode": "scheme", "reverse": false, "scale": "exponential", "scheme": "Oranges", "steps": 64 }, "filterValues": { "le": 1e-9 }, "legend": { "show": true }, "rowsFrame": { "layout": "auto" }, "tooltip": { "showColorScale": false, "yHistogram": false } },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 }
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 }
     },
     {
       "id": 10,
@@ -152,7 +152,7 @@
       "title": "Loss & recovery",
       "description": "Where are drops and recovery failures occurring? Inspect affected identities with `limpidctl stats --details`.",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 50 },
       "panels": []
     },
     {
@@ -166,7 +166,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 43 }
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 51 }
     },
     {
       "id": 12,
@@ -179,7 +179,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 43 }
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 51 }
     },
     {
       "id": 13,
@@ -193,7 +193,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 43 }
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 51 }
     },
     {
       "id": 30,
@@ -203,11 +203,12 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         { "refId": "A", "expr": "sum by (instance, pipeline, output) (rate(limpid_pipeline_processing_negative_delta_total{job=~\"$job\",instance=~\"$instance\",pipeline=~\"$pipeline\",output=~\"$output\"}[$__rate_interval]))", "legendFormat": "pipeline clamp {{instance}} / {{pipeline}} / {{output}}" },
-        { "refId": "B", "expr": "sum by (instance, output) (rate(limpid_output_delivery_negative_delta_total{job=~\"$job\",instance=~\"$instance\",output=~\"$output\"}[$__rate_interval]))", "legendFormat": "output clamp {{instance}} / {{output}}" }
+        { "refId": "B", "expr": "sum by (instance, output) (rate(limpid_output_delivery_negative_delta_total{job=~\"$job\",instance=~\"$instance\",output=~\"$output\"}[$__rate_interval]))", "legendFormat": "output clamp {{instance}} / {{output}}" },
+        { "refId": "C", "expr": "sum by (instance, input) (rate(limpid_input_queue_wait_negative_delta_total{job=~\"$job\",instance=~\"$instance\",input=~\"$input\"}[$__rate_interval]))", "legendFormat": "input clamp {{instance}} / {{input}}" }
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 51 }
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 59 }
     },
     {
       "id": 14,
@@ -215,7 +216,7 @@
       "title": "Processes",
       "description": "Which process invocations are active? These counters count invocation frames and must not be summed as event totals.",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
       "panels": []
     },
     {
@@ -230,7 +231,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 33 }
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 41 }
     },
     {
       "id": 16,
@@ -243,7 +244,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 33 }
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 41 }
     },
     {
       "id": 17,
@@ -251,7 +252,7 @@
       "title": "Outputs",
       "description": "Are selected outputs draining without retry, failure, or wedge?",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 59 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
       "panels": []
     },
     {
@@ -268,6 +269,19 @@
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 7 }
     },
     {
+      "id": 31,
+      "type": "heatmap",
+      "title": "Input queue wait latency distribution",
+      "description": "Rate of input-queue wait histogram buckets in seconds, from local input arrival to pipeline dispatch start after dequeue. Each event is observed once, including shutdown drain.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (le) (rate(limpid_input_queue_wait_seconds_bucket{job=~\"$job\",instance=~\"$instance\",input=~\"$input\"}[$__rate_interval]))", "format": "heatmap", "legendFormat": "queue wait" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "calculate": false, "cellGap": 1, "color": { "exponent": 0.5, "fill": "dark-orange", "mode": "scheme", "reverse": false, "scale": "exponential", "scheme": "Oranges", "steps": 64 }, "filterValues": { "le": 1e-9 }, "legend": { "show": true }, "rowsFrame": { "layout": "auto" }, "tooltip": { "showColorScale": false, "yHistogram": false } },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 15 }
+    },
+    {
       "id": 19,
       "type": "timeseries",
       "title": "Output byte rate",
@@ -278,7 +292,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 60 }
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 }
     },
     {
       "id": 20,
@@ -294,7 +308,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 60 }
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 }
     },
     {
       "id": 21,
@@ -308,7 +322,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 68 }
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 76 }
     },
     {
       "id": 29,
@@ -321,7 +335,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "options": { "calculate": false, "cellGap": 1, "color": { "exponent": 0.5, "fill": "dark-orange", "mode": "scheme", "reverse": false, "scale": "exponential", "scheme": "Oranges", "steps": 64 }, "filterValues": { "le": 1e-9 }, "legend": { "show": true }, "rowsFrame": { "layout": "auto" }, "tooltip": { "showColorScale": false, "yHistogram": false } },
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 76 }
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 84 }
     },
     {
       "id": 22,
@@ -329,7 +343,7 @@
       "title": "LTP",
       "description": "Are authenticated peers forwarding promptly without loop, identity, or clock anomalies?",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 85 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 93 },
       "panels": []
     },
     {
@@ -343,7 +357,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "options": { "calculate": false, "cellGap": 1, "color": { "exponent": 0.5, "fill": "dark-orange", "mode": "scheme", "reverse": false, "scale": "exponential", "scheme": "Oranges", "steps": 64 }, "filterValues": { "le": 1e-9 }, "legend": { "show": true }, "rowsFrame": { "layout": "auto" }, "tooltip": { "showColorScale": false, "yHistogram": false } },
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 86 }
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 94 }
     },
     {
       "id": 26,
@@ -356,7 +370,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "options": { "calculate": false, "cellGap": 1, "color": { "exponent": 0.5, "fill": "dark-orange", "mode": "scheme", "reverse": false, "scale": "exponential", "scheme": "Oranges", "steps": 64 }, "filterValues": { "le": 1e-9 }, "legend": { "show": true }, "rowsFrame": { "layout": "auto" }, "tooltip": { "showColorScale": false, "yHistogram": false } },
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 86 }
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 94 }
     },
     {
       "id": 24,
@@ -369,7 +383,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 95 }
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 103 }
     },
     {
       "id": 25,
@@ -384,7 +398,7 @@
       ],
       "fieldConfig": { "defaults": { "unit": "eps", "custom": { "drawStyle": "line", "lineInterpolation": "linear", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 95 }
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 103 }
     }
   ],
   "refresh": "30s",

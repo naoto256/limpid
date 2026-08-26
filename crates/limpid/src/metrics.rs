@@ -36,6 +36,8 @@ pub(crate) fn register_build_info(
 
 pub(crate) const LTP_HOP_LATENCY_BUCKETS: [f64; 8] =
     [0.0001, 0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0];
+pub(crate) const INPUT_QUEUE_WAIT_BUCKETS: [f64; 8] =
+    [0.0001, 0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0];
 pub(crate) const PIPELINE_PROCESSING_BUCKETS: [f64; 8] =
     [0.0001, 0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0];
 pub(crate) const OUTPUT_DELIVERY_BUCKETS: [f64; 12] = [
@@ -73,6 +75,58 @@ impl DurationHistogram {
 }
 
 #[derive(Clone)]
+pub(crate) struct InputQueueTimer {
+    histogram: DurationHistogram,
+    negative_delta: Arc<registry_core::Counter>,
+}
+
+impl InputQueueTimer {
+    pub(crate) fn register(registry: &Registry, input: &str) -> Result<Self, MetricsError> {
+        Ok(Self {
+            histogram: DurationHistogram::new(
+                registry
+                    .histogram("limpid_input_queue_wait_seconds")
+                    .label("input", input)
+                    .help(
+                        "Time from local input arrival to pipeline dispatch start after input-queue dequeue.",
+                    )
+                    .buckets(&INPUT_QUEUE_WAIT_BUCKETS)
+                    .build()?,
+            ),
+            negative_delta: registry
+                .counter("limpid_input_queue_wait_negative_delta_total")
+                .label("input", input)
+                .help(
+                    "Total input queue-wait durations clamped to zero after a wall-clock reversal.",
+                )
+                .build()?,
+        })
+    }
+
+    pub(crate) fn observe_between(
+        &self,
+        received_at: crate::time::UnixNanos,
+        dispatch_started_at: crate::time::UnixNanos,
+    ) {
+        let elapsed = dispatch_started_at.elapsed_since(received_at);
+        if elapsed.reversed {
+            self.negative_delta.inc();
+        }
+        self.histogram.observe(elapsed.duration);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> u64 {
+        self.histogram.count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sum(&self) -> f64 {
+        self.histogram.sum()
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct PipelineOutputTimer {
     histogram: DurationHistogram,
     negative_delta: Arc<registry_core::Counter>,
@@ -91,7 +145,7 @@ impl PipelineOutputTimer {
                     .label("pipeline", pipeline)
                     .label("output", output)
                     .help(
-                        "Time from local input arrival to emission at this pipeline output statement.",
+                        "Time from pipeline dispatch start to emission at this pipeline output statement.",
                     )
                     .buckets(&PIPELINE_PROCESSING_BUCKETS)
                     .build()?,
@@ -1311,9 +1365,9 @@ pub(crate) use registry_core::{MetricsError, Registry};
 #[cfg(test)]
 mod registry_tests {
     use super::{
-        InputMetrics, LTP_HOP_LATENCY_BUCKETS, LtpMetrics, MetricsError, MetricsSnapshot,
-        OUTPUT_DELIVERY_BUCKETS, OutputMetrics, PIPELINE_PROCESSING_BUCKETS, PipelineMetrics,
-        PipelineOutputTimer, Registry,
+        INPUT_QUEUE_WAIT_BUCKETS, InputMetrics, InputQueueTimer, LTP_HOP_LATENCY_BUCKETS,
+        LtpMetrics, MetricsError, MetricsSnapshot, OUTPUT_DELIVERY_BUCKETS, OutputMetrics,
+        PIPELINE_PROCESSING_BUCKETS, PipelineMetrics, PipelineOutputTimer, Registry,
     };
     use serde_json::Value;
     use std::collections::BTreeSet;
@@ -1327,39 +1381,48 @@ mod registry_tests {
     }
 
     #[test]
-    fn output_latency_histograms_have_exact_labels_buckets_and_nonnegative_time() {
+    fn stage_latency_histograms_have_exact_boundaries_labels_buckets_and_clamps() {
         let registry = Registry::new();
+        let input = build_ok(InputQueueTimer::register(&registry, "ingress"));
+        let reversed_input = build_ok(InputQueueTimer::register(&registry, "reversed"));
         let pipeline = build_ok(PipelineOutputTimer::register(&registry, "route", "egress"));
         let output = build_ok(OutputMetrics::register(&registry, "egress"));
-        let start = crate::time::UnixNanos::new(2_000_000_000);
+        let t0 = crate::time::UnixNanos::new(1_000_000_000);
+        let t1 = crate::time::UnixNanos::new(2_000_000_000);
+        let t2 = crate::time::UnixNanos::new(4_000_000_000);
+        let t3 = crate::time::UnixNanos::new(7_000_000_000);
 
-        pipeline.observe_between(start, crate::time::UnixNanos::new(1_000_000_000));
-        pipeline.observe_between(start, crate::time::UnixNanos::new(2_250_000_000));
-        pipeline.observe_between(start, crate::time::UnixNanos::new(2_500_000_000));
-        output.observe_delivery(start, crate::time::UnixNanos::new(1_000_000_000));
-        output.observe_delivery(start, crate::time::UnixNanos::new(3_500_000_000));
-        output.observe_delivery(start, crate::time::UnixNanos::new(2_500_000_000));
+        input.observe_between(t0, t1);
+        pipeline.observe_between(t1, t2);
+        output.observe_delivery(t2, t3);
+        reversed_input.observe_between(t1, t0);
 
         let snapshot = snapshot_json(&registry);
         for (name, labels, bounds, expected_sum) in [
             (
+                "limpid_input_queue_wait_seconds",
+                serde_json::json!({"input": "ingress"}),
+                INPUT_QUEUE_WAIT_BUCKETS.as_slice(),
+                1.0,
+            ),
+            (
                 "limpid_pipeline_processing_seconds",
                 serde_json::json!({"pipeline": "route", "output": "egress"}),
                 PIPELINE_PROCESSING_BUCKETS.as_slice(),
-                0.75,
+                2.0,
             ),
             (
                 "limpid_output_delivery_seconds",
                 serde_json::json!({"output": "egress"}),
                 OUTPUT_DELIVERY_BUCKETS.as_slice(),
-                2.0,
+                3.0,
             ),
         ] {
             let family = metric(&snapshot, name);
             assert_eq!(family["type"], "histogram");
             let series = &family["series"][0];
             assert_eq!(series["labels"], labels);
-            assert_eq!(series["count"], 3);
+            assert_eq!(series["count"], 1);
             assert_eq!(series["sum"].as_f64(), Some(expected_sum));
             let buckets = series["buckets"].as_array().unwrap();
             assert_eq!(buckets.len(), bounds.len());
@@ -1368,20 +1431,51 @@ mod registry_tests {
             }
         }
 
-        for (name, labels) in [
+        let reversed = metric(&snapshot, "limpid_input_queue_wait_seconds");
+        let reversed_series = reversed["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|series| series["labels"]["input"] == "reversed")
+            .unwrap();
+        assert_eq!(reversed_series["count"], 1);
+        assert_eq!(reversed_series["sum"], 0.0);
+        let counter = metric(&snapshot, "limpid_input_queue_wait_negative_delta_total");
+        let reversed_counter = counter["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|series| series["labels"]["input"] == "reversed")
+            .unwrap();
+        assert_eq!(reversed_counter["value"], 1);
+    }
+
+    #[test]
+    fn existing_pipeline_and_output_reversal_semantics_remain_unchanged() {
+        let registry = Registry::new();
+        let pipeline = build_ok(PipelineOutputTimer::register(&registry, "route", "egress"));
+        let output = build_ok(OutputMetrics::register(&registry, "egress"));
+        let later = crate::time::UnixNanos::new(2_000_000_000);
+        let earlier = crate::time::UnixNanos::new(1_000_000_000);
+
+        pipeline.observe_between(later, earlier);
+        output.observe_delivery(later, earlier);
+
+        let snapshot = snapshot_json(&registry);
+        for (histogram, counter) in [
             (
+                "limpid_pipeline_processing_seconds",
                 "limpid_pipeline_processing_negative_delta_total",
-                serde_json::json!({"pipeline": "route", "output": "egress"}),
             ),
             (
+                "limpid_output_delivery_seconds",
                 "limpid_output_delivery_negative_delta_total",
-                serde_json::json!({"output": "egress"}),
             ),
         ] {
-            let family = metric(&snapshot, name);
-            assert_eq!(family["type"], "counter");
-            assert_eq!(family["series"][0]["labels"], labels);
-            assert_eq!(family["series"][0]["value"], 1);
+            let series = &metric(&snapshot, histogram)["series"][0];
+            assert_eq!(series["count"], 1);
+            assert_eq!(series["sum"], 0.0);
+            assert_eq!(metric(&snapshot, counter)["series"][0]["value"], 1);
         }
     }
 
@@ -2099,6 +2193,7 @@ mod registry_tests {
     fn documented_metric_bundles_share_one_registry_without_shadow_series() {
         let registry = Registry::new();
         let input: Arc<InputMetrics> = build_ok(InputMetrics::register(&registry, "ingress"));
+        let input_queue = build_ok(InputQueueTimer::register(&registry, "ingress"));
         let pipeline: Arc<PipelineMetrics> =
             build_ok(PipelineMetrics::register(&registry, "route"));
         let output: Arc<OutputMetrics> = build_ok(OutputMetrics::register(&registry, "egress"));
@@ -2144,6 +2239,19 @@ mod registry_tests {
             )
         );
 
+        let queue_wait = metric(&initial, "limpid_input_queue_wait_seconds");
+        assert_eq!(queue_wait["type"], "histogram");
+        assert_eq!(
+            queue_wait["help"],
+            "Time from local input arrival to pipeline dispatch start after input-queue dequeue."
+        );
+        assert_eq!(
+            queue_wait["series"][0]["labels"],
+            serde_json::json!({"input": "ingress"})
+        );
+        assert_eq!(queue_wait["series"][0]["count"], 0);
+        assert_eq!(input_queue.count(), 0);
+
         macro_rules! inc {
             ($counter:expr, $times:expr) => {
                 for _ in 0..$times {
@@ -2181,7 +2289,7 @@ mod registry_tests {
             .expect("metrics must be an array");
         assert_eq!(
             metrics.len(),
-            23,
+            25,
             "only the documented metric set is registered"
         );
 

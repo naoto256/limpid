@@ -750,6 +750,11 @@ impl Runtime {
                 .remove(&input_name)
                 .expect("input queue-size preflight");
             let (event_tx, event_rx) = mpsc::channel::<Event>(queue_size);
+            let input_queue_timer =
+                match crate::metrics::InputQueueTimer::register(&metrics_registry, &input_name) {
+                    Ok(timer) => timer,
+                    Err(error) => return Err(startup_guard.rollback(error.into()).await),
+                };
 
             // Pipeline workers subscribed to this input. A pipeline with fan-in
             // (`input a, b;`) appears in the worker list of both inputs — its
@@ -786,17 +791,32 @@ impl Runtime {
                                 &workers,
                                 &ctx,
                                 &iname,
+                                &input_queue_timer,
                                 shutdown_for_worker,
                             ),
                         )
                         .await;
                     } else {
-                        run_pipeline_workers(event_rx, &workers, &ctx, &iname, shutdown_for_worker)
-                            .await;
+                        run_pipeline_workers(
+                            event_rx,
+                            &workers,
+                            &ctx,
+                            &iname,
+                            &input_queue_timer,
+                            shutdown_for_worker,
+                        )
+                        .await;
                     }
                     #[cfg(not(test))]
-                    run_pipeline_workers(event_rx, &workers, &ctx, &iname, shutdown_for_worker)
-                        .await;
+                    run_pipeline_workers(
+                        event_rx,
+                        &workers,
+                        &ctx,
+                        &iname,
+                        &input_queue_timer,
+                        shutdown_for_worker,
+                    )
+                    .await;
                     #[cfg(test)]
                     if let Some(observer) = completion_observer {
                         observer
@@ -1039,6 +1059,8 @@ struct PipelineWorker {
     def: PipelineDef,
     metrics: Arc<PipelineMetrics>,
     process_metrics: Option<Arc<crate::pipeline::PipelineProcessMetrics>>,
+    #[cfg(test)]
+    serial_test_gate: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl PipelineWorker {
@@ -1049,6 +1071,7 @@ impl PipelineWorker {
             def,
             metrics,
             process_metrics: None,
+            serial_test_gate: None,
         })
     }
 
@@ -1065,6 +1088,8 @@ impl PipelineWorker {
             def,
             metrics,
             process_metrics: Some(process_metrics),
+            #[cfg(test)]
+            serial_test_gate: None,
         })
     }
 
@@ -1092,6 +1117,7 @@ impl PipelineWorker {
             process_metrics: Some(Arc::new(plan.process_metrics.validate(&def, processes)?)),
             def,
             metrics: plan.pipeline_metrics,
+            serial_test_gate: None,
         })
     }
 }
@@ -1137,6 +1163,7 @@ async fn run_pipeline_workers(
     workers: &[Arc<PipelineWorker>],
     ctx: &PipelineContext,
     input_name: &str,
+    input_queue_timer: &crate::metrics::InputQueueTimer,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     info!(
@@ -1181,7 +1208,15 @@ async fn run_pipeline_workers(
                     // themselves (see `run_input`).
                     event_rx.close();
                     while let Some(event) = event_rx.recv().await {
-                        process_event(&event, workers, ctx, &input_tap_key, &mut bump).await;
+                        process_event(
+                            &event,
+                            workers,
+                            ctx,
+                            &input_tap_key,
+                            input_queue_timer,
+                            &mut bump,
+                        )
+                        .await;
                         bump.reset();
                     }
                     break;
@@ -1196,7 +1231,15 @@ async fn run_pipeline_workers(
                 }
             }
         };
-        process_event(&event, workers, ctx, &input_tap_key, &mut bump).await;
+        process_event(
+            &event,
+            workers,
+            ctx,
+            &input_tap_key,
+            input_queue_timer,
+            &mut bump,
+        )
+        .await;
         bump.reset();
     }
 
@@ -1210,7 +1253,15 @@ async fn run_pipeline_with_outputs(
     ctx: &PipelineContext,
     bump: &mut bumpalo::Bump,
 ) -> Result<crate::pipeline::PipelineRunResult> {
-    run_pipeline_with_outputs_inner(pipeline, None, event, ctx, bump).await
+    run_pipeline_with_outputs_inner(
+        pipeline,
+        None,
+        event,
+        ctx,
+        bump,
+        crate::time::UnixNanos::now(),
+    )
+    .await
 }
 
 async fn run_pipeline_with_outputs_inner(
@@ -1219,13 +1270,14 @@ async fn run_pipeline_with_outputs_inner(
     event: &Event,
     ctx: &PipelineContext,
     bump: &mut bumpalo::Bump,
+    dispatch_started_at: crate::time::UnixNanos,
 ) -> Result<crate::pipeline::PipelineRunResult> {
     // No `--test-pipeline` trace collector on the daemon hot path —
     // passing `None` skips every trace push (and the `format!` /
     // `to_string` work behind it) in `run_pipeline`, since nothing
     // here reads `PipelineRunResult::trace`.
     let mut result = match process_metrics {
-        Some(process_metrics) => crate::pipeline::run_pipeline_with_process_metrics(
+        Some(process_metrics) => crate::pipeline::run_pipeline_with_process_metrics_at(
             pipeline,
             event,
             &ctx.config,
@@ -1235,8 +1287,9 @@ async fn run_pipeline_with_outputs_inner(
             crate::pipeline::OutputCapturePolicy::DiskOnly(&ctx.disk_outputs),
             bump,
             process_metrics,
+            dispatch_started_at,
         )?,
-        None => crate::pipeline::run_pipeline(
+        None => crate::pipeline::run_pipeline_at(
             pipeline,
             event,
             &ctx.config,
@@ -1245,6 +1298,7 @@ async fn run_pipeline_with_outputs_inner(
             None,
             crate::pipeline::OutputCapturePolicy::DiskOnly(&ctx.disk_outputs),
             bump,
+            dispatch_started_at,
         )?,
     };
 
@@ -1348,8 +1402,36 @@ async fn process_event(
     workers: &[Arc<PipelineWorker>],
     ctx: &PipelineContext,
     input_tap_key: &str,
+    input_queue_timer: &crate::metrics::InputQueueTimer,
     bump: &mut bumpalo::Bump,
 ) {
+    let dispatch_started_at = crate::time::UnixNanos::now();
+    process_event_at(
+        event,
+        workers,
+        ctx,
+        input_tap_key,
+        input_queue_timer,
+        bump,
+        dispatch_started_at,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_event_at(
+    event: &Event,
+    workers: &[Arc<PipelineWorker>],
+    ctx: &PipelineContext,
+    input_tap_key: &str,
+    input_queue_timer: &crate::metrics::InputQueueTimer,
+    bump: &mut bumpalo::Bump,
+    dispatch_started_at: crate::time::UnixNanos,
+) {
+    input_queue_timer.observe_between(
+        crate::time::UnixNanos::from_datetime(event.received_at),
+        dispatch_started_at,
+    );
     ctx.tap.emit(input_tap_key, event).await;
     for (i, worker) in workers.iter().enumerate() {
         worker.metrics.events_received.inc();
@@ -1367,6 +1449,11 @@ async fn process_event(
         if i > 0 {
             bump.reset();
         }
+        #[cfg(test)]
+        if let Some(gate) = &worker.serial_test_gate {
+            gate.wait().await;
+            gate.wait().await;
+        }
         worker.metrics.inflight.inc();
         match run_pipeline_with_outputs_inner(
             &worker.def,
@@ -1374,6 +1461,7 @@ async fn process_event(
             event,
             ctx,
             bump,
+            dispatch_started_at,
         )
         .await
         {
@@ -1531,6 +1619,11 @@ mod tests {
     use std::str::FromStr;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
+
+    fn input_queue_timer(name: &str) -> crate::metrics::InputQueueTimer {
+        crate::metrics::InputQueueTimer::register(&Registry::new(), name)
+            .expect("test input queue timer must register")
+    }
 
     fn full_stdout_pipe() -> (OwnedFd, OwnedFd) {
         let mut fds = [-1; 2];
@@ -2782,6 +2875,7 @@ def pipeline execute { process dispatch; finish }
             &[worker],
             &ctx,
             "input compiled-plan",
+            &input_queue_timer("compiled-plan"),
             &mut bumpalo::Bump::new(),
         )
         .await;
@@ -2895,6 +2989,7 @@ def pipeline execute { process dispatch; finish }
             &[worker],
             &ctx,
             "input compiled-plan",
+            &input_queue_timer("compiled-plan-mutant"),
             &mut bumpalo::Bump::new(),
         )
         .await;
@@ -3205,6 +3300,7 @@ def pipeline p_fallback {
             &[worker],
             &ctx,
             "input fixture",
+            &input_queue_timer("fixture"),
             &mut bumpalo::Bump::new(),
         )
         .await;
@@ -3540,11 +3636,13 @@ def pipeline p { process a }
             let worker = Arc::clone(&worker);
             let ctx = Arc::clone(&ctx);
             tasks.push(tokio::spawn(async move {
+                let input_queue_timer = input_queue_timer("concurrent");
                 process_event(
                     &fixture_event(),
                     &[worker],
                     &ctx,
                     "input concurrent",
+                    &input_queue_timer,
                     &mut bumpalo::Bump::new(),
                 )
                 .await;
@@ -4047,10 +4145,12 @@ def pipeline p {{ input source; output sink }}
         let sd_a = shutdown_rx.clone();
         let sd_b = shutdown_rx.clone();
         let h_a = tokio::spawn(async move {
-            run_pipeline_workers(rx_a, &workers_a, &ctx_a, "a", sd_a).await;
+            let timer = input_queue_timer("fan-in-a");
+            run_pipeline_workers(rx_a, &workers_a, &ctx_a, "a", &timer, sd_a).await;
         });
         let h_b = tokio::spawn(async move {
-            run_pipeline_workers(rx_b, &workers_b, &ctx_b, "b", sd_b).await;
+            let timer = input_queue_timer("fan-in-b");
+            run_pipeline_workers(rx_b, &workers_b, &ctx_b, "b", &timer, sd_b).await;
         });
 
         let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
@@ -4130,14 +4230,16 @@ def pipeline p {{ input source; output sink }}
             let ctx = Arc::clone(&ctx);
             let shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
-                run_pipeline_workers(rx_a, &workers, &ctx, "a", shutdown).await;
+                let timer = input_queue_timer("blocked-a");
+                run_pipeline_workers(rx_a, &workers, &ctx, "a", &timer, shutdown).await;
             })
         };
         let h_b = {
             let workers = Arc::clone(&workers);
             let ctx = Arc::clone(&ctx);
             tokio::spawn(async move {
-                run_pipeline_workers(rx_b, &workers, &ctx, "b", shutdown_rx).await;
+                let timer = input_queue_timer("blocked-b");
+                run_pipeline_workers(rx_b, &workers, &ctx, "b", &timer, shutdown_rx).await;
             })
         };
 
@@ -4344,7 +4446,8 @@ def pipeline p {{ input source; output sink }}
             let task_worker = Arc::clone(&worker);
             let task = tokio::spawn(async move {
                 let mut bump = bumpalo::Bump::new();
-                process_event(&event, &[task_worker], &ctx, "input i", &mut bump).await;
+                let timer = input_queue_timer("error-path");
+                process_event(&event, &[task_worker], &ctx, "input i", &timer, &mut bump).await;
             });
 
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -4401,6 +4504,144 @@ def pipeline p {{ input source; output sink }}
         assert!(
             !body.contains("event_rx.try_recv()"),
             "pipeline worker shutdown must not use try_recv() — permit-holder race",
+        );
+    }
+
+    #[tokio::test]
+    async fn input_queue_wait_is_observed_once_for_normal_receive_and_shutdown_drain() {
+        let registry = Registry::new();
+        let normal_timer = crate::metrics::InputQueueTimer::register(&registry, "normal").unwrap();
+        let drain_timer = crate::metrics::InputQueueTimer::register(&registry, "drain").unwrap();
+        let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
+        let context = PipelineContext {
+            output_senders: Arc::new(HashMap::new()),
+            disk_outputs: Arc::new(HashSet::new()),
+            config: Arc::new(cfg),
+            funcs: Arc::new(FunctionRegistry::new()),
+            tap: TapRegistry::new(),
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+        };
+
+        let (normal_tx, normal_rx) = mpsc::channel(1);
+        normal_tx
+            .send(Event::new(
+                Bytes::from_static(b"normal"),
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .unwrap();
+        drop(normal_tx);
+        let (_normal_shutdown_tx, normal_shutdown_rx) = tokio::sync::watch::channel(false);
+        run_pipeline_workers(
+            normal_rx,
+            &[],
+            &context,
+            "normal",
+            &normal_timer,
+            normal_shutdown_rx,
+        )
+        .await;
+        assert_eq!(normal_timer.count(), 1);
+
+        let (drain_tx, drain_rx) = mpsc::channel(2);
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            drain_tx
+                .send(Event::new(
+                    Bytes::copy_from_slice(payload),
+                    "127.0.0.1:0".parse().unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        let (drain_shutdown_tx, drain_shutdown_rx) = tokio::sync::watch::channel(false);
+        drain_shutdown_tx.send(true).unwrap();
+        run_pipeline_workers(
+            drain_rx,
+            &[],
+            &context,
+            "drain",
+            &drain_timer,
+            drain_shutdown_rx,
+        )
+        .await;
+        assert_eq!(drain_timer.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn fan_out_pipelines_share_one_dispatch_boundary_after_input_queue_wait() {
+        let config = compiled_config(
+            r#"
+def input i { type syslog_tcp bind "127.0.0.1:0" }
+def output sink { type stdout }
+def pipeline first { input i; output sink; finish }
+def pipeline second { input i; output sink; finish }
+"#,
+        );
+        let registry = Registry::new();
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        let mut workers: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                PipelineWorker::new_with_process_metrics(
+                    config.pipelines.get(name).unwrap().clone(),
+                    &config.processes,
+                    &registry,
+                )
+                .unwrap()
+            })
+            .collect();
+        workers[0].serial_test_gate = Some(Arc::clone(&gate));
+        let workers: Vec<_> = workers.into_iter().map(Arc::new).collect();
+        let timer = crate::metrics::InputQueueTimer::register(&registry, "i").unwrap();
+        let context = PipelineContext {
+            output_senders: Arc::new(HashMap::new()),
+            disk_outputs: Arc::new(HashSet::new()),
+            config: Arc::new(config),
+            funcs: Arc::new(FunctionRegistry::new()),
+            tap: TapRegistry::new(),
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+        };
+        let dispatch_started_at = crate::time::UnixNanos::now();
+        let mut event = fixture_event();
+        event.received_at =
+            crate::time::UnixNanos::new(dispatch_started_at.get() - 60_000_000_000).to_datetime();
+
+        let process = async {
+            process_event_at(
+                &event,
+                &workers,
+                &context,
+                "input i",
+                &timer,
+                &mut bumpalo::Bump::new(),
+                dispatch_started_at,
+            )
+            .await;
+        };
+        let hold_first_worker = async {
+            gate.wait().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            gate.wait().await;
+        };
+        tokio::join!(process, hold_first_worker);
+
+        assert_eq!(timer.count(), 1);
+        assert_eq!(timer.sum(), 60.0);
+        let pipeline_series = metric_series(&registry, "limpid_pipeline_processing_seconds");
+        assert_eq!(pipeline_series.len(), 2);
+        for series in &pipeline_series {
+            assert_eq!(series["count"], 1);
+            assert!(series["sum"].as_f64().unwrap() < 5.0);
+        }
+        let later = pipeline_series
+            .iter()
+            .find(|series| series["labels"]["pipeline"] == "second")
+            .unwrap();
+        assert!(
+            later["sum"].as_f64().unwrap() >= 0.075,
+            "the later serial worker must retain time spent behind the first worker's gate"
         );
     }
 
@@ -4511,7 +4752,14 @@ def pipeline p {{ input source; output sink }}
 
         tokio::time::timeout(
             Duration::from_secs(2),
-            run_pipeline_workers(event_rx, &workers, &ctx, "i", shutdown_rx),
+            run_pipeline_workers(
+                event_rx,
+                &workers,
+                &ctx,
+                "i",
+                &input_queue_timer("closed-watch"),
+                shutdown_rx,
+            ),
         )
         .await
         .expect("closed watch must terminate after draining the input channel");

@@ -1467,6 +1467,31 @@ pub fn run_pipeline(
     output_capture: OutputCapturePolicy<'_>,
     bump: &mut bumpalo::Bump,
 ) -> Result<PipelineRunResult> {
+    run_pipeline_at(
+        pipeline,
+        event,
+        config,
+        funcs,
+        tap,
+        trace,
+        output_capture,
+        bump,
+        crate::time::UnixNanos::now(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_pipeline_at(
+    pipeline: &PipelineDef,
+    event: &OwnedEvent,
+    config: &CompiledConfig,
+    funcs: &FunctionRegistry,
+    tap: Option<&TapRegistry>,
+    trace: Option<&mut Vec<TraceEntry>>,
+    output_capture: OutputCapturePolicy<'_>,
+    bump: &mut bumpalo::Bump,
+    dispatch_started_at: crate::time::UnixNanos,
+) -> Result<PipelineRunResult> {
     run_pipeline_inner(
         pipeline,
         event,
@@ -1477,11 +1502,12 @@ pub fn run_pipeline(
         output_capture,
         bump,
         None,
+        dispatch_started_at,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_pipeline_with_process_metrics(
+pub(crate) fn run_pipeline_with_process_metrics_at(
     pipeline: &PipelineDef,
     event: &OwnedEvent,
     config: &CompiledConfig,
@@ -1491,6 +1517,7 @@ pub(crate) fn run_pipeline_with_process_metrics(
     output_capture: OutputCapturePolicy<'_>,
     bump: &mut bumpalo::Bump,
     process_metrics: &PipelineProcessMetrics,
+    dispatch_started_at: crate::time::UnixNanos,
 ) -> Result<PipelineRunResult> {
     run_pipeline_inner(
         pipeline,
@@ -1502,6 +1529,7 @@ pub(crate) fn run_pipeline_with_process_metrics(
         output_capture,
         bump,
         Some(process_metrics),
+        dispatch_started_at,
     )
 }
 
@@ -1516,6 +1544,7 @@ fn run_pipeline_inner(
     output_capture: OutputCapturePolicy<'_>,
     bump: &mut bumpalo::Bump,
     process_metrics: Option<&PipelineProcessMetrics>,
+    dispatch_started_at: crate::time::UnixNanos,
 ) -> Result<PipelineRunResult> {
     let registry = DslProcessRegistry::new(&config.processes, funcs, tap, process_metrics);
     let mut trace = trace;
@@ -1555,6 +1584,7 @@ fn run_pipeline_inner(
         funcs,
         arena: &arena,
         output_capture,
+        dispatch_started_at,
     };
     let mut exec_out = PipelineExecOut {
         trace,
@@ -1652,6 +1682,7 @@ struct PipelineExecCtx<'a, 'bump: 'a> {
     funcs: &'a FunctionRegistry,
     arena: &'bump EventArena<'bump>,
     output_capture: OutputCapturePolicy<'a>,
+    dispatch_started_at: crate::time::UnixNanos,
 }
 
 /// Mutable accumulators threaded through the pipeline executor:
@@ -1967,10 +1998,7 @@ fn exec_pipeline_stmt<'bump>(
             };
             let emitted_at = crate::time::UnixNanos::now();
             if let Some(PipelineMetricStatement::Output(timer)) = metric_stmt {
-                timer.observe_between(
-                    crate::time::UnixNanos::from_datetime(event.received_at),
-                    emitted_at,
-                );
+                timer.observe_between(ctx.dispatch_started_at, emitted_at);
             } else if ctx.registry.process_metrics.is_some() {
                 bail!("compiled pipeline output metric entry is missing");
             }
@@ -2567,9 +2595,10 @@ def pipeline p {
             Bytes::from_static(b"payload"),
             "127.0.0.1:0".parse().unwrap(),
         );
-        event.received_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        event.received_at = chrono::Utc::now() - chrono::Duration::seconds(60);
 
-        let result = run_pipeline_with_process_metrics(
+        let dispatch_started_at = crate::time::UnixNanos::now();
+        let result = run_pipeline_with_process_metrics_at(
             pipeline,
             &event,
             &cfg,
@@ -2579,6 +2608,7 @@ def pipeline p {
             OutputCapturePolicy::StripAll,
             &mut bumpalo::Bump::new(),
             &output_metrics,
+            dispatch_started_at,
         )
         .unwrap();
 
@@ -2597,7 +2627,7 @@ def pipeline p {
         assert_eq!(timers.len(), 2);
         assert_eq!(timers[0].count(), 2);
         assert_eq!(timers[1].count(), 2);
-        assert!(timers[0].sum() >= 2.0);
+        assert!(timers[0].sum() < 5.0);
     }
 
     #[test]
