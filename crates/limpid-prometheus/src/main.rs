@@ -1284,6 +1284,33 @@ metric_zeta_seconds_count{az="two",le_="source-zero",le__="source-one",le___="so
     }
 
     #[test]
+    fn input_queue_wait_histogram_translates_with_input_and_bucket_labels() {
+        let snapshot = serde_json::json!({
+            "schema": 1,
+            "metrics": [{
+                "name": "limpid_input_queue_wait_seconds",
+                "type": "histogram",
+                "help": "Time from local input arrival to pipeline dispatch start after input-queue dequeue.",
+                "series": [{
+                    "labels": {"input": "syslog"},
+                    "buckets": [[0.001, 2], [0.1, 3]],
+                    "sum": 0.125,
+                    "count": 3
+                }]
+            }]
+        });
+        let rendered = json_to_prometheus(&snapshot.to_string()).unwrap();
+        assert!(rendered.contains("# TYPE limpid_input_queue_wait_seconds histogram\n"));
+        assert!(
+            rendered.contains(
+                "limpid_input_queue_wait_seconds_bucket{input=\"syslog\",le=\"0.001\"} 2\n"
+            )
+        );
+        assert!(rendered.contains("limpid_input_queue_wait_seconds_count{input=\"syslog\"} 3\n"));
+        assert!(rendered.contains("limpid_input_queue_wait_seconds_sum{input=\"syslog\"} 0.125\n"));
+    }
+
+    #[test]
     fn schema_v1_translation_accepts_process_dimensions_generically() {
         let snapshot = serde_json::json!({
             "schema": 1,
