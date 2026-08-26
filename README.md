@@ -175,6 +175,19 @@ There are several types of expression functions you can call from inside a `proc
 
 Full reference: [Built-in Functions](docs/src/functions/expression-functions.md) · [String interpolation](docs/src/dsl-syntax.md#string-interpolation).
 
+## Observability
+
+limpid exports bounded-cardinality metrics for each configured input, pipeline,
+process, and output. The bundled Grafana dashboard brings health, flow,
+recovery, and stage-specific latency into one operational view.
+
+<a href="docs/src/operations/metrics.md#import-the-dashboard-and-alert-rules">
+  <img src="docs/src/assets/limpid-dashboard-overview.png" alt="Limpid Health &amp; Flow Grafana dashboard overview" width="900">
+</a>
+
+See [Metrics](docs/src/operations/metrics.md) for metric definitions, Prometheus
+setup, dashboard provisioning, and alert rules.
+
 ## Performance
 
 A single core handles **~221k events/sec** on the heaviest realistic schema-shaping DSL workload — full OCSF Authentication compose with `to_json` serialization, single-pipeline single-input, channel-direct injection. Lighter shapes scale up from there:
