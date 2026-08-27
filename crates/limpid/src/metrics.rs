@@ -161,10 +161,10 @@ impl PipelineOutputTimer {
 
     pub(crate) fn observe_between(
         &self,
-        received_at: crate::time::UnixNanos,
+        dispatch_started_at: crate::time::UnixNanos,
         emitted_at: crate::time::UnixNanos,
     ) {
-        let elapsed = emitted_at.elapsed_since(received_at);
+        let elapsed = emitted_at.elapsed_since(dispatch_started_at);
         if elapsed.reversed {
             self.negative_delta.inc();
         }
