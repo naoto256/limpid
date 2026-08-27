@@ -51,7 +51,7 @@ jobs:
         # validation confirmed that `cargo deb -p limpid --features
         # journal,kafka` produces a working package on aarch64 Ubuntu
         # (`journal → kafka SASL+TLS` end-to-end PASS in the aarch64 packaging validation report).
-        run: cargo build --release -p limpid -p limpidctl -p limpid-prometheus --features journal,kafka
+        run: cargo build --release --locked -p limpid -p limpidctl -p limpid-prometheus --features journal,kafka
 
       - name: Build .deb packages
         run: |
