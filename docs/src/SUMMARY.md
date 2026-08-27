@@ -54,6 +54,7 @@
 - [Debug Tap](./operations/tap.md)
 - [Schema Validation](./operations/schema-validation.md)
 - [Metrics](./operations/metrics.md)
+- [Performance](./operations/performance.md)
 - [Error Log (DLQ)](./operations/error-log.md)
 - [Packaging](./operations/packaging.md)
 - [systemd](./operations/systemd.md)

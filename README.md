@@ -190,18 +190,13 @@ setup, dashboard provisioning, and alert rules.
 
 ## Performance
 
-A single core handles **~221k events/sec** on the heaviest realistic schema-shaping DSL workload — full OCSF Authentication compose with `to_json` serialization, single-pipeline single-input, channel-direct injection. Lighter shapes scale up from there:
+Qualified v0.8.0 release measurements on a two-CPU Linux benchmark slice range
+from **156,887 to 414,161 median events/sec**, depending on pipeline shape. The
+suite covers passthrough, light parsing, regex-heavy security-log processing,
+and OCSF composition. These are not single-core claims.
 
-| Pipeline shape | events/sec/core |
-| --- | ---: |
-| passthrough | 378k |
-| `syslog.parse(ingress)` | 380k |
-| OCSF compose + to_json (heaviest realistic schema-shaping) | 221k |
-| **parse + 2× regex + if/else (heaviest per event)** | **146k** |
-
-Multi-pipeline configurations scale across cores via Tokio's multi-thread runtime: 4 independent pipelines (each its own input, process chain, and output) reach ~581k events/sec aggregate on the OCSF compose workload on a 16-core host, with no application-level work-stealing or pinning.
-
-The single-core numbers above are v0.7.10 measurements. The path to today's numbers ran through the v0.6.0 perf milestone (per-event bump arena, direct `serde::Serialize` for the runtime `Value` tree, static-literal hash-key interning, and a boundary refactor that eliminated the hot-path `BorrowedEvent::to_owned()` at every output sink), the v0.6.1 follow-up (per-worker bump-arena recycling, lifting the macOS `xzm` zone-lock contention that capped multi-pipeline scaling), and the v0.7.10 queue-consumer wake mitigation (batch-drain via `recv_many` plus an adaptive spin-before-park controller) that closed a wake-amplification tail on populated-workspace workloads. Real I/O (`__sendto`) and tokio scheduling are now the dominant categories on the flame graph; allocation collapsed from 43% at v0.5.7 to 15% on the single-pipeline path. See the [CHANGELOG](CHANGELOG.md) for the cumulative breakdown.
+See [Performance](docs/src/operations/performance.md) for workload definitions,
+methodology, absolute results, and the inconclusive pre/post overhead finding.
 
 ## Compared to rsyslog / fluentd / Vector
 
