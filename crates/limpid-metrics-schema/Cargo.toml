@@ -1,6 +1,6 @@
 [package]
 name = "limpid-metrics-schema"
-version = "0.7.15"
+version = "0.8.0"
 edition = "2024"
 description = "Wire DTOs for limpid schema-v1 metrics snapshots"
 license.workspace = true

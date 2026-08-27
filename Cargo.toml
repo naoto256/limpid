@@ -17,7 +17,7 @@ resolver = "3"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-limpid-metrics-schema = { version = "0.7.15", path = "crates/limpid-metrics-schema" }
+limpid-metrics-schema = { version = "0.8.0", path = "crates/limpid-metrics-schema" }
 base64 = "0.22.1"
 pem = "3.0.6"
 ring = "0.17.14"

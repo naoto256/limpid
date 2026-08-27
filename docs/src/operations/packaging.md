@@ -59,6 +59,8 @@ The post-install script (`packaging/postinst`) runs on first install:
 |------|-------------|
 | `/usr/bin/limpid-prometheus` | Prometheus exporter |
 | `/etc/default/limpid-prometheus` | Environment variables (`LIMPID_PROMETHEUS_BIND`, `LIMPID_PROMETHEUS_SOCKET`) |
+| `/usr/share/limpid/grafana/limpid-dashboard.json` | Bundled Grafana dashboard (`0644`) |
+| `/usr/share/limpid/grafana/limpid-alerts.yaml` | Bundled Prometheus alert rules (`0644`) |
 | `/etc/systemd/system/limpid-prometheus.service` | systemd unit file |
 
 ## systemd unit
