@@ -24,7 +24,7 @@ read that and explains the OTLP-specific reading on top.
 
 ## 1. Scope
 
-| Aspect | Current (0.7.15) |
+| Aspect | Current (0.8.0) |
 |---|---|
 | Signal | **logs** only — no traces, no metrics, no profiles |
 | Transports | HTTP/JSON, HTTP/protobuf, gRPC (all three; output side split into `output otlp_http` / `output otlp_grpc` introduced in 0.7.6; in 0.7.8 plaintext `http://` with `tls { ... }` is now rejected at parse time — see CHANGELOG 0.7.8) |

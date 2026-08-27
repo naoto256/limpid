@@ -8,6 +8,8 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-27
+
 ### Added — authenticated LTP node transport
 
 Limpid nodes can now exchange events through an unbatched `input ltp` and
@@ -38,6 +40,27 @@ through clones, queue persistence, dead-letter capture, and JSON replay, and is
 visible in `tap --json` without changing the default raw tap stream or the DSL.
 Pre-0.8 Event JSON without a key is assigned one when first read. The dead-letter
 record schema is now version 3 because its `event` object carries the key.
+
+### Fixed — startup is transactional and shutdown honors durable work
+
+Runtime startup now waits for input and control resources to become ready and
+rolls back every acquired resource if a later step fails or startup is
+cancelled. Shutdown distinguishes bounded cancel-safe network and terminal work
+from file, WAL, dead-letter, and journal owners that must be joined, preserving
+queue acknowledgement and exact output disposition.
+
+### Fixed — journal readers follow rotations
+
+Journal readers now follow the official `sd_journal_wait` contract at EOF,
+handling append and invalidation notifications on the same long-lived handle so
+entries continue across journal rotation. Immediate wait errors use a bounded
+backoff while retaining responsive shutdown and cursor semantics.
+
+### Fixed — RFC 3164 parsing preserves space-padded days
+
+The syslog parser now accepts and preserves the RFC 3164 convention that pads a
+single-digit day with a space. Canonical parser snippets no longer collapse or
+reject that timestamp shape before downstream processing.
 
 ### Changed — dropped metrics use one rooted hierarchy (breaking)
 
@@ -82,19 +105,30 @@ canonical sidecar checkpoint exercises the real control-socket and HTTP scrape
 path at three payload scales; detailed machine observations remain in the
 benchmark harness receipt rather than this product changelog.
 
-### Changed — latency metrics use non-overlapping stage boundaries
+The new observability surface includes logical input/output byte counters,
+runtime queue, retry, and in-flight gauges, process invocation counters,
+`limpid_build_info`, and the three latency stages below. The
+`limpid-prometheus` package also ships a bundled Grafana dashboard and exactly
+four alert rules.
 
-`limpid_input_queue_wait_seconds{input}` now measures local input arrival to
-the shared pipeline dispatch start (T0→T1), with
+### Added — three-stage latency histograms
+
+0.8.0 introduces three non-overlapping latency histograms:
+`limpid_input_queue_wait_seconds{input}` measures local input arrival to the
+shared pipeline dispatch start (T0→T1), with
 `limpid_input_queue_wait_negative_delta_total{input}` counting wall-clock
-reversals clamped to zero. `limpid_pipeline_processing_seconds{pipeline,output}`
-keeps its name, labels, and buckets, but now measures that shared dispatch start
-to each output snapshot (T1→T2) instead of starting at local input arrival.
-Output delivery remains the snapshot-to-Delivered stage (T2→T3).
+reversals clamped to zero;
+`limpid_pipeline_processing_seconds{pipeline,output}` measures that shared
+dispatch start to each output snapshot (T1→T2); and
+`limpid_output_delivery_seconds{output}` measures the snapshot to confirmed
+delivery (T2→T3). Together they separate input queueing, pipeline work, and
+output delivery without gaps or overlap.
 
-Pipeline-processing histogram values collected before and after this upgrade
-are not directly comparable because its start boundary changed despite the
-unchanged metric name and labels.
+The disk-backed output queue record format also changes: 0.8.0 records require
+`emitted_ns` for delivery latency. Before upgrading from 0.7.15, drain every
+disk-backed output queue backlog. Leftover 0.7.15 records do not contain the
+field, so 0.8.0 rejects them and reports them as corrupted; there is no
+automatic migration.
 
 ## [0.7.15] - 2026-07-20
 
@@ -2364,7 +2398,8 @@ See `docs/src/operations/upgrade-0.3.md` for end-to-end migration recipes includ
 
 Initial public release. Rust + tokio log pipeline daemon replacing rsyslog / syslog-ng / fluentd with a single readable DSL (`def input`, `def process`, `def output`, `def pipeline`). Includes syslog (UDP/TCP/ TLS) / tail / journal / unix socket inputs; file / HTTP / Kafka / TCP / UDP / unix socket / stdout outputs; in-DSL expression language with parsers (JSON / KV / CEF / syslog), regex, string templates, tables with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`); hot reload via `SIGHUP` with automatic rollback; per-output disk-backed queues.
 
-[Unreleased]: https://github.com/naoto256/limpid/compare/v0.7.15...HEAD
+[Unreleased]: https://github.com/naoto256/limpid/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/naoto256/limpid/compare/v0.7.15...v0.8.0
 [0.7.15]: https://github.com/naoto256/limpid/compare/v0.7.14...v0.7.15
 [0.7.14]: https://github.com/naoto256/limpid/compare/v0.7.13...v0.7.14
 [0.7.13]: https://github.com/naoto256/limpid/compare/v0.7.12...v0.7.13
