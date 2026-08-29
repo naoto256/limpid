@@ -334,7 +334,7 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
         let actor_handle = if tokio::runtime::Handle::try_current().is_ok() {
             let actor_inner = Arc::clone(&inner);
             Some(tokio::spawn(async move {
-                flusher_actor_loop(actor_inner).await;
+                flusher_actor_loop(actor_inner, batch_size).await;
             }))
         } else {
             None
@@ -470,10 +470,14 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
         //    late for the actor's last iteration. The actor's own
         //    in-flight batch was already resolved by `flush_events`
         //    before the actor exited. `flush_events_at_shutdown`
-        //    does one bounded send attempt then routes the rest to
-        //    DLQ + Recovered.
+        //    gives each hard-capped chunk at most one send attempt,
+        //    sharing one bounded deadline across the entire drain,
+        //    then routes the rest to DLQ + Recovered.
         let leftover = std::mem::take(&mut *self.inner.batch.lock().await);
-        self.inner.flush_events_at_shutdown(leftover).await;
+        let deadline = tokio::time::Instant::now() + crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT;
+        for batch in hard_capped_batches(leftover, self.batch_size) {
+            self.inner.flush_events_at_shutdown(batch, deadline).await;
+        }
         #[cfg(test)]
         if let Some(observer) = shutdown_observer {
             observer.resolved_dispositions.store(
@@ -576,7 +580,19 @@ impl<P: BatchSinkPolicy> Drop for BatchedSink<P> {
 /// `batch_timeout` sleep, or shutdown via `is_shutting_down`. See the
 /// module docs for the lifecycle contract (`shutdown()` never aborts
 /// this actor).
-async fn flusher_actor_loop<P: BatchSinkPolicy>(inner: Arc<SinkShared<P>>) {
+fn hard_capped_batches(
+    events: Vec<ParkedEvent>,
+    batch_size: usize,
+) -> impl Iterator<Item = Vec<ParkedEvent>> {
+    let mut events = events.into_iter();
+    let batch_size = batch_size.max(1);
+    std::iter::from_fn(move || {
+        let batch: Vec<_> = events.by_ref().take(batch_size).collect();
+        (!batch.is_empty()).then_some(batch)
+    })
+}
+
+async fn flusher_actor_loop<P: BatchSinkPolicy>(inner: Arc<SinkShared<P>>, batch_size: usize) {
     loop {
         if inner.is_shutting_down.load(Ordering::Acquire) {
             break;
@@ -599,7 +615,7 @@ async fn flusher_actor_loop<P: BatchSinkPolicy>(inner: Arc<SinkShared<P>>) {
             let mut buf = inner.batch.lock().await;
             std::mem::take(&mut *buf)
         };
-        if !batch.is_empty() {
+        for batch in hard_capped_batches(batch, batch_size) {
             // `flush_events` resolves every handle (Delivered on
             // success, Recovered on retry-exhausted DLQ). It checks
             // `is_shutting_down` between retry attempts so a
@@ -920,7 +936,11 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
     /// an `Elapsed` outcome does NOT drop it — otherwise the inner
     /// handles would fire `QueueAckHandle::Drop` and be counted as
     /// silent loss.
-    async fn flush_events_at_shutdown(&self, batch: Vec<ParkedEvent>) {
+    async fn flush_events_at_shutdown(
+        &self,
+        batch: Vec<ParkedEvent>,
+        deadline: tokio::time::Instant,
+    ) {
         if batch.is_empty() {
             return;
         }
@@ -944,11 +964,21 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 return;
             }
         };
-        let send_outcome = tokio::time::timeout(
-            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
-            self.policy.send(&prepared),
-        )
-        .await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let err = anyhow::anyhow!("shutdown flush deadline exhausted before send attempt");
+            crate::modules::route_shutdown_batch_to_dlq(
+                self.error_log.as_ref(),
+                self.error_log_fallback,
+                &self.metrics,
+                &self.name,
+                strip_permits(shippable),
+                &err,
+            )
+            .await;
+            return;
+        }
+        let send_outcome = tokio::time::timeout(remaining, self.policy.send(&prepared)).await;
         match send_outcome {
             Ok(Ok(outcome)) => {
                 self.resolve_send_success(shippable, outcome).await;
@@ -991,6 +1021,361 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::future;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use bytes::Bytes;
+
+    use super::{BatchSinkPolicy, BatchedSink, SendOutcome, flusher_actor_loop};
+    use crate::error_log::ErrorLogFallback;
+    use crate::event::Event;
+    use crate::metrics::OutputMetrics;
+    use crate::queue::{AckDisposition, QueueAckHandle, RetryConfig};
+
+    #[derive(Clone, Copy)]
+    enum SendAction {
+        Success,
+        Fail,
+        Pending,
+    }
+
+    #[derive(Default)]
+    struct RecordingState {
+        requests: Vec<Vec<usize>>,
+        actions: VecDeque<SendAction>,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingPolicy {
+        state: Arc<StdMutex<RecordingState>>,
+    }
+
+    impl RecordingPolicy {
+        fn with_actions(actions: impl IntoIterator<Item = SendAction>) -> Self {
+            Self {
+                state: Arc::new(StdMutex::new(RecordingState {
+                    requests: Vec::new(),
+                    actions: actions.into_iter().collect(),
+                })),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BatchSinkPolicy for RecordingPolicy {
+        type Payload = usize;
+        type Prepared = Vec<usize>;
+
+        fn kind(&self) -> &'static str {
+            "recording output"
+        }
+
+        fn render(&self, event: &Event) -> Result<Self::Payload> {
+            let payload = std::str::from_utf8(&event.egress)?;
+            Ok(payload
+                .rsplit('-')
+                .next()
+                .expect("test event sequence")
+                .parse()?)
+        }
+
+        fn prepare(&self, payloads: Vec<Self::Payload>) -> Result<Self::Prepared> {
+            Ok(payloads)
+        }
+
+        async fn send(&self, prepared: &Self::Prepared) -> Result<SendOutcome> {
+            let action = {
+                let mut state = self.state.lock().expect("recording policy state");
+                state.requests.push(prepared.clone());
+                state.actions.pop_front().unwrap_or(SendAction::Success)
+            };
+            match action {
+                SendAction::Success => Ok(SendOutcome::default()),
+                SendAction::Fail => anyhow::bail!("scripted transport failure"),
+                SendAction::Pending => future::pending().await,
+            }
+        }
+    }
+
+    fn event(sequence: usize) -> Event {
+        Event::new(
+            Bytes::from(format!("<13>batch-event-{sequence}")),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 514),
+        )
+    }
+
+    fn sink_without_actor_with(
+        batch_size: usize,
+        policy: RecordingPolicy,
+        retry: RetryConfig,
+    ) -> BatchedSink<RecordingPolicy> {
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
+        BatchedSink::new(
+            policy,
+            "batch-hard-limit-test",
+            batch_size,
+            Duration::from_secs(60),
+            retry,
+            None,
+            ErrorLogFallback::Off,
+            OutputMetrics::for_testing(),
+            shutdown_rx,
+        )
+    }
+
+    fn sink_without_actor(batch_size: usize) -> BatchedSink<RecordingPolicy> {
+        sink_without_actor_with(
+            batch_size,
+            RecordingPolicy::default(),
+            RetryConfig::default(),
+        )
+    }
+
+    async fn assert_delivered_once(
+        receivers: Vec<
+            tokio::sync::mpsc::UnboundedReceiver<(crate::queue::AckPosition, AckDisposition)>,
+        >,
+    ) {
+        for mut receiver in receivers {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .expect("ack resolution must not stall")
+                    .map(|(_, disposition)| disposition),
+                Some(AckDisposition::Delivered)
+            );
+            assert!(
+                receiver.try_recv().is_err(),
+                "each event must resolve exactly once"
+            );
+        }
+    }
+
+    async fn assert_dispositions_once(
+        receivers: Vec<
+            tokio::sync::mpsc::UnboundedReceiver<(crate::queue::AckPosition, AckDisposition)>,
+        >,
+        expected: &[AckDisposition],
+    ) {
+        assert_eq!(receivers.len(), expected.len());
+        for (mut receiver, expected) in receivers.into_iter().zip(expected) {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .expect("ack resolution must not stall")
+                    .map(|(_, disposition)| disposition),
+                Some(*expected)
+            );
+            assert!(
+                receiver.try_recv().is_err(),
+                "each event must resolve exactly once"
+            );
+        }
+    }
+
+    fn run_steady_scheduler_backlog_case(
+        batch_size: usize,
+        event_count: usize,
+        expected_request_sizes: &[usize],
+    ) {
+        // Construct outside the runtime so the actor cannot run while
+        // the test builds the same backlog a delayed scheduler can
+        // leave behind after threshold notifications coalesce.
+        let sink = sink_without_actor(batch_size);
+        let state = Arc::clone(&sink.inner.policy.state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async move {
+            let mut receivers = Vec::with_capacity(event_count);
+            for sequence in 0..event_count {
+                let (ack, receiver) = QueueAckHandle::for_test();
+                sink.consume(&event(sequence), ack)
+                    .await
+                    .expect("consume must accept the scheduler backlog");
+                receivers.push(receiver);
+            }
+            assert_eq!(sink.inner.batch.lock().await.len(), event_count);
+
+            let actor = tokio::spawn(flusher_actor_loop(Arc::clone(&sink.inner), batch_size));
+            sink.inner.flush_notify.notify_one();
+            assert_delivered_once(receivers).await;
+
+            sink.inner.is_shutting_down.store(true, Ordering::Release);
+            sink.inner.flush_notify.notify_waiters();
+            actor.await.expect("flusher actor must join");
+
+            let requests = &state.lock().expect("recorded requests").requests;
+            assert_eq!(
+                requests.iter().map(Vec::len).collect::<Vec<_>>(),
+                expected_request_sizes
+            );
+            assert_eq!(
+                requests.iter().flatten().copied().collect::<Vec<_>>(),
+                (0..event_count).collect::<Vec<_>>(),
+                "hard-cap chunking must preserve event order"
+            );
+        });
+    }
+
+    #[test]
+    fn steady_scheduler_backlog_hard_caps_batch_size_one() {
+        run_steady_scheduler_backlog_case(1, 2, &[1, 1]);
+    }
+
+    #[test]
+    fn steady_scheduler_backlog_hard_caps_larger_batch_and_flushes_remainder() {
+        run_steady_scheduler_backlog_case(3, 5, &[3, 2]);
+    }
+
+    #[test]
+    fn shutdown_backlog_is_chunked_to_batch_size() {
+        let sink = sink_without_actor(3);
+        let state = Arc::clone(&sink.inner.policy.state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async move {
+            let mut receivers = Vec::new();
+            for sequence in 0..8 {
+                let (ack, receiver) = QueueAckHandle::for_test();
+                sink.consume_shutdown(&event(sequence), ack)
+                    .await
+                    .expect("shutdown consume must accept backlog");
+                receivers.push(receiver);
+            }
+
+            sink.shutdown().await.expect("shutdown must drain backlog");
+            assert_delivered_once(receivers).await;
+            let requests = &state.lock().expect("recorded requests").requests;
+            assert_eq!(
+                requests.iter().map(Vec::len).collect::<Vec<_>>(),
+                vec![3, 3, 2]
+            );
+            assert_eq!(
+                requests.iter().flatten().copied().collect::<Vec<_>>(),
+                (0..8).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test]
+    fn steady_failure_resolves_its_chunk_once_and_flushes_the_remainder() {
+        let retry = RetryConfig {
+            max_attempts: 1,
+            ..RetryConfig::default()
+        };
+        let sink = sink_without_actor_with(
+            2,
+            RecordingPolicy::with_actions([SendAction::Fail, SendAction::Success]),
+            retry,
+        );
+        let state = Arc::clone(&sink.inner.policy.state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async move {
+            let mut receivers = Vec::new();
+            for sequence in 0..3 {
+                let (ack, receiver) = QueueAckHandle::for_test();
+                sink.consume(&event(sequence), ack).await.expect("consume");
+                receivers.push(receiver);
+            }
+            let actor = tokio::spawn(flusher_actor_loop(Arc::clone(&sink.inner), 2));
+            sink.inner.flush_notify.notify_one();
+            assert_dispositions_once(
+                receivers,
+                &[
+                    AckDisposition::Recovered,
+                    AckDisposition::Recovered,
+                    AckDisposition::Delivered,
+                ],
+            )
+            .await;
+            sink.inner.is_shutting_down.store(true, Ordering::Release);
+            sink.inner.flush_notify.notify_waiters();
+            actor.await.expect("flusher actor must join");
+
+            assert_eq!(
+                state.lock().expect("recorded requests").requests,
+                vec![vec![0, 1], vec![2]]
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_multi_chunk_drain_uses_one_deadline_and_resolves_every_event_once() {
+        let sink = sink_without_actor_with(
+            2,
+            RecordingPolicy::with_actions([
+                SendAction::Success,
+                SendAction::Pending,
+                SendAction::Success,
+            ]),
+            RetryConfig::default(),
+        );
+        let state = Arc::clone(&sink.inner.policy.state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async move {
+            let mut receivers = Vec::new();
+            for sequence in 0..4 {
+                let (ack, receiver) = QueueAckHandle::for_test();
+                sink.consume(&event(sequence), ack).await.expect("consume");
+                receivers.push(receiver);
+            }
+            let (ack, receiver) = QueueAckHandle::for_test();
+            sink.consume_shutdown(&event(4), ack)
+                .await
+                .expect("shutdown consume");
+            receivers.push(receiver);
+
+            let started = tokio::time::Instant::now();
+            sink.shutdown().await.expect("shutdown must finish");
+            assert_eq!(
+                tokio::time::Instant::now().duration_since(started),
+                crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+                "one shared deadline must bound the whole multi-chunk drain"
+            );
+            assert_dispositions_once(
+                receivers,
+                &[
+                    AckDisposition::Delivered,
+                    AckDisposition::Delivered,
+                    AckDisposition::Recovered,
+                    AckDisposition::Recovered,
+                    AckDisposition::Recovered,
+                ],
+            )
+            .await;
+            assert_eq!(
+                state.lock().expect("recorded requests").requests,
+                vec![vec![0, 1], vec![2, 3]],
+                "the shared shutdown deadline must not start a later request after timeout"
+            );
+            assert_eq!(
+                sink.inner.permits.available_permits(),
+                4,
+                "every steady-state permit must be released after disposition"
+            );
+        });
+    }
+
     #[test]
     fn accepted_batch_samples_delivery_time_once_before_resolving_each_ack() {
         let src = include_str!("batched.rs");
@@ -1063,7 +1448,7 @@ mod tests {
         // `flush_events_at_shutdown` Elapsed arm: same check. The
         // Err(_elapsed) branch must call the ambiguous helper.
         let fs_start = src
-            .find("async fn flush_events_at_shutdown(&self, batch: Vec<ParkedEvent>)")
+            .find("async fn flush_events_at_shutdown(")
             .expect("flush_events_at_shutdown fn must exist");
         // Take the rest of the file — the fn is the last thing here.
         let fs_body = &src[fs_start..];
