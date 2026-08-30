@@ -529,7 +529,7 @@ pub(super) fn analyze_process_stmt(
                         namespace,
                         name,
                         args,
-                        block_arg: _,
+                        block_arg,
                     },
                 ..
             },
@@ -541,13 +541,15 @@ pub(super) fn analyze_process_stmt(
             // separate arg-only pass — `check_types(call, …)` already
             // walks `args`.
             expr_types::check_types(call, pipeline_name, bindings, registry, None, diagnostics);
-            parser_effects::apply_parser_effects(
-                namespace.as_deref(),
-                name,
-                args,
-                registry,
-                bindings,
-            );
+            if block_arg.is_none() {
+                parser_effects::apply_parser_effects(
+                    namespace.as_deref(),
+                    name,
+                    args,
+                    registry,
+                    bindings,
+                );
+            }
         }
         ProcessStatement::ExprStmt(e) => {
             expr_types::check_types(e, pipeline_name, bindings, registry, None, diagnostics);
@@ -662,6 +664,55 @@ mod tests {
             assert_eq!(bindings.get_workspace(&path), Some(&nullable_string));
         }
         assert!(errors(&diags).is_empty(), "got: {diags:?}");
+    }
+
+    #[test]
+    fn block_form_csv_parse_does_not_merge_fields_into_workspace() {
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process {
+        csv_parse(ingress, ["host"]) { |value| value }
+        workspace.copy = workspace.host
+    }
+    output o
+}
+"#;
+
+        let cfg = parse_config(src).expect("config should parse");
+        let compiled = CompiledConfig::from_config(cfg).expect("compile");
+        let pipeline = compiled.pipelines.get("p").expect("pipeline p");
+        let stmt = pipeline
+            .body
+            .iter()
+            .find_map(|stmt| match stmt {
+                PipelineStatement::ProcessChain(elements) => {
+                    elements.iter().find_map(|element| match element {
+                        ProcessChainElement::Inline(statements) => statements.first(),
+                        ProcessChainElement::Named(_) => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("parsed inline process statement");
+        let ProcessStatement::ExprStmt(Expr {
+            kind: ExprKind::FuncCall { block_arg, .. },
+            ..
+        }) = stmt
+        else {
+            panic!("expected parsed block-form function call, got {stmt:?}");
+        };
+        assert!(block_arg.is_some(), "parser must retain the block argument");
+
+        let registry = registry();
+        let mut bindings = Bindings::new();
+        let mut diags = Vec::new();
+        analyze_process_stmt(stmt, "p", &registry, &mut bindings, &mut diags);
+
+        let host = vec!["workspace".to_string(), "host".to_string()];
+        assert_eq!(bindings.get_workspace(&host), None);
     }
 
     #[test]
