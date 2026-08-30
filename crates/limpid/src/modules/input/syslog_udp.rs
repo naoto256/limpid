@@ -6,24 +6,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
-use bytes::Bytes;
-use tokio::net::UdpSocket;
-use tracing::{error, info, warn};
 
-use super::rate_limit::RateLimiter;
+use super::udp::UdpInputRuntime;
+#[cfg(test)]
+use super::udp::shutdown_change_is_terminal;
 use super::validate::validate_pri;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
-
-async fn shutdown_change_is_terminal(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
-    match shutdown.changed().await {
-        Ok(()) => *shutdown.borrow(),
-        Err(_) => true,
-    }
-}
 
 const SYSLOG_UDP_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
@@ -82,75 +74,17 @@ impl Input for SyslogUdpInput {
     async fn run(
         self,
         tx: tokio::sync::mpsc::Sender<Event>,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        let socket = UdpSocket::bind(&self.bind_addr).await?;
-        crate::modules::input_startup_ready();
-        info!("syslog_udp listening on {}", self.bind_addr);
-
-        let limiter = self.rate_limit.map(RateLimiter::new);
-        if let Some(rate) = self.rate_limit {
-            info!("syslog_udp rate_limit: {} events/sec", rate);
+        UdpInputRuntime {
+            module_name: "syslog_udp",
+            bind_addr: self.bind_addr,
+            rate_limit: self.rate_limit,
+            metrics: self.metrics,
+            validator: Some(validate_pri),
         }
-
-        let metrics = self.metrics;
-        let mut buf = vec![0u8; 65536];
-        loop {
-            tokio::select! {
-                biased;
-
-                terminal = shutdown_change_is_terminal(&mut shutdown) => {
-                    if terminal {
-                        info!("syslog_udp: shutting down");
-                        break;
-                    }
-                }
-
-                result = socket.recv_from(&mut buf) => {
-                    match result {
-                        Ok((len, addr)) => {
-                            let data = &buf[..len];
-                            metrics.bytes_received.inc_by(len as u64);
-
-                            if let Err(e) = validate_pri(data) {
-                                warn!("syslog_udp [{}]: dropping invalid message ({})", addr, e);
-                                metrics.events_invalid.inc();
-                                continue;
-                            }
-
-                            metrics.events_received.inc();
-
-                            if let Some(ref limiter) = limiter {
-                                limiter.acquire().await;
-                            }
-
-                            let raw = Bytes::copy_from_slice(data);
-                            let event = Event::new(raw, addr);
-                            if tx.send(event).await.is_err() {
-                                // The pipeline event channel closed
-                                // beneath us — during graceful
-                                // shutdown this is expected (the
-                                // pipeline worker closes the channel
-                                // as part of its drain protocol);
-                                // otherwise it signals a downstream
-                                // task exit. Log once so operators
-                                // see the transition rather than a
-                                // silent stop, then exit the input.
-                                info!(
-                                    "syslog_udp [{}]: pipeline event channel closed, stopping input task",
-                                    addr
-                                );
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("syslog_udp recv error: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
+        .run(tx, shutdown)
+        .await
     }
 }
 
@@ -247,6 +181,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn received_at_is_fixed_before_rate_limit_wait() {
+        let port = pick_port();
+        let bind = format!("127.0.0.1:{port}");
+        let metrics = InputMetrics::for_testing();
+        let input = SyslogUdpInput {
+            bind_addr: bind.clone(),
+            rate_limit: Some(1),
+            metrics,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move { input.run(tx, shutdown_rx).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let sender = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"<13>first", &bind).unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("first event timed out")
+            .expect("event channel closed");
+
+        let sent_at = chrono::Utc::now();
+        sender.send_to(b"<13>second", &bind).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let before_limiter_release = chrono::Utc::now();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "second event was delivered before the limiter wait"
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1100), rx.recv())
+            .await
+            .expect("limited event did not resume")
+            .expect("event channel closed");
+
+        assert_eq!(&event.ingress[..], b"<13>second");
+        assert!(event.received_at >= sent_at);
+        assert!(
+            event.received_at < before_limiter_release,
+            "received_at was sampled after the limiter wait: {} >= {}",
+            event.received_at,
+            before_limiter_release
+        );
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn empty_datagram_is_a_zero_byte_noop() {
         let port = pick_port();
         let bind = format!("127.0.0.1:{port}");
@@ -302,7 +286,7 @@ mod tests {
             .expect("closed watch must resolve without spinning")
         );
         let marker = ["shutdown_change_is_terminal", "(&mut shutdown)"].concat();
-        assert!(include_str!("syslog_udp.rs").contains(&marker));
+        assert!(include_str!("udp.rs").contains(&marker));
 
         let (handle, shutdown, _events, _metrics) =
             spawn_input(format!("127.0.0.1:{}", pick_port()));

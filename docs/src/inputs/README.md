@@ -6,6 +6,7 @@ Input modules receive log messages from external sources and feed them into pipe
 
 | Type | Description |
 |------|-------------|
+| [`raw_udp`](./raw-udp.md) | Byte-exact UDP datagram receiver |
 | [`syslog_udp`](./syslog-udp.md) | UDP syslog receiver |
 | [`syslog_tcp`](./syslog-tcp.md) | TCP syslog receiver (RFC 6587); optional TLS termination + mTLS |
 | [`tail`](./tail.md) | File tailing with rotation detection |
@@ -18,7 +19,7 @@ Input modules receive log messages from external sources and feed them into pipe
 
 Each `def input` block declares its type via the `type <name>` clause; see the per-input pages for the property set each type accepts.
 
-`rate_limit` (maximum events per second) is supported per input — see the per-input pages for which inputs expose it (currently the `syslog_*` and `otlp_*` receivers).
+`rate_limit` (maximum events per second) is supported per input — see the per-input pages for which inputs expose it (currently `raw_udp`, the `syslog_*` receivers, and the `otlp_*` receivers).
 
 ## Usage in pipelines
 

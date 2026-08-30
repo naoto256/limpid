@@ -135,7 +135,7 @@ See the [Getting Started guide](docs/src/getting-started.md) for installation, .
 
 ### Inputs
 
-`syslog_udp` · `syslog_tcp` (with optional TLS / mTLS) · `tail` · `journal`&nbsp;\* · `unix_socket` · `otlp_http` · `otlp_grpc`
+`raw_udp` · `syslog_udp` · `syslog_tcp` (with optional TLS / mTLS) · `tail` · `journal`&nbsp;\* · `unix_socket` · `otlp_http` · `otlp_grpc`
 
 ### Outputs
 

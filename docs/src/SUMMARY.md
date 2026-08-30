@@ -13,6 +13,7 @@
 - [DSL Syntax Basics](./dsl-syntax.md)
 - [Main Configuration](./configuration.md)
 - [Inputs](./inputs/README.md)
+  - [raw_udp](./inputs/raw-udp.md)
   - [syslog_udp](./inputs/syslog-udp.md)
   - [syslog_tcp](./inputs/syslog-tcp.md)
   - [tail](./inputs/tail.md)
