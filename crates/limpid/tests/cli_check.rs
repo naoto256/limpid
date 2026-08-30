@@ -881,6 +881,52 @@ def pipeline p { input i; output o }
 // declared `property_schema()`.
 
 #[test]
+fn check_accepts_raw_udp_input_schema() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("raw-udp.conf");
+    fs::write(
+        &conf,
+        r#"
+def input packets {
+    type raw_udp
+    bind "127.0.0.1:5514"
+    rate_limit 1000
+}
+def output o { type stdout }
+def pipeline p { input packets; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+}
+
+#[test]
+fn check_rejects_unknown_raw_udp_property_with_suggestion() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("raw-udp-invalid.conf");
+    fs::write(
+        &conf,
+        r#"
+def input packets { type raw_udp bnd "127.0.0.1:5514" }
+def output o { type stdout }
+def pipeline p { input packets; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unknown property 'bnd'") && stderr.contains("bind"),
+        "expected an unknown-property error with bind suggestion\nstderr: {stderr}"
+    );
+}
+
+#[test]
 fn check_accepts_correct_framing_enum_value_without_false_warning() {
     // Pre-schema, `framing non_transparent` (a perfectly valid enum
     // value) tripped `expr_types::check_unknown_ident` because the

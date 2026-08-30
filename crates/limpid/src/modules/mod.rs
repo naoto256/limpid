@@ -1435,6 +1435,7 @@ fn format_factory_schema_errors(
 
 pub fn register_builtins(registry: &mut ModuleRegistry) {
     // Inputs
+    register_input_type::<input::raw_udp::RawUdpInput>(registry, "raw_udp");
     register_input_type::<input::syslog_udp::SyslogUdpInput>(registry, "syslog_udp");
     register_input_type::<input::syslog_tcp::SyslogTcpInput>(registry, "syslog_tcp");
     register_input_type::<input::ltp::LtpInput>(registry, "ltp");
