@@ -360,7 +360,7 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// for events still buffered in the receiver AFTER the shutdown
     /// signal was observed. Unlike `consume`, this MUST NOT use the
     /// steady-state retry budget — the runtime caps the entire
-    /// shutdown sequence at `runtime::Daemon::SHUTDOWN_TIMEOUT` (10s),
+    /// shutdown sequence at `runtime::lifecycle::SHUTDOWN_TIMEOUT` (10s),
     /// and a steady-state retry loop (e.g. `flush_events`'s
     /// exponential backoff path) that outlasts it gets killed
     /// mid-flight, dropping `QueueAckHandle`s unresolved.
@@ -432,7 +432,7 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// timeout aborts the task, which fires `Dropped` (= silent loss
     /// attributed to a bug). Batched outputs MUST NOT reuse their
     /// steady-state retry budget here — the runtime caps the entire
-    /// shutdown sequence at `runtime::Daemon::SHUTDOWN_TIMEOUT` (10s),
+    /// shutdown sequence at `runtime::lifecycle::SHUTDOWN_TIMEOUT` (10s),
     /// and a retry loop that outlasts it will be killed mid-flight.
     /// Use a single bounded attempt (e.g.
     /// `tokio::time::timeout(SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, ...)`)
@@ -541,7 +541,7 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
 }
 
 /// Per-attempt deadline for the single shutdown flush a batched output
-/// is allowed. Deliberately shorter than `runtime::Daemon::SHUTDOWN_TIMEOUT`
+/// is allowed. Deliberately shorter than `runtime::lifecycle::SHUTDOWN_TIMEOUT`
 /// (10s) so the DLQ drain that follows a failed / timed-out send still
 /// has headroom inside the runtime-level shutdown budget. This is a
 /// daemon invariant tied to the runtime contract, not an operator knob —
@@ -886,7 +886,7 @@ pub async fn route_shutdown_batch_ambiguous_to_dlq(
 ///
 /// Central emission for all four DLQ paths (steady-state per-event,
 /// batched shutdown-drain, ambiguous shutdown-drain, and the
-/// pipeline-side runtime error path in `runtime.rs`). Only the
+/// pipeline-side runtime error path in `runtime/pipeline_worker.rs`). Only the
 /// tracing line is written here — every caller keeps ownership of
 /// its own ack disposition so this helper can never accidentally
 /// change queue cursor semantics.
@@ -927,7 +927,7 @@ pub async fn route_shutdown_batch_ambiguous_to_dlq(
 ///   `route_shutdown_batch_to_dlq` / `route_shutdown_batch_ambiguous_to_dlq`
 ///   all require a live `AckPosition` at the type level and pass
 ///   `Some(position)` here. `(none)` only appears on the pipeline
-///   side (`runtime::write_errored_to_dlq`) where the event
+///   side (`runtime::pipeline_worker::write_errored_to_dlq`) where the event
 ///   never entered an output queue and no `AckPosition` exists.
 ///
 /// # Excluded fields
@@ -1121,7 +1121,7 @@ pub enum DlqRouteOutcome {
 /// entry point and every sink call site holds an in-scope
 /// `QueueAckHandle` at the moment of dispatch (the immediate next
 /// statement resolves it via `resolve_ack_from_dlq_outcome`). The
-/// pipeline-side runtime path (`runtime::write_errored_to_dlq`)
+/// pipeline-side runtime path (`runtime::pipeline_worker::write_errored_to_dlq`)
 /// legitimately has no such handle and does not route through this
 /// helper — it delegates to `emit_dlq_tracing_fallback` directly
 /// with `position = None`. Requiring the argument here at the type
@@ -1150,7 +1150,7 @@ pub async fn route_event_to_dlq(
             Err(write_err) => {
                 // DLQ file itself failed. Bump the operator-facing
                 // counter that pipeline-side `write_errored_to_dlq`
-                // (in runtime.rs) also uses so both sink-side and
+                // (in runtime/pipeline_worker.rs) also uses so both sink-side and
                 // pipeline-side DLQ-write failures show up under
                 // the same metric. `Dropped` signals the caller
                 // to hold the cursor on a disk queue rather than

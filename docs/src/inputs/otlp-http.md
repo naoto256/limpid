@@ -6,7 +6,7 @@ Receives OpenTelemetry logs over the OTLP/HTTP transport. Listens for `POST /v1/
 
 ## Configuration
 
-```
+```limpid
 def input otlp_in {
     type otlp_http
     bind "0.0.0.0:4318"            // OTLP/HTTP default port
@@ -72,10 +72,10 @@ Each LogRecord in the incoming `ExportLogsServiceRequest` becomes one Event. The
 
 To structure the LogRecord into workspace fields, decode it explicitly in a process:
 
-```
+```limpid
 def process unpack_otlp {
     workspace.otlp = otlp.decode_resourcelog_protobuf(ingress)
-    // workspace.otlp.scope_logs[0].log_records[0].body.string_value, etc.
+    // first(first(workspace.otlp.scope_logs).log_records).body.string_value, etc.
 }
 ```
 
@@ -101,7 +101,7 @@ A decode failure returns HTTP 400 and increments `events_invalid`. Successful bu
 
 If the pipeline has no process layer, an OTLP/HTTP → `otlp_http` (or `otlp_grpc`) output topology relays without re-encoding — `egress` is already valid singleton ResourceLogs proto bytes:
 
-```
+```limpid
 def pipeline otlp_relay {
     input otlp_in
     output otlp_out

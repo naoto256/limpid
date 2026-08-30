@@ -12,7 +12,7 @@ and is skipped until it recovers.
 
 Single plaintext destination:
 
-```
+```limpid
 def output relay {
     type syslog_tcp
     framing octet_counting
@@ -22,7 +22,7 @@ def output relay {
 
 Multiple plaintext destinations (round-robin):
 
-```
+```limpid
 def output relay {
     type syslog_tcp
     framing octet_counting
@@ -36,7 +36,7 @@ def output relay {
 
 Single TLS destination with custom CA:
 
-```
+```limpid
 def output secure {
     type syslog_tcp
     framing octet_counting
@@ -49,7 +49,7 @@ def output secure {
 
 Mixed TLS and plaintext, with shared and per-peer profiles:
 
-```
+```limpid
 def output relay {
     type syslog_tcp
     framing octet_counting

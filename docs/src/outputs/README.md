@@ -15,12 +15,13 @@ Output modules write processed events to external destinations.
 | [`stdout`](./stdout.md) | Standard output (debugging) |
 | [`otlp_http`](./otlp_http.md) | OTLP/HTTP logs sender (`http_protobuf` / `http_json`), per-peer TLS / mTLS |
 | [`otlp_grpc`](./otlp_grpc.md) | OTLP/gRPC logs sender, per-peer TLS / mTLS |
+| [`ltp`](../ltp.md) | LTP node-to-node transport (mutual TLS 1.3 with raw public keys); see [LTP protocol notes](../ltp.md) |
 
 ## Queue and retry
 
 Every output has an async queue that decouples pipeline processing from I/O. You can configure the queue and retry behavior:
 
-```
+```limpid
 def output reliable {
     type syslog_tcp
     peer { host "10.0.0.1" port 514 }
@@ -114,7 +115,7 @@ The `"full"` value restores the pre-0.7.9 shape (full JSONL on the tracing line)
 
 `output` is **non-terminal** — it deep-copies the event to the output queue and pipeline execution continues:
 
-```
+```limpid
 def pipeline main {
     input syslog
     output archive       // event is copied to archive queue

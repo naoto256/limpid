@@ -11,7 +11,7 @@ cargo build --release -p limpid --features journal
 
 ## Configuration
 
-```
+```limpid
 def input system {
     type journal
     match "SYSLOG_FACILITY=10"
@@ -78,7 +78,7 @@ Conventions matching `journalctl`:
 The standard pattern is two snippets — one to pull the structured fields off
 the JSON, one to compose the wire form you want to ship:
 
-```
+```limpid
 include "/usr/share/limpid/snippets/parsers/parse_journald.limpid"
 include "/usr/share/limpid/snippets/composers/compose_rfc5424.limpid"
 

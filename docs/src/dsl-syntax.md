@@ -73,7 +73,7 @@ workspace.geo.country           // nested
 workspace.cef.src_endpoint.ip   // arbitrarily deep
 ```
 
-The leading segment is one of the event-level names (`ingress`, `egress`, `received_at`, `source`, `error`, `workspace`) or a `let` binding in scope. Bare identifiers that match none of these are an error at analyzer time.
+The leading segment is one of the event-level names (`ingress`, `egress`, `received_at`, `source`, `error`, `workspace`), a `let` binding in scope, or a `def function` parameter name when inside a function body. Bare identifiers that match none of these are an error at analyzer time.
 
 ## Property assignment in process bodies
 

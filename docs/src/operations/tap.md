@@ -18,7 +18,7 @@ sudo limpidctl tap process enrich_fortigate
 sudo limpidctl list
 ```
 
-By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the Event as one JSON object per line. Top-level keys are always `key`, `received_at`, `source`, `ingress`, and `egress`. `key` is the event's immutable UUIDv7 identity; it is minted before fan-out and survives queue persistence, DLQ capture, and JSON replay. `workspace` inclusion depends on the tap point:
+By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the Event as one JSON object per line. Top-level keys always include `key`, `received_at`, `source`, `ingress`, and `egress`; `ltp_stamps` appears only when non-empty (LTP-forwarded events; see [LTP → Hop timing](../ltp.md#hop-timing)). `key` is the event's immutable UUIDv7 identity; it is minted before fan-out and survives queue persistence, DLQ capture, and JSON replay. `workspace` inclusion depends on the tap point:
 
 - **`tap process <name> --json`** — `workspace` is included when non-empty. This is the tap point that shows workspace state, because process bodies are the only DSL construct that mutates it.
 - **`tap input <name> --json`** — `workspace` is always absent (input events start with an empty workspace).
@@ -55,7 +55,7 @@ sudo limpidctl tap input syslog | grep -E '<[0-3]>'
 # Structured filter via full-Event JSON — output tap exposes egress and
 # provenance only, so inspect workspace state one hop earlier via the
 # named process that set it.
-sudo limpidctl tap process parse_cef --json | jq 'select(.workspace.cef.severity != null and (.workspace.cef.severity | tonumber) <= 3)'
+sudo limpidctl tap process parse_cef --json | jq 'select(.workspace.cef.severity as $s | $s == "High" or $s == "Very-High" or (($s | tonumber?) // -1) >= 7)'
 ```
 
 ## Inject

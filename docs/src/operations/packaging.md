@@ -40,7 +40,7 @@ cargo deb -p limpid -- --features journal,kafka
 | `/usr/share/limpid/limpid.conf.example` | Example configuration |
 | `/usr/share/doc/limpid/README.md` | Documentation |
 | `/usr/share/limpid/snippets/` | Shipped snippet library (`composers/`, `filters/`, `functions/`, `parsers/`) — resolved by absolute-`include` under `SYSTEM_SNIPPET_DIR`. See [Snippet Library](../snippets/README.md). |
-| `/etc/systemd/system/limpid.service` | systemd unit file |
+| `/usr/lib/systemd/system/limpid.service` | systemd unit file (operator overrides live under `/etc/systemd/system/limpid.service.d/*.conf`) |
 
 The post-install script (`packaging/postinst`) runs on first install:
 
@@ -61,7 +61,7 @@ The post-install script (`packaging/postinst`) runs on first install:
 | `/etc/default/limpid-prometheus` | Environment variables (`LIMPID_PROMETHEUS_BIND`, `LIMPID_PROMETHEUS_SOCKET`) |
 | `/usr/share/limpid/grafana/limpid-dashboard.json` | Bundled Grafana dashboard (`0644`) |
 | `/usr/share/limpid/grafana/limpid-alerts.yaml` | Bundled Prometheus alert rules (`0644`) |
-| `/etc/systemd/system/limpid-prometheus.service` | systemd unit file |
+| `/usr/lib/systemd/system/limpid-prometheus.service` | systemd unit file (operator overrides live under `/etc/systemd/system/limpid-prometheus.service.d/*.conf`) |
 
 ## systemd unit
 

@@ -4,7 +4,7 @@ Receives syslog messages from a Unix datagram socket. Used to receive messages f
 
 ## Configuration
 
-```
+```limpid
 def input local {
     type unix_socket
     path "/dev/log"
