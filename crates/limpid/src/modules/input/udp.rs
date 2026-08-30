@@ -78,10 +78,42 @@ impl UdpInputRuntime {
                             let event = Event::new(Bytes::copy_from_slice(data), addr);
 
                             if let Some(ref limiter) = limiter {
-                                limiter.acquire().await;
+                                let acquire = limiter.acquire();
+                                tokio::pin!(acquire);
+                                loop {
+                                    tokio::select! {
+                                        biased;
+
+                                        terminal = shutdown_change_is_terminal(&mut shutdown) => {
+                                            if terminal {
+                                                info!("{}: shutting down", self.module_name);
+                                                return Ok(());
+                                            }
+                                        }
+
+                                        () = &mut acquire => break,
+                                    }
+                                }
                             }
 
-                            if tx.send(event).await.is_err() {
+                            let send = tx.send(event);
+                            tokio::pin!(send);
+                            let send_result = loop {
+                                tokio::select! {
+                                    biased;
+
+                                    terminal = shutdown_change_is_terminal(&mut shutdown) => {
+                                        if terminal {
+                                            info!("{}: shutting down", self.module_name);
+                                            return Ok(());
+                                        }
+                                    }
+
+                                    result = &mut send => break result,
+                                }
+                            };
+
+                            if send_result.is_err() {
                                 info!(
                                     "{} [{}]: pipeline event channel closed, stopping input task",
                                     self.module_name, addr
@@ -97,5 +129,116 @@ impl UdpInputRuntime {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::UdpSocket as StdUdpSocket;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    fn pick_port() -> u16 {
+        let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap().port()
+    }
+
+    fn spawn_runtime(
+        bind_addr: String,
+        rate_limit: Option<u64>,
+        channel_capacity: usize,
+    ) -> (
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::mpsc::Receiver<Event>,
+        Arc<InputMetrics>,
+    ) {
+        let metrics = InputMetrics::for_testing();
+        let runtime = UdpInputRuntime {
+            module_name: "udp_test",
+            bind_addr,
+            rate_limit,
+            metrics: Arc::clone(&metrics),
+            validator: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(channel_capacity);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(runtime.run(tx, shutdown_rx));
+        (handle, shutdown_tx, rx, metrics)
+    }
+
+    async fn wait_for_received(metrics: &InputMetrics, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while metrics.events_received.load(Ordering::Relaxed) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("UDP runtime did not receive the expected datagrams");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_rate_limit_token_wait() {
+        let bind = format!("127.0.0.1:{}", pick_port());
+        let (handle, shutdown, mut events, metrics) = spawn_runtime(bind.clone(), Some(1), 2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let sender = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"first", &bind).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), events.recv())
+            .await
+            .expect("first event timed out")
+            .expect("event channel closed");
+
+        sender.send_to(b"second", &bind).unwrap();
+        wait_for_received(&metrics, 2).await;
+        shutdown.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_millis(300), handle)
+            .await
+            .expect("UDP runtime did not stop while waiting for a rate-limit token")
+            .expect("UDP runtime task did not join")
+            .expect("UDP runtime returned an error");
+        assert!(
+            events.recv().await.is_none(),
+            "limited event was delivered after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_full_pipeline_channel_send() {
+        let bind = format!("127.0.0.1:{}", pick_port());
+        let (handle, shutdown, mut events, metrics) = spawn_runtime(bind.clone(), None, 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let sender = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"first", &bind).unwrap();
+        wait_for_received(&metrics, 1).await;
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while events.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first event did not fill the pipeline channel");
+
+        sender.send_to(b"second", &bind).unwrap();
+        wait_for_received(&metrics, 2).await;
+        shutdown.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_millis(300), handle)
+            .await
+            .expect("UDP runtime did not stop while blocked on the pipeline channel")
+            .expect("UDP runtime task did not join")
+            .expect("UDP runtime returned an error");
+        assert_eq!(
+            &events.recv().await.expect("first event missing").ingress[..],
+            b"first"
+        );
+        assert!(
+            events.recv().await.is_none(),
+            "blocked second event was delivered after shutdown"
+        );
     }
 }
