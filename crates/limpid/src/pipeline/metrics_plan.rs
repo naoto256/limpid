@@ -42,6 +42,107 @@ def pipeline p { process recurse; finish }
             "unexpected error: {message}"
         );
     }
+
+    #[test]
+    fn parsed_branch_bodies_keep_their_enclosing_statement_kind() {
+        let config = CompiledConfig::from_config(
+            parse_config(
+                r#"
+def process nested {
+    if true { drop } else { drop }
+}
+def pipeline p {
+    if true { process nested } else { finish }
+}
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let pipeline = config.pipelines.get("p").unwrap();
+        let PipelineStatement::If(pipeline_if) = &pipeline.body[0] else {
+            panic!("expected pipeline if statement");
+        };
+        assert!(pipeline_if.branches.iter().all(|(_, body)| {
+            body.iter()
+                .all(|item| matches!(item, BranchBody::Pipeline(_)))
+        }));
+        assert!(
+            pipeline_if
+                .else_body
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|item| matches!(item, BranchBody::Pipeline(_)))
+        );
+
+        let process = config.processes.get("nested").unwrap();
+        let ProcessStatement::If(process_if) = &process.body[0] else {
+            panic!("expected process if statement");
+        };
+        assert!(process_if.branches.iter().all(|(_, body)| {
+            body.iter()
+                .all(|item| matches!(item, BranchBody::Process(_)))
+        }));
+        assert!(
+            process_if
+                .else_body
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|item| matches!(item, BranchBody::Process(_)))
+        );
+
+        PipelineProcessMetrics::register(
+            pipeline,
+            &config.processes,
+            &crate::metrics::Registry::new(),
+        )
+        .expect("valid parsed branches must register");
+    }
+
+    #[test]
+    fn inline_token_mutant_targets_inline_identity_after_named_step() {
+        let config = CompiledConfig::from_config(
+            parse_config(
+                "def process named { drop } def pipeline p { process named | { drop }; finish }",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let pipeline = config.pipelines.get("p").unwrap();
+        let mut raw = PipelineProcessMetrics::compile_raw(
+            pipeline,
+            &config.processes,
+            &crate::metrics::Registry::new(),
+        )
+        .unwrap();
+        let named_token = raw
+            .identities
+            .iter()
+            .position(|identity| {
+                matches!(&identity.kind, ProcessMetricNodeKind::Named(name) if name == "named")
+            })
+            .unwrap();
+        let inline_token = raw
+            .identities
+            .iter()
+            .position(|identity| identity.kind == ProcessMetricNodeKind::Inline)
+            .unwrap();
+
+        let PipelineMetricStatement::ProcessChain(tokens) = &raw.statements[0] else {
+            panic!("expected process chain plan");
+        };
+        assert_eq!(tokens, &[named_token, inline_token]);
+
+        raw.invalidate_first_inline_token_for_testing();
+
+        let PipelineMetricStatement::ProcessChain(tokens) = &raw.statements[0] else {
+            panic!("expected process chain plan");
+        };
+        assert_eq!(tokens, &[named_token, usize::MAX]);
+    }
 }
 
 pub(super) struct ProcessMetricNode {
@@ -269,9 +370,16 @@ impl RawPipelineProcessMetrics {
 
     #[cfg(test)]
     pub(crate) fn invalidate_first_inline_token_for_testing(&mut self) {
+        let Some(inline_token) = self
+            .identities
+            .iter()
+            .position(|identity| identity.kind == ProcessMetricNodeKind::Inline)
+        else {
+            return;
+        };
         for statement in &mut self.statements {
             if let PipelineMetricStatement::ProcessChain(tokens) = statement
-                && let Some(token) = tokens.first_mut()
+                && let Some(token) = tokens.iter_mut().find(|token| **token == inline_token)
             {
                 *token = usize::MAX;
                 return;
