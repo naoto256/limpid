@@ -8,6 +8,12 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Added
+
+- Added the `raw_udp` input for byte-exact UDP datagrams that do not carry a
+  syslog PRI header. Each datagram, including an empty or non-UTF-8 payload,
+  becomes one event with its source peer preserved.
+
 ## [0.8.0] - 2026-08-27
 
 ### Added — authenticated LTP node transport

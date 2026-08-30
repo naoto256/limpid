@@ -5,6 +5,13 @@ include "outputs/*.limpid"
 include "processes/*.limpid"
 include "pipelines/*.limpid"
 
+// Example opaque-datagram input. Production deployments normally place input
+// definitions in /etc/limpid/inputs/*.limpid.
+// def input packets {
+//     type raw_udp
+//     bind "0.0.0.0:5514"
+// }
+
 geoip {
     database "/usr/share/GeoIP/GeoLite2-City.mmdb"
 }
