@@ -79,3 +79,81 @@ fn parse<'bump>(
     }
     builder.finish()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::value::ArrayBuilder;
+
+    fn names<'bump>(arena: &'bump EventArena<'bump>, values: &[Option<&str>]) -> Value<'bump> {
+        let mut builder = ArrayBuilder::with_capacity(arena, values.len());
+        for value in values {
+            builder.push(match value {
+                Some(value) => Value::String(arena.alloc_str(value)),
+                None => Value::Int(7),
+            });
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn extra_cells_are_dropped_and_empty_names_keep_position() {
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let text = Value::String("one,ignored,two,extra");
+        let fields = names(&arena, &[Some("first"), Some(""), Some("third")]);
+
+        let Value::Object(entries) = parse(&arena, &text, &fields) else {
+            panic!("csv_parse should return an object");
+        };
+        assert_eq!(
+            entries,
+            [
+                ("first", Value::String("one")),
+                ("third", Value::String("two")),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_empty_and_non_string_named_cells_are_honest() {
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let text = Value::String("one,");
+        let fields = names(
+            &arena,
+            &[Some("first"), Some("empty"), None, Some("missing")],
+        );
+
+        let Value::Object(entries) = parse(&arena, &text, &fields) else {
+            panic!("csv_parse should return an object");
+        };
+        assert_eq!(
+            entries,
+            [
+                ("first", Value::String("one")),
+                ("empty", Value::Null),
+                ("missing", Value::Null),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_names_preserve_runtime_order_for_last_wins_merge() {
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let text = Value::String("first,second");
+        let fields = names(&arena, &[Some("value"), Some("value")]);
+
+        let Value::Object(entries) = parse(&arena, &text, &fields) else {
+            panic!("csv_parse should return an object");
+        };
+        assert_eq!(
+            entries,
+            [
+                ("value", Value::String("first")),
+                ("value", Value::String("second")),
+            ]
+        );
+    }
+}

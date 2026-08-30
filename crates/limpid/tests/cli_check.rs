@@ -645,6 +645,101 @@ def pipeline p {
     );
 }
 
+fn run_test_pipeline(config: &std::path::Path) -> std::process::Output {
+    Command::new(limpid_bin())
+        .arg("--config")
+        .arg(config)
+        .arg("--test-pipeline")
+        .arg("p")
+        .output()
+        .expect("failed to spawn limpid test pipeline")
+}
+
+#[test]
+fn user_csv_parse_shadow_passes_ultra_strict_and_leaves_runtime_workspace_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("csv_shadow.conf");
+    fs::write(
+        &conf,
+        r#"
+def function csv_parse(text, names) { null }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process {
+        csv_parse(ingress, ["host"])
+        workspace.copy = workspace.host
+        workspace.marker = "user-function"
+    }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    let checked = run_with_flags(&conf, &["--ultra-strict"]);
+    assert!(
+        checked.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let runtime = run_test_pipeline(&conf);
+    assert!(
+        runtime.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&runtime.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&runtime.stdout);
+    assert!(stdout.contains("user-function"), "{stdout}");
+    assert!(!stdout.contains("\"host\""), "{stdout}");
+}
+
+#[test]
+fn builtin_csv_parse_wrong_arity_does_not_fabricate_fields_and_routes_runtime_error() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("csv_wrong_arity.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process {
+        csv_parse(ingress, ["host"], "extra")
+        workspace.copy = workspace.host
+    }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    let checked = run_with_flags(&conf, &["--ultra-strict"]);
+    assert!(
+        checked.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let runtime = run_test_pipeline(&conf);
+    assert!(
+        runtime.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&runtime.stderr)
+    );
+    let runtime_stdout = String::from_utf8_lossy(&runtime.stdout);
+    assert!(runtime_stdout.contains("[error_log]"), "{runtime_stdout}");
+    assert!(
+        runtime_stdout.contains("csv_parse() expects 2 arguments, got 3"),
+        "{runtime_stdout}"
+    );
+    assert!(!runtime_stdout.contains("[output]"), "{runtime_stdout}");
+    assert!(!runtime_stdout.contains("\"host\""), "{runtime_stdout}");
+}
+
 #[test]
 fn check_resolves_user_function_from_include_closure() {
     let dir = TempDir::new().unwrap();

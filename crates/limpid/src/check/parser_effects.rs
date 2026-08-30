@@ -21,6 +21,16 @@ pub(super) fn apply_parser_effects(
     registry: &FunctionRegistry,
     bindings: &mut Bindings,
 ) {
+    if namespace.is_none()
+        && name == "csv_parse"
+        && args.len() == 2
+        && !registry.is_user_function(name)
+        && registry.signature(None, name).is_some()
+    {
+        apply_csv_parse_effect(args, bindings);
+        return;
+    }
+
     let Some(info) = registry.parser(namespace, name) else {
         // Not a parser — nothing to merge into workspace. Side-effect-
         // only functions (`table_upsert`, `table_delete`) return Null
@@ -72,6 +82,42 @@ pub(super) fn apply_parser_effects(
     }
 }
 
+/// `csv_parse` derives its output keys from the literal `field_names`
+/// argument rather than a registry-level parser schema. Mirror only the
+/// names the DSL can address as `workspace.<ident>`; dynamic or malformed
+/// declarations remain unknown instead of widening workspace.
+fn apply_csv_parse_effect(args: &[Expr], bindings: &mut Bindings) {
+    let Some(Expr {
+        kind: ExprKind::ArrayLit(field_names),
+        ..
+    }) = args.get(1)
+    else {
+        return;
+    };
+
+    let nullable_string = FieldType::union(FieldType::String, FieldType::Null);
+    for field_name in field_names {
+        let ExprKind::StringLit(field_name) = &field_name.kind else {
+            continue;
+        };
+        if !is_dsl_identifier(field_name) {
+            continue;
+        }
+
+        let path = vec!["workspace".to_string(), field_name.clone()];
+        bindings.bind_workspace(&path, nullable_string.clone());
+    }
+}
+
+fn is_dsl_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 /// Best-effort type from a literal-shaped expression. Used for
 /// HashLit defaults inference in parser calls; non-literal entries
 /// fall through to `Any`.
@@ -91,13 +137,24 @@ fn literal_type(e: &Expr) -> FieldType {
 mod tests {
     use super::*;
     use crate::dsl::ast::Expr;
+    use crate::dsl::parser::parse_config;
     use crate::functions::FunctionRegistry;
     use crate::functions::table::TableStore;
+    use crate::pipeline::CompiledConfig;
 
     fn registry() -> FunctionRegistry {
         let mut reg = FunctionRegistry::new();
         let table_store = TableStore::from_configs(vec![]).unwrap();
         crate::functions::register_builtins(&mut reg, table_store);
+        reg
+    }
+
+    fn shadowed_registry() -> FunctionRegistry {
+        let mut reg = registry();
+        let config = parse_config("def function csv_parse(text, names) { null }").unwrap();
+        let compiled = CompiledConfig::from_config(config).unwrap();
+        crate::functions::register_user_functions(&mut reg, &compiled);
+        assert!(reg.is_user_function("csv_parse"));
         reg
     }
 
@@ -117,8 +174,135 @@ mod tests {
         Expr::spanless(ExprKind::HashLit(owned))
     }
 
+    fn array(items: Vec<Expr>) -> Expr {
+        Expr::spanless(ExprKind::ArrayLit(items))
+    }
+
     fn ws(key: &str) -> Vec<String> {
         vec!["workspace".to_string(), key.to_string()]
+    }
+
+    #[test]
+    fn csv_parse_literal_field_names_bind_nullable_strings() {
+        let reg = registry();
+        let mut bindings = Bindings::new();
+        let args = vec![
+            ident("ingress"),
+            array(vec![string("host"), string("status")]),
+        ];
+
+        apply_parser_effects(None, "csv_parse", &args, &reg, &mut bindings);
+
+        let nullable_string = FieldType::union(FieldType::String, FieldType::Null);
+        assert_eq!(bindings.get_workspace(&ws("host")), Some(&nullable_string));
+        assert_eq!(
+            bindings.get_workspace(&ws("status")),
+            Some(&nullable_string)
+        );
+        assert!(!bindings.is_workspace_wildcard());
+    }
+
+    #[test]
+    fn csv_parse_literal_field_names_skip_unaddressable_entries() {
+        let reg = registry();
+        let mut bindings = Bindings::new();
+        let args = vec![
+            ident("ingress"),
+            array(vec![
+                string("first"),
+                string(""),
+                string("a.b"),
+                string("has space"),
+                string("1leading"),
+                Expr::spanless(ExprKind::IntLit(7)),
+                string("_last"),
+            ]),
+        ];
+
+        apply_parser_effects(None, "csv_parse", &args, &reg, &mut bindings);
+
+        let nullable_string = FieldType::union(FieldType::String, FieldType::Null);
+        assert_eq!(bindings.get_workspace(&ws("first")), Some(&nullable_string));
+        assert_eq!(bindings.get_workspace(&ws("_last")), Some(&nullable_string));
+        for skipped in ["", "a.b", "has space", "1leading"] {
+            assert_eq!(bindings.get_workspace(&ws(skipped)), None, "{skipped}");
+        }
+        assert!(!bindings.is_workspace_wildcard());
+    }
+
+    #[test]
+    fn csv_parse_dynamic_or_namespaced_fields_do_not_create_bindings() {
+        let reg = registry();
+
+        for (namespace, fields) in [
+            (None, ident("field_names")),
+            (None, string("not-an-array")),
+            (Some("custom"), array(vec![string("invented")])),
+        ] {
+            let mut bindings = Bindings::new();
+            let args = vec![ident("ingress"), fields];
+            apply_parser_effects(namespace, "csv_parse", &args, &reg, &mut bindings);
+            assert_eq!(bindings.get_workspace(&ws("invented")), None);
+            assert!(!bindings.is_workspace_wildcard());
+        }
+    }
+
+    #[test]
+    fn csv_parse_duplicate_names_keep_one_honest_binding() {
+        let reg = registry();
+        let mut bindings = Bindings::new();
+        let args = vec![
+            ident("ingress"),
+            array(vec![string("value"), string("value")]),
+        ];
+
+        apply_parser_effects(None, "csv_parse", &args, &reg, &mut bindings);
+
+        assert_eq!(
+            bindings.get_workspace(&ws("value")),
+            Some(&FieldType::union(FieldType::String, FieldType::Null))
+        );
+        assert_eq!(bindings.workspace_keys().count(), 1);
+    }
+
+    #[test]
+    fn user_csv_parse_shadow_does_not_fabricate_builtin_fields() {
+        let reg = shadowed_registry();
+        let mut bindings = Bindings::new();
+        let args = vec![ident("ingress"), array(vec![string("host")])];
+
+        apply_parser_effects(None, "csv_parse", &args, &reg, &mut bindings);
+
+        assert_eq!(bindings.get_workspace(&ws("host")), None);
+        assert!(!bindings.is_workspace_wildcard());
+    }
+
+    #[test]
+    fn csv_parse_requires_registered_builtin_and_exact_arity() {
+        let fields = array(vec![string("host")]);
+
+        let unregistered = FunctionRegistry::new();
+        let mut bindings = Bindings::new();
+        apply_parser_effects(
+            None,
+            "csv_parse",
+            &[ident("ingress"), fields.clone()],
+            &unregistered,
+            &mut bindings,
+        );
+        assert_eq!(bindings.get_workspace(&ws("host")), None);
+
+        let reg = registry();
+        for args in [
+            vec![],
+            vec![ident("ingress")],
+            vec![ident("ingress"), fields.clone(), string("extra")],
+        ] {
+            let mut bindings = Bindings::new();
+            apply_parser_effects(None, "csv_parse", &args, &reg, &mut bindings);
+            assert_eq!(bindings.get_workspace(&ws("host")), None, "{args:?}");
+            assert!(!bindings.is_workspace_wildcard());
+        }
     }
 
     // parse_kv 3-arg form: defaults sits at args[2]. The pre-fix
