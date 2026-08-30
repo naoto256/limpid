@@ -741,6 +741,44 @@ def pipeline p {
 }
 
 #[test]
+fn block_form_csv_parse_does_not_bind_fields_and_routes_runtime_error() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("csv_block_arg.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process {
+        csv_parse(ingress, ["host"]) { |value| value }
+        workspace.copy = workspace.host
+    }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    let runtime = run_test_pipeline(&conf);
+
+    assert!(
+        runtime.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&runtime.stderr)
+    );
+    let runtime_stdout = String::from_utf8_lossy(&runtime.stdout);
+    assert!(runtime_stdout.contains("[error_log]"), "{runtime_stdout}");
+    assert!(
+        runtime_stdout.contains("function `csv_parse` does not accept a block argument"),
+        "{runtime_stdout}"
+    );
+    assert!(!runtime_stdout.contains("[output]"), "{runtime_stdout}");
+    assert!(!runtime_stdout.contains("\"host\""), "{runtime_stdout}");
+}
+
+#[test]
 fn check_resolves_user_function_from_include_closure() {
     let dir = TempDir::new().unwrap();
     fs::write(
