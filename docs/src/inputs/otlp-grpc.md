@@ -6,7 +6,7 @@ Receives OpenTelemetry logs over the OTLP/gRPC transport. Hosts the `opentelemet
 
 ## Configuration
 
-```
+```limpid
 def input otlp_in {
     type otlp_grpc
     bind "0.0.0.0:4317"   // OTLP/gRPC default port
@@ -67,7 +67,7 @@ For setups where TLS terminates outside limpid (envoy, nginx, traefik, cloud LB)
 
 The gRPC input pairs naturally with the gRPC output for collector-to-collector relay:
 
-```
+```limpid
 def pipeline otlp_relay {
     input otlp_grpc_in
     output otlp_grpc_out  // type otlp_grpc

@@ -16,7 +16,7 @@ It contains `include` directives and global blocks (`geoip`, `control`, `table`)
 
 ## Include directives
 
-```
+```limpid
 include "inputs/*.limpid"          // glob
 include "outputs/ama.limpid"       // single file
 include "/usr/share/limpid/snippets/parsers/parse_cef.limpid"             // shipped snippet
@@ -73,7 +73,7 @@ stderr.
 
 Configures the runtime control surface — the Unix socket used by `limpidctl` and the Prometheus exporter, plus the optional dead-letter queue file.
 
-```
+```limpid
 control {
     socket    "/var/run/limpid/control.sock"
     error_log "/var/log/limpid/errored.jsonl"
@@ -83,7 +83,7 @@ control {
 | Property | Default | Effect |
 |----------|---------|--------|
 | `socket` | `/var/run/limpid/control.sock` | Unix socket path consumed by `limpidctl` and `limpid-prometheus`. |
-| `error_log` | *(unset)* | JSONL file appended to when an event terminates at a producer site that needs replay — pipeline-side process / pipeline-skeleton runtime errors and sink-side retry exhaustion / shutdown-drain / enqueue failures (see [Error Log → Producer sites](./operations/error-log.md#producer-sites)). When unset, every failure site emits a one-line `tracing::error!` summary — payload is not persisted anywhere by default. Strongly recommended when any output declares `retry` or is a batched OTLP/HTTP output — `--check` warns (see [Error Log → Recovery readiness check](./operations/error-log.md#recovery-readiness-check---check)). See [Error Log (DLQ)](./operations/error-log.md) for the v2 record format and flavor-aware replay recipes. |
+| `error_log` | *(unset)* | JSONL file appended to when an event terminates at a producer site that needs replay — pipeline-side process / pipeline-skeleton runtime errors and sink-side retry exhaustion / shutdown-drain / enqueue failures (see [Error Log → Producer sites](./operations/error-log.md#producer-sites)). When unset, every failure site emits a one-line `tracing::error!` summary — payload is not persisted anywhere by default. Strongly recommended when any output declares `retry` or is a batched OTLP/HTTP output — `--check` warns (see [Error Log → Recovery readiness check](./operations/error-log.md#recovery-readiness-check---check)). See [Error Log (DLQ)](./operations/error-log.md) for the current v3 record format and flavor-aware replay recipes. |
 | `error_log_fallback` | `"off"` | Confidentiality policy for the tracing-side fallback line when `error_log` is set but its write fails: `"off"` (default) keeps the line payload-free, `"meta"` adds structured metadata (timestamp, size, queue position — no payload bytes), `"full"` attaches the full event JSONL via an `event_record` field. Only takes effect when `error_log` is also set; `--check` warns on the inert combination. See [Error Log → Tracing fallback ladder](./operations/error-log.md#tracing-fallback-ladder-error_log_fallback). |
 
 The whole block is optional — daemon starts with the defaults if it's omitted.
@@ -92,7 +92,7 @@ The whole block is optional — daemon starts with the defaults if it's omitted.
 
 Defines in-memory key-value tables for use with `table_lookup()`, `table_upsert()`, and `table_delete()`.
 
-```
+```limpid
 table {
     // Static table loaded from file (read-write)
     asset {
@@ -121,7 +121,7 @@ See [table functions](./functions/expression-functions.md#table-functions) for u
 
 Enables the `geoip()` expression function for IP geolocation.
 
-```
+```limpid
 geoip {
     database "/usr/share/GeoIP/GeoLite2-City.mmdb"
 }

@@ -4,7 +4,7 @@ Receives syslog messages as UDP datagrams.
 
 ## Configuration
 
-```
+```limpid
 def input fw {
     type syslog_udp
     bind "0.0.0.0:514"
@@ -22,5 +22,5 @@ def input fw {
 ## Notes
 
 - Messages must start with a valid PRI header (`<N>`). Invalid messages are dropped and counted as `events_invalid`.
-- Maximum message size: 65,536 bytes (UDP datagram limit).
+- Receive buffer: 65,536 bytes (fits every valid IPv4 UDP datagram, whose payload maxes at 65,507 bytes).
 - Binding to port 514 requires `CAP_NET_BIND_SERVICE` or root privileges.

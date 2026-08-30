@@ -178,7 +178,7 @@ Note what the relay does *not* do:
 
 ## Verifying the pipeline
 
-With four tap points you can see exactly where an event is at every hop:
+With five tap points you can see exactly where an event is at every hop:
 
 ```bash
 # On edge01 — verify journald events enter the pipeline
@@ -193,11 +193,11 @@ sudo limpidctl tap input tcp514
 # On the relay — verify PRI rewrite (egress bytes leaving the sink)
 sudo limpidctl tap output ama --json | jq '.egress'
 
-# On the relay — verify parse results (workspace state after the parser)
-sudo limpidctl tap process parse_journal --json | jq '.workspace'
+# On the relay — verify parse results (workspace state after the debug-drop process)
+sudo limpidctl tap process app_drop_debug --json | jq '.workspace'
 ```
 
-A common bug shape: `app_drop_debug` was supposed to drop DEBUG events but wasn't — the `level` field was nested inside the parsed JSON and the snippet referenced `workspace.level` instead of the correct path. The five-point tap finds this in under a minute: the event is present at `input tcp514`, still present at `output ama`, and `workspace.level` is undefined at `tap process parse_journal`. No guessing, no restart, no log-digging. This is Principle 5 (safety and operational transparency) paying rent.
+A common bug shape: `app_drop_debug` was supposed to drop DEBUG events but wasn't — the `level` field is nested inside the parsed JSON, and an earlier revision of the snippet referenced the bare `workspace.level` instead of the correct nested `workspace.json.level` path. The five-point tap finds this in under a minute: the event is present at `input tcp514`, still present at `output ama` (it should have been dropped), and at `tap process app_drop_debug` the workspace shows `workspace.json.level == "DEBUG"` (the correct path the pipeline should have been reading) while the hypothetical `workspace.level` predicate would have observed `null` — an unambiguous mismatch that locates the bug. No guessing, no restart, no log-digging. This is Principle 5 (safety and operational transparency) paying rent.
 
 ## End-to-end testing without real traffic
 

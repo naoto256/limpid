@@ -8,7 +8,7 @@ Each Event's `egress` is expected to be the singleton ResourceLogs protobuf byte
 
 ## Configuration
 
-```
+```limpid
 def output otlp_out {
     type otlp_grpc
     peers {
@@ -35,7 +35,7 @@ def output otlp_out {
 
 A single-peer setup can use the `peer { ... }` shorthand (same shape `output syslog_tcp` accepts):
 
-```
+```limpid
 def output otlp_out {
     type otlp_grpc
     peer {

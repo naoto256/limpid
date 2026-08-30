@@ -14,6 +14,7 @@ Input modules receive log messages from external sources and feed them into pipe
 | [`unix_socket`](./unix-socket.md) | Unix datagram socket (`/dev/log`) |
 | [`otlp_http`](./otlp-http.md) | OTLP/HTTP logs receiver (`POST /v1/logs`) |
 | [`otlp_grpc`](./otlp-grpc.md) | OTLP/gRPC logs receiver (`LogsService.Export`) |
+| [`ltp`](../ltp.md) | LTP node-to-node transport (mutual TLS 1.3 with raw public keys); see [LTP protocol notes](../ltp.md) |
 
 ## Common properties
 
@@ -25,7 +26,7 @@ Each `def input` block declares its type via the `type <name>` clause; see the p
 
 An input is referenced by name in a pipeline definition:
 
-```
+```limpid
 def input fw {
     type syslog_udp
     bind "0.0.0.0:514"
