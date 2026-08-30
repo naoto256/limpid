@@ -4,7 +4,7 @@ Sends events to a Unix stream socket with persistent connection and automatic re
 
 ## Configuration
 
-```
+```limpid
 def output local_forward {
     type unix_socket
     path "/var/run/other/input.sock"

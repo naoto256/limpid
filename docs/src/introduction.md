@@ -37,7 +37,7 @@ When an output exhausts its retries or shutdown can't drain the queue in time, t
 
 ## At a glance
 
-```
+```limpid
 def input fw {
     type syslog_udp
     bind "0.0.0.0:514"
@@ -54,11 +54,16 @@ def output siem {
     batch_size 100
 }
 
+control {
+    error_log "/var/log/limpid/errored.jsonl"
+}
+
 def pipeline security {
     input fw
     process { workspace.cef = cef.parse(ingress) }
     output archive
-    if workspace.cef.severity <= 3 {
+    // CEF severity is a numeric-or-named union — forward High/Very-High and numeric 7-10.
+    if workspace.cef.severity == "High" or workspace.cef.severity == "Very-High" or workspace.cef.severity >= 7 {
         output siem
     }
 }

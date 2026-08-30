@@ -168,16 +168,28 @@ def process fw_dispatch {
 }
 ```
 
-Split these into `parse_fortigate`, `parse_paloalto`, `parse_cisco` and dispatch at the pipeline level with `switch`. The switch is load-bearing routing information — it deserves to be in the pipeline where routing lives, not hidden inside a process that reads like a parser.
+Split these into the shipped vendor parsers and dispatch at the pipeline level. The routing is load-bearing information — it deserves to be in the pipeline where routing lives, not hidden inside a process that reads like a parser.
+
+FortiGate and Palo Alto CEF records share a syslog transport and CEF format, while Cisco ASA records use a different syslog body. No input creates a `workspace.vendor` field, so this deployment first unwraps syslog and then dispatches on its known, anchored body contracts. Each branch decodes CEF where applicable and runs the matching vendor parser. The parser may populate `workspace.lsis.parsed.src_endpoint.ip`; only when that fact is present does the shared enrichment process consume it. This is explicit routing for the wire formats accepted by this pipeline, not Limpid-wide vendor autodetection.
 
 ```limpid
+def process enrich_with_geoip {
+    if workspace.lsis.parsed.src_endpoint.ip != null {
+        workspace.geo = geoip(workspace.lsis.parsed.src_endpoint.ip)
+    }
+}
+
 def pipeline fw {
     input fw_syslog
-    switch workspace.vendor {
-        "Fortinet"  { process parse_fortigate }
-        "PaloAlto"  { process parse_paloalto }
-        "Cisco"     { process parse_cisco }
-        default     { drop }
+    process parse_syslog
+    if starts_with(workspace.syslog.msg, "CEF:0|Fortinet|Fortigate|") {
+        process parse_cef | parse_fortigate_cef
+    } else if starts_with(workspace.syslog.msg, "CEF:0|Palo Alto Networks|PAN-OS|") {
+        process parse_cef | parse_paloalto_cef
+    } else if regex_match(workspace.syslog.msg, "^(?:[^:]*: )?%ASA-\\d-\\d+: ") {
+        process parse_asa
+    } else {
+        drop
     }
     process enrich_with_geoip
     output siem

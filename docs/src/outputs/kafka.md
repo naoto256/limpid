@@ -10,7 +10,7 @@ cargo build --release -p limpid --features kafka
 
 ## Configuration
 
-```
+```limpid
 def output events {
     type kafka
     brokers "kafka1:9092,kafka2:9092"
@@ -24,7 +24,7 @@ def output events {
 
 TLS to the brokers (with optional client cert for mTLS):
 
-```
+```limpid
 def output secure {
     type kafka
     brokers "kafka1.example.com:9093,kafka2.example.com:9093"
@@ -39,7 +39,7 @@ def output secure {
 
 SASL/SCRAM (over TLS — the typical production combo):
 
-```
+```limpid
 def output authenticated {
     type kafka
     brokers "kafka1.example.com:9094"
@@ -113,7 +113,7 @@ password.
 the wire — the only safe transport is TLS. limpid rejects this
 combination at config-load time:
 
-```
+```limpid
 def output lake {
     type kafka
     brokers "..."
@@ -152,7 +152,7 @@ If `key` is omitted, the event is sent without a partition key (round-robin acro
 
 For per-tenant or per-content partitioning, split traffic into separate `output kafka` blocks from the pipeline body and give each one its own `topic` (or its own broker cluster):
 
-```
+```limpid
 def output kafka_apac { type kafka brokers "..." topic "logs-apac" }
 def output kafka_emea { type kafka brokers "..." topic "logs-emea" }
 
@@ -176,7 +176,7 @@ Routing decisions stay in the pipeline body; the output configs stay static and 
 
 ## Example
 
-```
+```limpid
 def output siem_kafka {
     type kafka
     brokers "kafka1:9092,kafka2:9092,kafka3:9092"

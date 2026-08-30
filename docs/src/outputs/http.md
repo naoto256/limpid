@@ -6,7 +6,7 @@ Works with Elasticsearch Bulk API, Splunk HEC, Datadog, Grafana Loki, and any ge
 
 ## Configuration
 
-```
+```limpid
 def output es_cluster {
     type http
     peers {
@@ -35,7 +35,7 @@ def output es_cluster {
 
 Single-peer setups use the `peer { ... }` shorthand (same shape `output syslog_tcp` / `output otlp_http` accept):
 
-```
+```limpid
 def output es {
     type http
     peer {
@@ -66,7 +66,7 @@ Each `peer` block configures one target endpoint:
 
 | Per-peer property | Required | Description |
 |-------------------|----------|-------------|
-| `url` | yes | Target URL (`http://` or `https://`) |
+| `url` | yes | Target URL (`http://` or `https://`). A `tls { ... }` sub-block requires the `https://` scheme; a `tls` block paired with an `http://` URL is rejected at config-load time (see [TLS behavior](#tls-behavior)). |
 | `tls.ca` | no | Custom CA certificate file (PEM) for this peer. Falls back to the system root store if omitted. |
 | `tls.cert`, `tls.key` | no (paired) | Client certificate and private key for mTLS, as separate PEM files (chmod 600 the key). Both must be present together. |
 
@@ -74,7 +74,7 @@ On each send the rotation picks the next available peer (cooldown expired) and t
 
 ### headers block
 
-```
+```limpid
 headers {
     Authorization "Bearer your-token"
     X-Custom-Header "value"
@@ -130,7 +130,7 @@ is moot when no chain is checked at all.
 
 ### Splunk HEC
 
-```
+```limpid
 def output splunk {
     type http
     peer { url "https://splunk:8088/services/collector/event" }
@@ -142,7 +142,7 @@ def output splunk {
 
 ### Datadog Logs
 
-```
+```limpid
 def output datadog {
     type http
     peer { url "https://http-intake.logs.datadoghq.com/api/v2/logs" }
@@ -156,7 +156,7 @@ def output datadog {
 
 ### Grafana Loki
 
-```
+```limpid
 def output loki {
     type http
     peer { url "http://loki:3100/loki/api/v1/push" }
@@ -166,7 +166,7 @@ def output loki {
 
 ### Elasticsearch cluster with mTLS (round-robin)
 
-```
+```limpid
 def output es {
     type http
     peers {
@@ -195,7 +195,7 @@ def output es {
 
 ### Self-signed certificates (debugging only)
 
-```
+```limpid
 def output internal {
     type http
     peer { url "https://es.example.com:9200/_bulk" }

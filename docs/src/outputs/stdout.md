@@ -4,7 +4,7 @@ Writes events to standard output. Useful for debugging and testing.
 
 ## Configuration
 
-```
+```limpid
 def output debug {
     type stdout
 }

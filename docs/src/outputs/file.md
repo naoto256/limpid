@@ -4,7 +4,7 @@ Appends event `egress` bytes to a local file. Supports dynamic path templates (f
 
 ## Configuration
 
-```
+```limpid
 def output archive {
     type file
     path "/var/log/limpid/archive.log"
@@ -19,7 +19,7 @@ def output archive {
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `path` | yes | — | File path (literal, or a template with `${...}`) |
-| `mode` | no | system default | Octal file permissions (e.g., `"0640"`) |
+| `mode` | no | See [Permissions contract](#permissions-contract) below — umask-derived when `mode` / `owner` / `group` are all unset; new file born `0o600` and `fchmod`'d nowhere further when `owner` or `group` are set with `mode` omitted; born directly at the configured `mode` when `mode` is set without `owner` / `group`; ownership applied first and then `fchmod` to `mode` when `mode` accompanies `owner` / `group` | Octal file permissions (e.g., `"0640"`) |
 | `owner` | no | process user | File owner (requires `CAP_CHOWN`) |
 | `group` | no | process group | File group |
 
@@ -32,7 +32,9 @@ This holds independently of the `mode` / `owner` / `group` contract
 below: an operator typo that pointed `path` at `/dev/log` or a stale
 FIFO won't silently drain events into whatever is on the other end.
 
-**Permissions contract.** When any of `mode` / `owner` / `group` is
+### Permissions contract
+
+When any of `mode` / `owner` / `group` is
 configured, the output enforces the following on every write:
 
 - **File newly created by this output:** the inode is born
@@ -74,7 +76,7 @@ umask and default ownership.
 
 See [DSL Syntax Basics → String interpolation](../dsl-syntax.md#string-interpolation) for the full interpolation syntax. The short version:
 
-```
+```limpid
 def output per_source {
     type file
     path "/var/log/limpid/${source.ip}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
@@ -90,7 +92,7 @@ Any DSL expression over event-intrinsic fields is allowed inside `${...}` — id
 
 For per-tenant or per-content routing — anything that depends on what an earlier process parsed out — split into multiple outputs from the pipeline:
 
-```
+```limpid
 def output siem_apac { type file path "/var/log/limpid/apac.log" }
 def output siem_emea { type file path "/var/log/limpid/emea.log" }
 
@@ -126,7 +128,7 @@ Path interpolation goes through three safety passes that together make directory
 
 **Pass 2 — `..` traversal reject on the fully-rendered path.** After all interpolations resolve and the literal+interpolation parts are joined into a single path string, the result is split on `/` and any exact `..` component fails the write with a loud error. Silently rewriting `..` would quietly redirect writes to a different file, so per Principle 1 (zero hidden behaviour) it is refused rather than stripped. Since Pass 1 already normalises slashes inside each interpolation, no single value can introduce a `..` segment of its own; this pass is the cross-literal catch:
 
-```
+```limpid
 path "/var/log/../x.log"   // → Pass 2 rejects: `..` traversal component
 ```
 
@@ -141,5 +143,5 @@ Parent directories are created automatically for dynamic paths (templates with `
 ## Notes
 
 - Each line is the event's `egress` bytes verbatim followed by a `\n`. The writer is byte-preserving: non-UTF-8 payloads (rare vendor formats, base64-decoded blobs) are written unchanged rather than lossily normalised to U+FFFD.
-- For log rotation, the output uses a fresh `open(2)` per write (`create_new` + `fstat` verify on the existing branch), so no `SIGHUP` reload is needed — logrotate's default rename-and-recreate flow works because the next event opens the new inode. `copytruncate` also works. If logrotate's `create` mode is set, its mode / owner / group must match the output's configured `mode` / `owner` / `group`; otherwise the next write is refused with a mismatch diagnostic (see the [Permissions contract](#properties) above). See also the DLQ [error-log rotation guidance](../operations/error-log.md#recommended-logrotate-configuration) for the same shape.
+- For log rotation, the output uses a fresh `open(2)` per write (`create_new` + `fstat` verify on the existing branch), so no `SIGHUP` reload is needed — logrotate's default rename-and-recreate flow works because the next event opens the new inode. `copytruncate` also works. If logrotate's `create` mode is set, its mode / owner / group must match the output's configured `mode` / `owner` / `group`; otherwise the next write is refused with a mismatch diagnostic (see the [Permissions contract](#permissions-contract) above). See also the DLQ [error-log rotation guidance](../operations/error-log.md#recommended-logrotate-configuration) for the same shape.
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).

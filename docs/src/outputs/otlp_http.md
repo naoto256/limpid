@@ -8,7 +8,7 @@ Each Event's `egress` is expected to be the singleton ResourceLogs protobuf byte
 
 ## Configuration
 
-```
+```limpid
 def output otlp_out {
     type otlp_http
     peers {
@@ -36,7 +36,7 @@ def output otlp_out {
 
 A single-peer setup can use the `peer { ... }` shorthand (same shape `output syslog_tcp` accepts):
 
-```
+```limpid
 def output otlp_out {
     type otlp_http
     peer {
@@ -79,7 +79,7 @@ Every HTTP export is bounded by a 30s timeout (connect, TLS handshake, request s
 
 The output expects `egress` to already be valid singleton ResourceLogs proto bytes. It does **not** re-encode — that's the process layer's job. Typical wiring:
 
-```
+```limpid
 def pipeline syslog_to_otlp {
     input syslog_udp
     process parse_fortigate_syslog
@@ -99,7 +99,7 @@ facts. Missing event time remains absent, while observed time defaults to
 When a deployment intentionally wraps composed OCSF JSON as the OTLP Body,
 make that target-specific adjustment **after** the source adapter:
 
-```
+```limpid
 process parse_fortigate_syslog
       | fortigate_syslog_to_otlp
       | compose_ocsf
@@ -118,7 +118,7 @@ If `egress` is not a valid ResourceLogs proto, flush errors with `pipeline egres
 
 For OTLP-in / OTLP-out topologies, no process is required — the input writes a valid singleton ResourceLogs to `egress`, and the output ships it as-is:
 
-```
+```limpid
 def pipeline otlp_relay {
     input otlp_in        // type otlp_http or otlp_grpc
     output otlp_out

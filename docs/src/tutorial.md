@@ -128,7 +128,7 @@ Now start with the counters:
 ```bash
 $ sudo limpidctl stats
 Pipelines:
-  main                         15234 received     14102 finished      1132 dropped         0 discarded         0 errored
+  main                         15234 received     14102 finished      1132 dropped         0 discarded
 Inputs:
   fw_tcp                       15234 received         0 invalid         0 injected
 Outputs:
