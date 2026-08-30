@@ -30,6 +30,9 @@ const STDOUT_OUTPUT_SCHEMA: &[PropertySpec] = &[
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
+#[cfg(target_os = "macos")]
+const DARWIN_PIPE_EAGAIN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Process-wide stdout readiness registration and serialization. Every stdout
 /// output shares this one Unix transport so frames from distinct output actors
 /// cannot interleave. It is deliberately module-local: this is not a generic
@@ -100,6 +103,10 @@ struct WriteObserver {
     waiting_count: std::sync::atomic::AtomicUsize,
     waiting: tokio::sync::Notify,
     progressed: tokio::sync::Notify,
+    #[cfg(target_os = "macos")]
+    backoff_count: std::sync::atomic::AtomicUsize,
+    #[cfg(target_os = "macos")]
+    backing_off: tokio::sync::Notify,
 }
 
 impl StdoutTransport {
@@ -326,7 +333,44 @@ impl StdoutTransport {
                         written: offset,
                     });
                 }
-                Err(_would_block) => {}
+                Err(_would_block) => {
+                    // Darwin kqueue can repeatedly report EVFILT_WRITE while
+                    // a nonblocking pipe still rejects this atomic frame with
+                    // EAGAIN. Clearing AsyncFd readiness alone then spins
+                    // without reader progress. Ten milliseconds caps that
+                    // false-ready loop at 100 attempts/s while adding at most
+                    // 10 ms before noticing newly drained capacity. Linux's
+                    // epoll path and successful/partial writes remain
+                    // unchanged.
+                    #[cfg(target_os = "macos")]
+                    {
+                        #[cfg(test)]
+                        if let Some(observer) = &self.observer {
+                            observer
+                                .backoff_count
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            observer.backing_off.notify_waiters();
+                        }
+                        if drain {
+                            tokio::time::sleep(DARWIN_PIPE_EAGAIN_BACKOFF).await;
+                        } else {
+                            tokio::select! {
+                                _ = tokio::time::sleep(DARWIN_PIPE_EAGAIN_BACKOFF) => {}
+                                terminal = shutdown_change_is_terminal(shutdown) => {
+                                    let message = if terminal {
+                                        "stdout shutdown requested"
+                                    } else {
+                                        "stdout shutdown signal changed"
+                                    };
+                                    return Err(StdoutWriteError {
+                                        source: io::Error::new(io::ErrorKind::Interrupted, message),
+                                        written: offset,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -935,6 +979,15 @@ mod metrics_registration_tests {
             task_output.consume(&event, ack).await
         }));
 
+        #[cfg(target_os = "macos")]
+        while observer
+            .backoff_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            observer.backing_off.notified().await;
+        }
+        #[cfg(not(target_os = "macos"))]
         while observer
             .waiting_count
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -945,6 +998,17 @@ mod metrics_registration_tests {
         let readiness_waits = observer
             .waiting_count
             .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(target_os = "macos")]
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(2),
+                observer.waiting.notified()
+            )
+            .await
+            .is_err(),
+            "a full pipe must not immediately re-enter writable readiness"
+        );
+        #[cfg(not(target_os = "macos"))]
         for _ in 0..32 {
             tokio::task::yield_now().await;
         }
@@ -966,6 +1030,7 @@ mod metrics_registration_tests {
             ack_rx.recv().await,
             Some((_, crate::queue::AckDisposition::Recovered))
         ));
+        assert_eq!(ack_rx.recv().await, None, "ack must resolve exactly once");
         assert_eq!(
             output
                 .metrics
@@ -974,6 +1039,92 @@ mod metrics_registration_tests {
             0
         );
         drop(read_fd);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn draining_full_pipe_resumes_frame_and_delivers_ack_exactly_once() {
+        let (read_fd, write_fd) = unix_pipe();
+        let capacity = fill_pipe(write_fd.as_raw_fd());
+        assert!(capacity > 0);
+        let observer = Arc::new(WriteObserver::default());
+        let transport = StdoutTransport::from_owned(write_fd, Some(Arc::clone(&observer))).unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let output = test_output("stdout-full-pipe-drain", shutdown_rx, one_attempt_retry());
+        let event = Event::new(
+            bytes::Bytes::from_static(b"resumed"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, mut ack_rx) = QueueAckHandle::for_test();
+        let task_output = Arc::clone(&output);
+        let task = tokio::spawn(TEST_STDOUT_TRANSPORT.scope(transport, async move {
+            task_output.consume(&event, ack).await
+        }));
+
+        while observer
+            .backoff_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            observer.backing_off.notified().await;
+        }
+
+        let read_fd = async_owned_fd(read_fd);
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_exact_fd(&read_fd, capacity + b"resumed\n".len()),
+        )
+        .await
+        .expect("reader progress must make the pending frame writable");
+        assert!(observed[..capacity].iter().all(|byte| *byte == b'x'));
+        assert_eq!(&observed[capacity..], b"resumed\n");
+        task.await.unwrap().unwrap();
+        assert!(matches!(
+            ack_rx.recv().await,
+            Some((_, crate::queue::AckDisposition::Delivered))
+        ));
+        assert_eq!(ack_rx.recv().await, None, "ack must resolve exactly once");
+        assert_eq!(
+            output
+                .metrics
+                .events_written
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn writable_pipe_success_never_enters_eagain_backoff() {
+        let (read_fd, write_fd) = unix_pipe();
+        let observer = Arc::new(WriteObserver::default());
+        let transport = StdoutTransport::from_owned(write_fd, Some(Arc::clone(&observer))).unwrap();
+        let read_fd = async_owned_fd(read_fd);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let output = test_output("stdout-writable", shutdown_rx, one_attempt_retry());
+        let event = Event::new(
+            bytes::Bytes::from_static(b"ready"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, mut ack_rx) = QueueAckHandle::for_test();
+
+        TEST_STDOUT_TRANSPORT
+            .scope(transport, output.consume(&event, ack))
+            .await
+            .unwrap();
+        assert_eq!(read_exact_fd(&read_fd, b"ready\n".len()).await, b"ready\n");
+        assert!(matches!(
+            ack_rx.recv().await,
+            Some((_, crate::queue::AckDisposition::Delivered))
+        ));
+        assert_eq!(ack_rx.recv().await, None, "ack must resolve exactly once");
+        assert_eq!(
+            observer
+                .backoff_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a successful write must not pay the Darwin EAGAIN backoff"
+        );
     }
 
     #[tokio::test]
