@@ -603,7 +603,27 @@ pub(super) fn analyze_process_stmt(
 mod tests {
     use super::*;
     use crate::dsl::parser::parse_config;
+    use crate::functions::table::TableStore;
     use crate::pipeline::CompiledConfig;
+
+    fn registry() -> FunctionRegistry {
+        let mut registry = FunctionRegistry::new();
+        let table_store = TableStore::from_configs(vec![]).unwrap();
+        crate::functions::register_builtins(&mut registry, table_store);
+        registry
+    }
+
+    fn csv_call(field_names: Expr) -> Expr {
+        Expr::spanless(ExprKind::FuncCall {
+            namespace: None,
+            name: "csv_parse".to_string(),
+            args: vec![
+                Expr::spanless(ExprKind::Ident(vec!["ingress".to_string()])),
+                field_names,
+            ],
+            block_arg: None,
+        })
+    }
 
     fn analyze_str(src: &str) -> Vec<Diagnostic> {
         let cfg = parse_config(src).expect("config should parse");
@@ -622,6 +642,52 @@ mod tests {
     }
 
     // ----- workspace produce / consume -----------------------------------
+
+    #[test]
+    fn bare_csv_parse_routes_literal_fields_through_process_analysis() {
+        let registry = registry();
+        let fields = Expr::spanless(ExprKind::ArrayLit(vec![
+            Expr::spanless(ExprKind::StringLit("host".to_string())),
+            Expr::spanless(ExprKind::StringLit("status".to_string())),
+        ]));
+        let stmt = ProcessStatement::ExprStmt(csv_call(fields));
+        let mut bindings = Bindings::new();
+        let mut diags = Vec::new();
+
+        analyze_process_stmt(&stmt, "p", &registry, &mut bindings, &mut diags);
+
+        let nullable_string = FieldType::union(FieldType::String, FieldType::Null);
+        for key in ["host", "status"] {
+            let path = vec!["workspace".to_string(), key.to_string()];
+            assert_eq!(bindings.get_workspace(&path), Some(&nullable_string));
+        }
+        assert!(errors(&diags).is_empty(), "got: {diags:?}");
+    }
+
+    #[test]
+    fn csv_parse_expression_result_does_not_merge_into_workspace() {
+        let registry = registry();
+        let fields = Expr::spanless(ExprKind::ArrayLit(vec![Expr::spanless(
+            ExprKind::StringLit("host".to_string()),
+        )]));
+        let stmt = ProcessStatement::Assign(
+            AssignTarget::Workspace(vec!["parsed".to_string()]),
+            csv_call(fields),
+        );
+        let mut bindings = Bindings::new();
+        let mut diags = Vec::new();
+
+        analyze_process_stmt(&stmt, "p", &registry, &mut bindings, &mut diags);
+
+        let parsed = vec!["workspace".to_string(), "parsed".to_string()];
+        let host = vec!["workspace".to_string(), "host".to_string()];
+        assert_eq!(
+            bindings.get_workspace(&parsed),
+            Some(&FieldType::union(FieldType::Object, FieldType::Null))
+        );
+        assert_eq!(bindings.get_workspace(&host), None);
+        assert!(errors(&diags).is_empty(), "got: {diags:?}");
+    }
 
     #[test]
     fn output_referencing_unproduced_workspace_key_errors() {
