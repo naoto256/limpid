@@ -6,7 +6,7 @@ when a pipeline performs its own decoding.
 
 ## Configuration
 
-```
+```limpid
 def input packets {
     type raw_udp
     bind "0.0.0.0:5514"
