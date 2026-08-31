@@ -19,7 +19,7 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,8 @@ const NEWLINE: u8 = b'\n';
 #[cfg(test)]
 std::thread_local! {
     static CORRUPT_WARNING_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INCOMPLETE_TAIL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static READ_LINE_OFFSETS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn warn_corrupt_line(segment: u64, offset: u64) {
@@ -399,39 +401,44 @@ impl DiskQueueReceiver {
                 return None;
             }
 
-            let mut file = match fs::File::open(&seg_path) {
-                Ok(f) => f,
+            let mut line = match read_line_at(&seg_path, self.read_offset) {
+                Ok(line) => line,
                 Err(_) => return None,
             };
 
-            // Seek to byte offset instead of scanning lines
-            use std::io::Seek;
-            if self.read_offset > 0
-                && file
-                    .seek(std::io::SeekFrom::Start(self.read_offset))
-                    .is_err()
-            {
-                return None;
+            if !line.is_empty() && line.last() != Some(&NEWLINE) {
+                // `read_until` may expose the active writer's bytes at
+                // EOF before its single write_all(data + newline) has
+                // completed. Synchronize with the writer mutex, then
+                // reread from the same offset once. If the segment is
+                // still active, retaining the offset and returning to
+                // `recv` lets the existing Notify path sleep until the
+                // completed append wakes it; finalized tails remain
+                // corrupt and must not wait forever.
+                let active_segment = {
+                    let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.write_seq == self.read_seq
+                        && state.write_file.is_some()
+                        && !self.closed.load(Ordering::Acquire)
+                };
+                line = match read_line_at(&seg_path, self.read_offset) {
+                    Ok(line) => line,
+                    Err(_) => return None,
+                };
+                if !line.is_empty() && line.last() != Some(&NEWLINE) && active_segment {
+                    #[cfg(test)]
+                    INCOMPLETE_TAIL_COUNT.set(INCOMPLETE_TAIL_COUNT.get() + 1);
+                    return None;
+                }
             }
 
-            let mut reader = BufReader::new(file);
-            let mut line = String::new();
-
-            loop {
-                line.clear();
-                let bytes_read = match reader.read_line(&mut line) {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                if bytes_read == 0 {
-                    break; // EOF
-                }
-
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    self.read_offset += bytes_read as u64;
-                    continue;
-                }
+            if line.is_empty() {
+                // EOF: either the current active segment has no new
+                // record yet, or this finalized segment is exhausted.
+            } else {
+                let bytes_read = line.len();
+                let complete = line.last() == Some(&NEWLINE);
+                let empty = line.iter().all(u8::is_ascii_whitespace);
 
                 // Capture the position of THIS event (= the position
                 // BEFORE we advance past it) so the ack handle can be
@@ -455,35 +462,40 @@ impl DiskQueueReceiver {
                 // ack, restart re-reads from `acked_offset` and
                 // replays this event.
 
-                let queued = serde_json::from_str::<serde_json::Value>(trimmed)
-                    .ok()
-                    .and_then(|mut value| {
-                        let emitted_nanos =
-                            value.as_object_mut()?.remove("emitted_ns")?.as_i64()?;
-                        let event = Event::from_json_value(value)?;
-                        Some(QueuedEvent::new(
+                if complete && !empty {
+                    let queued = serde_json::from_slice::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|mut value| {
+                            let emitted_nanos =
+                                value.as_object_mut()?.remove("emitted_ns")?.as_i64()?;
+                            let event = Event::from_json_value(value)?;
+                            Some(QueuedEvent::new(
+                                event,
+                                crate::time::UnixNanos::new(emitted_nanos),
+                            ))
+                        });
+                    if let Some(event) = queued {
+                        self.in_flight_positions.push_back(InFlight {
+                            start_seq,
+                            start_offset,
+                            end_seq,
+                            end_offset,
+                            acked: false,
+                        });
+                        return Some((
                             event,
-                            crate::time::UnixNanos::new(emitted_nanos),
-                        ))
-                    });
-                if let Some(event) = queued {
-                    self.in_flight_positions.push_back(InFlight {
-                        start_seq,
-                        start_offset,
-                        end_seq,
-                        end_offset,
-                        acked: false,
-                    });
-                    return Some((
-                        event,
-                        AckPosition::Disk {
-                            seq: start_seq,
-                            offset: start_offset,
-                        },
-                    ));
+                            AckPosition::Disk {
+                                seq: start_seq,
+                                offset: start_offset,
+                            },
+                        ));
+                    }
                 }
 
-                warn_corrupt_line(self.read_seq, self.read_offset);
+                if !empty {
+                    warn_corrupt_line(self.read_seq, start_offset);
+                }
+                continue;
             }
 
             // Finished this segment — try next
@@ -545,7 +557,60 @@ fn cursor_path(dir: &Path) -> PathBuf {
     dir.join("cursor")
 }
 
+fn read_line_at(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    READ_LINE_OFFSETS.with(|offsets| offsets.borrow_mut().push(offset));
+    let mut file = fs::File::open(path)?;
+    if offset > 0 {
+        file.seek(std::io::SeekFrom::Start(offset))?;
+    }
+    let mut line = Vec::new();
+    BufReader::new(file).read_until(NEWLINE, &mut line)?;
+    Ok(line)
+}
+
 fn write_to_segment(state: &mut DiskQueueState, data: &[u8]) -> bool {
+    // A recovered highest segment is finalized until this process
+    // opens it. Never append a new JSON record to an unterminated
+    // tail: that would turn the corrupt tail and the new event into
+    // one permanently invalid line. Preserve the old segment for the
+    // reader's corrupt-record contract and start a fresh segment.
+    if state.write_file.is_none() {
+        let path = segment_path(&state.dir, state.write_seq);
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > 0 => {
+                let mut file = match fs::File::open(&path) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        error!("disk queue: failed to inspect segment tail: {}", e);
+                        return false;
+                    }
+                };
+                if file.seek(std::io::SeekFrom::End(-1)).is_err() {
+                    error!("disk queue: failed to seek to segment tail");
+                    return false;
+                }
+                let mut tail = [0u8; 1];
+                if let Err(e) = file.read_exact(&mut tail) {
+                    error!("disk queue: failed to read segment tail: {}", e);
+                    return false;
+                }
+                if tail[0] == NEWLINE {
+                    state.write_size = metadata.len();
+                } else {
+                    state.write_seq += 1;
+                    state.write_size = 0;
+                }
+            }
+            Ok(_) => state.write_size = 0,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => state.write_size = 0,
+            Err(e) => {
+                error!("disk queue: failed to inspect segment: {}", e);
+                return false;
+            }
+        }
+    }
+
     // Rotate segment if needed
     if state.write_size + data.len() as u64 + 1 > SEGMENT_MAX_BYTES {
         state.write_file = None;
@@ -575,10 +640,12 @@ fn write_to_segment(state: &mut DiskQueueState, data: &[u8]) -> bool {
     buf.push(NEWLINE);
     if let Err(e) = file.write_all(&buf) {
         error!("disk queue: write failed: {}", e);
+        state.write_file = None;
         return false;
     }
     if let Err(e) = file.flush() {
         error!("disk queue: flush failed: {}", e);
+        state.write_file = None;
         return false;
     }
     state.write_size += buf.len() as u64;
@@ -700,6 +767,42 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
+    fn wal_record(msg: &str) -> Vec<u8> {
+        let (event, emitted_ns) = make_event(msg).into_parts();
+        let mut value = event.to_json_value();
+        value
+            .as_object_mut()
+            .expect("event JSON is an object")
+            .insert(
+                "emitted_ns".to_owned(),
+                serde_json::Value::Number(emitted_ns.get().into()),
+            );
+        serde_json::to_vec(&value).expect("event must serialize")
+    }
+
+    fn install_active_partial(receiver: &DiskQueueReceiver, bytes: &[u8]) {
+        let mut state = receiver.state.lock().unwrap();
+        let path = segment_path(&state.dir, state.write_seq);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        state.write_size = fs::metadata(path).unwrap().len();
+        state.write_file = Some(file);
+    }
+
+    fn finish_active_record(receiver: &DiskQueueReceiver, bytes: &[u8]) {
+        let mut state = receiver.state.lock().unwrap();
+        let file = state.write_file.as_mut().expect("active writer file");
+        file.write_all(bytes).unwrap();
+        file.write_all(&[NEWLINE]).unwrap();
+        file.flush().unwrap();
+        state.write_size += bytes.len() as u64 + 1;
+    }
+
     fn make_event(msg: &str) -> QueuedEvent {
         QueuedEvent::new(
             Event::new(Bytes::from(msg.to_string()), "127.0.0.1:0".parse().unwrap()),
@@ -779,6 +882,240 @@ mod tests {
         let (e2, _p2) = rx.recv().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&e2.ingress), "<134>msg2");
         assert_eq!(e2.key(), second_key);
+    }
+
+    #[test]
+    fn active_unterminated_tail_waits_without_advancing_then_delivers_once() {
+        let cases = [
+            ("partial-json", 512usize, None),
+            ("newline-split", 512usize, Some(usize::MAX)),
+            ("page-boundary", 8 * 1024usize, Some(4096)),
+        ];
+
+        for (label, payload_len, forced_split) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (_sender, mut receiver) =
+                create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+            let payload = format!("{label}:{}", "x".repeat(payload_len));
+            let record = wal_record(&payload);
+            let split = match forced_split {
+                Some(usize::MAX) => record.len(),
+                Some(split) => split,
+                None => record.len() / 2,
+            };
+            assert!(
+                split <= record.len(),
+                "{label} fixture must cover the split"
+            );
+
+            install_active_partial(&receiver, &record[..split]);
+            READ_LINE_OFFSETS.with(|offsets| offsets.borrow_mut().clear());
+            let warnings_before = CORRUPT_WARNING_COUNT.get();
+            assert!(
+                receiver.try_recv().is_none(),
+                "{label}: active unterminated tail is not a complete record"
+            );
+            assert_eq!(
+                receiver.read_offset, 0,
+                "{label}: incomplete append must not advance the read cursor"
+            );
+            assert_eq!(
+                CORRUPT_WARNING_COUNT.get(),
+                warnings_before,
+                "{label}: incomplete append must not be reported corrupt"
+            );
+            READ_LINE_OFFSETS.with(|offsets| {
+                assert_eq!(
+                    offsets.borrow().as_slice(),
+                    [0, 0],
+                    "{label}: one synchronized reread must use the unchanged offset"
+                );
+            });
+
+            finish_active_record(&receiver, &record[split..]);
+            let (event, position) = receiver
+                .try_recv()
+                .unwrap_or_else(|| panic!("{label}: completed record must become readable"));
+            assert_eq!(event.ingress.as_ref(), payload.as_bytes());
+            assert_eq!(
+                position,
+                AckPosition::Disk { seq: 0, offset: 0 },
+                "{label}: retry must preserve the original record position"
+            );
+            assert_eq!(
+                receiver.read_offset,
+                record.len() as u64 + 1,
+                "{label}: complete record advances exactly once"
+            );
+            assert!(receiver.try_recv().is_none(), "{label}: duplicate read");
+        }
+    }
+
+    #[test]
+    fn finalized_unterminated_tail_and_complete_invalid_line_remain_corrupt() {
+        for (label, bytes) in [
+            ("finalized-tail", br#"{"received_at":1"#.as_slice()),
+            ("complete-invalid", b"not-json\n".as_slice()),
+            ("complete-invalid-utf8", b"\xff\xfe\n".as_slice()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(segment_path(dir.path(), 0), bytes).unwrap();
+            let (_sender, mut receiver) =
+                create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+            assert!(
+                receiver.state.lock().unwrap().write_file.is_none(),
+                "fixture must be finalized, not an active append"
+            );
+            let warnings_before = CORRUPT_WARNING_COUNT.get();
+
+            assert!(receiver.try_recv().is_none(), "{label}: corrupt input");
+            assert_eq!(
+                receiver.read_offset,
+                bytes.len() as u64,
+                "{label}: finalized corruption must be skipped"
+            );
+            assert_eq!(
+                CORRUPT_WARNING_COUNT.get(),
+                warnings_before + 1,
+                "{label}: finalized corruption remains operator-visible"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn active_incomplete_tail_parks_until_notified_then_replays_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sender, mut receiver) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+        let payload = "notify-and-replay";
+        let record = wal_record(payload);
+        let split = record.len() / 2;
+        install_active_partial(&receiver, &record[..split]);
+        let incomplete_before = INCOMPLETE_TAIL_COUNT.get();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err(),
+            "active incomplete tail must park on Notify instead of returning or spinning"
+        );
+        assert_eq!(receiver.read_offset, 0);
+        assert_eq!(
+            INCOMPLETE_TAIL_COUNT.get(),
+            incomplete_before + 1,
+            "one recv attempt performs one synchronized reread before parking"
+        );
+
+        finish_active_record(&receiver, &record[split..]);
+        receiver.notify.notify_one();
+        let (event, position) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("completion notification must wake the receiver")
+                .expect("completed record");
+        assert_eq!(event.ingress.as_ref(), payload.as_bytes());
+        assert_eq!(position, AckPosition::Disk { seq: 0, offset: 0 });
+
+        drop(receiver);
+        drop(sender);
+        let (_sender, mut reopened) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+        let (replayed, replay_position) = reopened.try_recv().expect("unacked record replays");
+        assert_eq!(replayed.ingress.as_ref(), payload.as_bytes());
+        assert_eq!(replay_position, position);
+        reopened.ack_to(0, 0);
+        drop(reopened);
+
+        let (_sender, mut reopened) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+        assert!(
+            reopened.try_recv().is_none(),
+            "acked record must not replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_shutdown_finalizes_incomplete_tail_and_interrupts_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sender, mut receiver) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+        let partial = br#"{"received_at":1"#;
+        install_active_partial(&receiver, partial);
+        let warnings_before = CORRUPT_WARNING_COUNT.get();
+
+        drop(sender);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("last-sender notification must interrupt the wait");
+
+        assert!(result.is_none(), "finalized corrupt tail is not an event");
+        assert_eq!(receiver.read_offset, partial.len() as u64);
+        assert_eq!(CORRUPT_WARNING_COUNT.get(), warnings_before + 1);
+    }
+
+    #[tokio::test]
+    async fn writer_rotates_before_appending_after_finalized_partial_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = br#"{"received_at":1"#;
+        fs::write(segment_path(dir.path(), 0), partial).unwrap();
+        let (sender, mut receiver) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+
+        sender.send(make_event("after-partial")).await.unwrap();
+
+        let (event, position) = receiver
+            .recv()
+            .await
+            .expect("new record in rotated segment");
+        assert_eq!(event.ingress.as_ref(), b"after-partial");
+        assert_eq!(position, AckPosition::Disk { seq: 1, offset: 0 });
+        assert_eq!(
+            fs::read(segment_path(dir.path(), 0)).unwrap(),
+            partial,
+            "finalized corrupt bytes remain isolated and operator-visible"
+        );
+        assert_eq!(
+            fs::read(segment_path(dir.path(), 1)).unwrap().last(),
+            Some(&NEWLINE)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_writer_reader_conserves_65536_records() {
+        const EVENT_COUNT: usize = 65_536;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (sender, mut receiver) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+
+        let write = async move {
+            for sequence in 0..EVENT_COUNT {
+                sender
+                    .send(make_event(&format!("concurrent-{sequence:05}")))
+                    .await
+                    .unwrap();
+            }
+            // Dropping the last sender makes a missing record terminate
+            // deterministically instead of leaving the reader parked.
+            drop(sender);
+        };
+        let read = async move {
+            for expected in 0..EVENT_COUNT {
+                let (event, _) = receiver
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| panic!("queue closed before record {expected}"));
+                assert_eq!(
+                    event.ingress.as_ref(),
+                    format!("concurrent-{expected:05}").as_bytes(),
+                    "record order and identity must be conserved"
+                );
+            }
+            assert!(receiver.recv().await.is_none(), "no duplicate tail record");
+        };
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            tokio::join!(write, read)
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "bounded concurrent conservation run timed out"
+        );
     }
 
     #[tokio::test]
