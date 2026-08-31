@@ -151,7 +151,7 @@ impl ErroredEventContext {
                     event.source,
                     event.ingress.clone(),
                     event.ingress.clone(),
-                    event.ltp_stamps(),
+                    event.ltp_stamps_arc(),
                 );
                 let mut event_json = ev.to_json_value();
                 if let serde_json::Value::Object(ref mut map) = event_json {
@@ -187,7 +187,7 @@ impl ErroredEventContext {
                     event.source,
                     event.ingress.clone(),
                     event.egress.clone(),
-                    event.ltp_stamps(),
+                    event.ltp_stamps_arc(),
                 );
                 let mut event_json = ev.to_json_value();
                 if let serde_json::Value::Object(ref mut map) = event_json {

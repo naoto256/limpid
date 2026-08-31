@@ -189,7 +189,7 @@ pub struct OwnedEvent {
     /// LTP hop history is persisted and forwarded but intentionally absent
     /// from the DSL workspace. Sharing the immutable slice keeps ordinary
     /// event clones cheap.
-    ltp_stamps: Arc<[crate::ltp::HopStamp]>,
+    ltp_stamps: Option<Arc<[crate::ltp::HopStamp]>>,
     /// Optional drop-fired ack used by inputs that persist a cursor
     /// (tail / journal). `None` for inputs that don't have a position to
     /// advance (syslog, OTLP, unix_socket, …) and for events synthesised
@@ -251,7 +251,7 @@ impl OwnedEvent {
             egress: ingress.clone(),
             ingress,
             workspace: HashMap::new(),
-            ltp_stamps: Arc::from([]),
+            ltp_stamps: None,
             ack: None,
         }
     }
@@ -270,7 +270,7 @@ impl OwnedEvent {
             egress: ingress.clone(),
             ingress,
             workspace: HashMap::new(),
-            ltp_stamps: Arc::from([]),
+            ltp_stamps: None,
             ack: Some(ack),
         }
     }
@@ -281,11 +281,16 @@ impl OwnedEvent {
     }
 
     pub(crate) fn ltp_stamps(&self) -> &[crate::ltp::HopStamp] {
-        &self.ltp_stamps
+        self.ltp_stamps.as_deref().unwrap_or(&[])
     }
 
-    pub(crate) fn ltp_stamps_arc(&self) -> Arc<[crate::ltp::HopStamp]> {
-        Arc::clone(&self.ltp_stamps)
+    pub(crate) fn ltp_stamps_arc(&self) -> Option<Arc<[crate::ltp::HopStamp]>> {
+        self.ltp_stamps.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ltp_history_storage(&self) -> bool {
+        self.ltp_stamps.is_some()
     }
 
     pub(crate) fn from_ltp_parts(
@@ -302,7 +307,7 @@ impl OwnedEvent {
             ingress: payload.clone(),
             egress: payload,
             workspace: HashMap::new(),
-            ltp_stamps: Arc::from(stamps),
+            ltp_stamps: (!stamps.is_empty()).then(|| Arc::from(stamps)),
             ack: None,
         }
     }
@@ -313,7 +318,7 @@ impl OwnedEvent {
         source: SocketAddr,
         ingress: Bytes,
         egress: Bytes,
-        stamps: Arc<[crate::ltp::HopStamp]>,
+        stamps: Option<Arc<[crate::ltp::HopStamp]>>,
     ) -> Self {
         Self {
             key,
@@ -322,7 +327,7 @@ impl OwnedEvent {
             ingress,
             egress,
             workspace: HashMap::new(),
-            ltp_stamps: stamps,
+            ltp_stamps: stamps.filter(|stamps| !stamps.is_empty()),
             ack: None,
         }
     }
@@ -345,7 +350,7 @@ impl OwnedEvent {
             source: self.source,
             ingress: self.ingress.clone(),
             egress: self.egress.clone(),
-            ltp_stamps: Arc::clone(&self.ltp_stamps),
+            ltp_stamps: self.ltp_stamps.clone(),
             workspace,
         }
     }
@@ -397,11 +402,11 @@ impl OwnedEvent {
         map.insert("source".into(), JsonValue::Object(source_obj));
         map.insert("ingress".into(), bytes_to_json(&self.ingress));
         map.insert("egress".into(), bytes_to_json(&self.egress));
-        if !self.ltp_stamps.is_empty() {
+        if let Some(stamps) = &self.ltp_stamps {
             map.insert(
                 "ltp_stamps".into(),
                 JsonValue::Array(
-                    self.ltp_stamps
+                    stamps
                         .iter()
                         .map(|stamp| {
                             serde_json::json!({
@@ -483,10 +488,10 @@ impl OwnedEvent {
             .and_then(json_to_bytes)
             .unwrap_or_else(|| ingress.clone());
 
-        let ltp_stamps: Arc<[crate::ltp::HopStamp]> = match v.get("ltp_stamps") {
-            None => Arc::from([]),
-            Some(JsonValue::Array(stamps)) => Arc::from(
-                stamps
+        let ltp_stamps: Option<Arc<[crate::ltp::HopStamp]>> = match v.get("ltp_stamps") {
+            None => None,
+            Some(JsonValue::Array(stamps)) => {
+                let stamps = stamps
                     .iter()
                     .map(|stamp| {
                         Some(crate::ltp::HopStamp {
@@ -495,8 +500,9 @@ impl OwnedEvent {
                             departure_unix_nano: stamp.get("departure_unix_nano")?.as_u64()?,
                         })
                     })
-                    .collect::<Option<Vec<_>>>()?,
-            ),
+                    .collect::<Option<Vec<_>>>()?;
+                (!stamps.is_empty()).then(|| Arc::from(stamps))
+            }
             Some(_) => return None,
         };
 
@@ -563,7 +569,7 @@ pub struct BorrowedEvent<'bump> {
     pub source: SocketAddr,
     pub ingress: Bytes,
     pub egress: Bytes,
-    ltp_stamps: Arc<[crate::ltp::HopStamp]>,
+    ltp_stamps: Option<Arc<[crate::ltp::HopStamp]>>,
     pub workspace: bumpalo::collections::Vec<'bump, (&'bump str, Value<'bump>)>,
 }
 
@@ -571,6 +577,11 @@ impl<'bump> BorrowedEvent<'bump> {
     /// Return this event's immutable identity.
     pub fn key(&self) -> uuid::Uuid {
         self.key
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ltp_history_storage(&self) -> bool {
+        self.ltp_stamps.is_some()
     }
 
     /// Heap-allocate a fresh [`OwnedEvent`] from this borrowed view.
@@ -588,7 +599,7 @@ impl<'bump> BorrowedEvent<'bump> {
             source: self.source,
             ingress: self.ingress.clone(),
             egress: self.egress.clone(),
-            ltp_stamps: Arc::clone(&self.ltp_stamps),
+            ltp_stamps: self.ltp_stamps.clone(),
             workspace,
             // BorrowedEvent does not carry an ack — it's the per-event arena
             // view. Cloning back to owned for DLQ / disk-queue persistence
@@ -631,7 +642,7 @@ impl<'bump> BorrowedEvent<'bump> {
             source: self.source,
             ingress: self.ingress.clone(),
             egress: self.egress.clone(),
-            ltp_stamps: Arc::clone(&self.ltp_stamps),
+            ltp_stamps: self.ltp_stamps.clone(),
             // `HashMap::new()` here does not allocate a backing table
             // — that only happens on the first `insert`. So this is a
             // zero-heap-touch construction; the four Bytes/scalar
@@ -680,7 +691,7 @@ impl<'bump> BorrowedEvent<'bump> {
             source: self.source,
             ingress: self.ingress.clone(),
             egress: self.egress.clone(),
-            ltp_stamps: Arc::clone(&self.ltp_stamps),
+            ltp_stamps: self.ltp_stamps.clone(),
             workspace,
         }
     }
@@ -798,6 +809,45 @@ mod boundary_tests {
     }
 
     #[test]
+    fn ordinary_event_keeps_absent_ltp_history_through_all_snapshot_paths() {
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"ordinary"),
+            "192.0.2.10:5140".parse().unwrap(),
+        );
+        assert!(!event.has_ltp_history_storage());
+        let (ack_tx, _ack_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ack_event = OwnedEvent::with_ack(
+            Bytes::from_static(b"ordinary-with-ack"),
+            "192.0.2.10:5140".parse().unwrap(),
+            Arc::new(AckHandle::new(
+                AckPosition::Offset {
+                    generation: 1,
+                    offset: 1,
+                },
+                ack_tx,
+            )),
+        );
+        assert!(!ack_event.has_ltp_history_storage());
+
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let borrowed = event.view_in(&arena);
+        assert!(!borrowed.has_ltp_history_storage());
+        assert!(!borrowed.snapshot_in(&arena).has_ltp_history_storage());
+        assert!(!borrowed.to_owned().has_ltp_history_storage());
+        assert!(
+            !borrowed
+                .to_owned_without_workspace()
+                .has_ltp_history_storage()
+        );
+
+        let process = crate::pipeline::ProcessEvent::from_owned(&event);
+        let output = crate::pipeline::OutputEvent::from_owned(&event);
+        assert!(!process.has_ltp_history_storage());
+        assert!(!output.has_ltp_history_storage());
+    }
+
+    #[test]
     fn to_json_value_then_from_json_round_trips_event() {
         // This boundary is exercised every time a disk-queue replay /
         // tap snapshot / error-log entry / inject command needs to
@@ -854,6 +904,7 @@ mod boundary_tests {
 
         let persisted = event.to_json_string();
         let recovered = OwnedEvent::from_json(&persisted).unwrap();
+        assert!(recovered.has_ltp_history_storage());
         assert_eq!(recovered.ltp_stamps(), stamps);
 
         let tap = event.to_json_value_without_workspace();
@@ -864,6 +915,10 @@ mod boundary_tests {
         let arena = EventArena::new(&bump);
         let round_trip = event.view_in(&arena).to_owned();
         assert_eq!(round_trip.ltp_stamps(), stamps);
+        assert!(Arc::ptr_eq(
+            event.ltp_stamps_arc().as_ref().unwrap(),
+            round_trip.ltp_stamps_arc().as_ref().unwrap()
+        ));
     }
 
     #[test]
@@ -873,6 +928,14 @@ mod boundary_tests {
         json.as_object_mut().unwrap().remove("ltp_stamps");
         let recovered = OwnedEvent::from_json(&serde_json::to_string(&json).unwrap()).unwrap();
         assert!(recovered.ltp_stamps().is_empty());
+        assert!(!recovered.has_ltp_history_storage());
+
+        json.as_object_mut()
+            .unwrap()
+            .insert("ltp_stamps".into(), JsonValue::Array(Vec::new()));
+        let recovered = OwnedEvent::from_json(&serde_json::to_string(&json).unwrap()).unwrap();
+        assert!(recovered.ltp_stamps().is_empty());
+        assert!(!recovered.has_ltp_history_storage());
     }
 
     #[test]
