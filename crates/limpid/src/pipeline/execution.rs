@@ -105,7 +105,7 @@ pub struct ProcessEvent {
     pub source: std::net::SocketAddr,
     pub received_at: chrono::DateTime<chrono::Utc>,
     pub ingress: bytes::Bytes,
-    ltp_stamps: std::sync::Arc<[crate::ltp::HopStamp]>,
+    ltp_stamps: Option<std::sync::Arc<[crate::ltp::HopStamp]>>,
 }
 
 /// Output-flavor event snapshot for the DLQ.
@@ -121,7 +121,7 @@ pub struct OutputEvent {
     pub received_at: chrono::DateTime<chrono::Utc>,
     pub ingress: bytes::Bytes,
     pub egress: bytes::Bytes,
-    ltp_stamps: std::sync::Arc<[crate::ltp::HopStamp]>,
+    ltp_stamps: Option<std::sync::Arc<[crate::ltp::HopStamp]>>,
 }
 
 impl ProcessEvent {
@@ -141,8 +141,18 @@ impl ProcessEvent {
         self.key
     }
 
-    pub(crate) fn ltp_stamps(&self) -> std::sync::Arc<[crate::ltp::HopStamp]> {
-        std::sync::Arc::clone(&self.ltp_stamps)
+    #[allow(dead_code)] // slice-view contract retained for snapshot consumers
+    pub(crate) fn ltp_stamps(&self) -> &[crate::ltp::HopStamp] {
+        self.ltp_stamps.as_deref().unwrap_or(&[])
+    }
+
+    pub(crate) fn ltp_stamps_arc(&self) -> Option<std::sync::Arc<[crate::ltp::HopStamp]>> {
+        self.ltp_stamps.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ltp_history_storage(&self) -> bool {
+        self.ltp_stamps.is_some()
     }
 }
 
@@ -164,8 +174,18 @@ impl OutputEvent {
         self.key
     }
 
-    pub(crate) fn ltp_stamps(&self) -> std::sync::Arc<[crate::ltp::HopStamp]> {
-        std::sync::Arc::clone(&self.ltp_stamps)
+    #[allow(dead_code)] // slice-view contract retained for snapshot consumers
+    pub(crate) fn ltp_stamps(&self) -> &[crate::ltp::HopStamp] {
+        self.ltp_stamps.as_deref().unwrap_or(&[])
+    }
+
+    pub(crate) fn ltp_stamps_arc(&self) -> Option<std::sync::Arc<[crate::ltp::HopStamp]>> {
+        self.ltp_stamps.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ltp_history_storage(&self) -> bool {
+        self.ltp_stamps.is_some()
     }
 }
 
