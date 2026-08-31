@@ -377,6 +377,8 @@ fn event_meta(
 struct WorkingEventMeta {
     meta: LtpMeta,
     local_stamp: usize,
+    #[cfg(test)]
+    requested_capacity: usize,
 }
 
 #[cfg(test)]
@@ -390,28 +392,32 @@ impl LtpOutput {
             crate::time::UnixNanos::from_datetime(event.received_at).to_wire_u64();
         #[cfg(test)]
         STAMP_CLONE_COUNT.set(STAMP_CLONE_COUNT.get() + 1);
-        let mut stamps = event.ltp_stamps().to_vec();
-        let local_stamp = match stamps.last() {
+        let prefix = event.ltp_stamps();
+        let reuses_pending_local = matches!(
+            prefix.last(),
             Some(stamp)
-                if stamp.node_id == self.node_id.as_ref() && stamp.departure_unix_nano == 0 =>
-            {
-                stamps.len() - 1
-            }
-            _ => {
-                stamps.push(HopStamp {
-                    node_id: self.node_id.to_string(),
-                    arrival_unix_nano,
-                    departure_unix_nano: 0,
-                });
-                stamps.len() - 1
-            }
-        };
+                if stamp.node_id == self.node_id.as_ref() && stamp.departure_unix_nano == 0
+        );
+        let append_count = usize::from(!reuses_pending_local);
+        let requested_capacity = prefix.len() + append_count;
+        let mut stamps = Vec::with_capacity(requested_capacity);
+        stamps.extend_from_slice(prefix);
+        if !reuses_pending_local {
+            stamps.push(HopStamp {
+                node_id: self.node_id.to_string(),
+                arrival_unix_nano,
+                departure_unix_nano: 0,
+            });
+        }
+        let local_stamp = stamps.len() - 1;
         WorkingEventMeta {
             meta: LtpMeta {
                 key: event.key().as_bytes().to_vec(),
                 stamps,
             },
             local_stamp,
+            #[cfg(test)]
+            requested_capacity,
         }
     }
 
@@ -1129,6 +1135,10 @@ mod tests {
         crate::time::UnixNanos::new(200)
     }
 
+    fn now_300() -> crate::time::UnixNanos {
+        crate::time::UnixNanos::new(300)
+    }
+
     fn now_negative() -> crate::time::UnixNanos {
         crate::time::UnixNanos::new(-1)
     }
@@ -1159,6 +1169,7 @@ mod tests {
         );
 
         let mut working = output.working_event_meta(&event);
+        assert_eq!(working.requested_capacity, 1);
         let frame = output.event_frame(&mut working, &event.egress).unwrap();
         let (meta, payload) = crate::ltp::decode_frame(&frame).unwrap();
         assert_eq!(meta.key, event.key().as_bytes());
@@ -1211,6 +1222,54 @@ mod tests {
             assert_ne!(meta.stamps[15].departure_unix_nano, 0);
             assert_eq!(payload, Bytes::from_static(b"payload"));
         }
+    }
+
+    #[test]
+    fn fanout_outputs_build_independent_exact_capacity_metadata_without_mutating_prefix() {
+        let stamps = vec![HopStamp {
+            node_id: "peer".to_owned(),
+            arrival_unix_nano: 1,
+            departure_unix_nano: 2,
+        }];
+        let event = Event::from_ltp_parts(
+            uuid::Uuid::now_v7(),
+            Utc.timestamp_nanos(100),
+            "127.0.0.1:7514".parse().unwrap(),
+            Bytes::from_static(b"payload"),
+            stamps.clone(),
+        );
+        let mut output_a = output_for("127.0.0.1:1");
+        output_a.now = now_200;
+        let mut output_b = output_for("127.0.0.1:2");
+        output_b.node_id = Arc::from("node-b");
+        output_b.now = now_300;
+
+        let mut working_a = output_a.working_event_meta(&event);
+        let mut working_b = output_b.working_event_meta(&event);
+
+        assert_eq!(working_b.meta.stamps[0], stamps[0]);
+        assert_eq!(working_a.requested_capacity, stamps.len() + 1);
+        assert_eq!(working_b.requested_capacity, stamps.len() + 1);
+        let frame_a = output_a.event_frame(&mut working_a, &event.egress).unwrap();
+        let frame_b = output_b.event_frame(&mut working_b, &event.egress).unwrap();
+        let (meta_a, _) = crate::ltp::decode_frame(&frame_a).unwrap();
+        let (meta_b, _) = crate::ltp::decode_frame(&frame_b).unwrap();
+        assert_eq!(meta_a.stamps[1].node_id, "node-a");
+        assert_eq!(meta_a.stamps[1].departure_unix_nano, 200);
+        assert_eq!(meta_b.stamps[1].node_id, "node-b");
+        assert_eq!(meta_b.stamps[1].departure_unix_nano, 300);
+        assert_eq!(event.ltp_stamps(), stamps);
+
+        let source = include_str!("ltp.rs");
+        let body = source
+            .split("fn working_event_meta")
+            .nth(1)
+            .and_then(|tail| tail.split("fn event_frame").next())
+            .expect("working_event_meta source");
+        assert!(!body.contains("ltp_stamps().to_vec()"));
+        assert_eq!(body.matches("Vec::with_capacity").count(), 1);
+        assert!(body.contains("let mut stamps = Vec::with_capacity(requested_capacity);"));
+        assert!(body.contains("extend_from_slice"));
     }
 
     #[test]
