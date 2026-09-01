@@ -969,6 +969,67 @@ pub enum AckDisposition {
     Dropped,
 }
 
+/// Ack-channel payload. Delivered acks carry the already-sampled T2→T3
+/// duration; non-delivery dispositions intentionally carry no observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AckResolution {
+    Delivered {
+        position: AckPosition,
+        elapsed: crate::time::ElapsedNanos,
+    },
+    Recovered {
+        position: AckPosition,
+    },
+    Dropped {
+        position: AckPosition,
+    },
+}
+
+impl AckResolution {
+    fn position(self) -> AckPosition {
+        match self {
+            Self::Delivered { position, .. }
+            | Self::Recovered { position }
+            | Self::Dropped { position } => position,
+        }
+    }
+
+    fn disposition(self) -> AckDisposition {
+        match self {
+            Self::Delivered { .. } => AckDisposition::Delivered,
+            Self::Recovered { .. } => AckDisposition::Recovered,
+            Self::Dropped { .. } => AckDisposition::Dropped,
+        }
+    }
+
+    fn delivery_elapsed(self) -> Option<crate::time::ElapsedNanos> {
+        match self {
+            Self::Delivered { elapsed, .. } => Some(elapsed),
+            Self::Recovered { .. } | Self::Dropped { .. } => None,
+        }
+    }
+}
+
+enum AckSender {
+    Resolution(tokio::sync::mpsc::UnboundedSender<AckResolution>),
+    #[cfg(test)]
+    LegacyTest(tokio::sync::mpsc::UnboundedSender<(AckPosition, AckDisposition)>),
+}
+
+impl AckSender {
+    fn send(self, resolution: AckResolution) {
+        match self {
+            Self::Resolution(tx) => {
+                let _ = tx.send(resolution);
+            }
+            #[cfg(test)]
+            Self::LegacyTest(tx) => {
+                let _ = tx.send((resolution.position(), resolution.disposition()));
+            }
+        }
+    }
+}
+
 /// Handle handed to an [`crate::modules::Output`] alongside each event.
 /// The output is responsible for calling `resolve_delivered` or
 /// `resolve_recovered` once the event's final disposition is decided —
@@ -977,7 +1038,7 @@ pub enum AckDisposition {
 /// to [`AckDisposition::Dropped`] for the unhealthy paths, and
 /// `debug_assert!`s the contract was met.
 pub struct QueueAckHandle {
-    tx: Option<tokio::sync::mpsc::UnboundedSender<(AckPosition, AckDisposition)>>,
+    tx: Option<AckSender>,
     /// Position the handle's event occupied in the source queue,
     /// captured at `recv()` time. Pre-fix the disk receiver advanced
     /// its cursor to `self.read_*` at ack time, which under batched
@@ -992,27 +1053,35 @@ pub struct QueueAckHandle {
     /// "dropped without resolve" (fire the assert + send `Dropped`).
     resolved: bool,
     emitted_ns: crate::time::UnixNanos,
-    metrics: Arc<crate::metrics::OutputMetrics>,
 }
 
 #[cfg(test)]
 tokio::task_local! {
     static TEST_IMPLICIT_DROP_COUNT: Arc<std::sync::atomic::AtomicUsize>;
+    static TEST_CRASH_AFTER_DELIVERY_MERGE: bool;
+}
+
+#[cfg(test)]
+fn test_crash_after_delivery_merge() {
+    if TEST_CRASH_AFTER_DELIVERY_MERGE
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false)
+    {
+        panic!("test crash after delivery metrics merge and before cursor advancement");
+    }
 }
 
 impl QueueAckHandle {
-    pub fn new(
-        tx: tokio::sync::mpsc::UnboundedSender<(AckPosition, AckDisposition)>,
+    pub(crate) fn new(
+        tx: tokio::sync::mpsc::UnboundedSender<AckResolution>,
         position: AckPosition,
         emitted_ns: crate::time::UnixNanos,
-        metrics: Arc<crate::metrics::OutputMetrics>,
     ) -> Self {
         Self {
-            tx: Some(tx),
+            tx: Some(AckSender::Resolution(tx)),
             position,
             resolved: false,
             emitted_ns,
-            metrics,
         }
     }
 
@@ -1036,10 +1105,13 @@ impl QueueAckHandle {
 
     /// Signal delivery using a caller-sampled wall-clock boundary.
     pub(crate) fn resolve_delivered_at(mut self, delivered_at: crate::time::UnixNanos) {
-        self.metrics.observe_delivery(self.emitted_ns, delivered_at);
+        let elapsed = delivered_at.elapsed_since(self.emitted_ns);
         self.resolved = true;
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send((self.position, AckDisposition::Delivered));
+            tx.send(AckResolution::Delivered {
+                position: self.position,
+                elapsed,
+            });
         }
     }
 
@@ -1048,7 +1120,9 @@ impl QueueAckHandle {
     pub fn resolve_recovered(mut self) {
         self.resolved = true;
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send((self.position, AckDisposition::Recovered));
+            tx.send(AckResolution::Recovered {
+                position: self.position,
+            });
         }
     }
 
@@ -1078,7 +1152,9 @@ impl QueueAckHandle {
     pub fn resolve_dropped(mut self) {
         self.resolved = true;
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send((self.position, AckDisposition::Dropped));
+            tx.send(AckResolution::Dropped {
+                position: self.position,
+            });
         }
     }
 
@@ -1098,12 +1174,12 @@ impl QueueAckHandle {
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
-            Self::new(
-                tx,
-                AckPosition::Memory,
-                crate::time::UnixNanos::now(),
-                crate::metrics::OutputMetrics::for_testing(),
-            ),
+            Self {
+                tx: Some(AckSender::LegacyTest(tx)),
+                position: AckPosition::Memory,
+                resolved: false,
+                emitted_ns: crate::time::UnixNanos::now(),
+            },
             rx,
         )
     }
@@ -1118,12 +1194,12 @@ impl QueueAckHandle {
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
-            Self::new(
-                tx,
+            Self {
+                tx: Some(AckSender::LegacyTest(tx)),
                 position,
-                crate::time::UnixNanos::now(),
-                crate::metrics::OutputMetrics::for_testing(),
-            ),
+                resolved: false,
+                emitted_ns: crate::time::UnixNanos::now(),
+            },
             rx,
         )
     }
@@ -1141,7 +1217,9 @@ impl Drop for QueueAckHandle {
             let _ = TEST_IMPLICIT_DROP_COUNT.try_with(|count| {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             });
-            let _ = tx.send((self.position, AckDisposition::Dropped));
+            tx.send(AckResolution::Dropped {
+                position: self.position,
+            });
         }
     }
 }
@@ -1164,6 +1242,20 @@ pub(crate) async fn with_test_implicit_drop_count<T>(
 /// 1/k curve, so raising this further has diminishing returns while
 /// the blackout grows linearly; 64 sits past the knee of the curve.
 const RECV_BATCH_MAX: usize = 64;
+/// Maximum number of resolved output acknowledgements merged per consumer
+/// wake. This bounds disposition blackout while amortizing delivery-metric
+/// atomics across the burst.
+const ACK_RECV_BATCH_MAX: usize = 64;
+
+fn merge_delivery_metrics(resolutions: &[AckResolution], metrics: &crate::metrics::OutputMetrics) {
+    let mut delta = crate::metrics::DeliveryDelta::default();
+    for resolution in resolutions {
+        if let Some(elapsed) = resolution.delivery_elapsed() {
+            delta.record(elapsed);
+        }
+    }
+    metrics.merge_delivery_delta(&delta);
+}
 
 /// Run a queue consumer that drains events and writes them to an output.
 ///
@@ -1192,8 +1284,7 @@ pub async fn run_queue_consumer(
 ) {
     let name = Arc::clone(&receiver.name);
     info!("output '{}': queue consumer started", name);
-    let (ack_tx, mut ack_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(AckPosition, AckDisposition)>();
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckResolution>();
     let mut in_flight: usize = 0;
     let mut accepting = true;
     // `wedged` distinguishes fail-stop wedge from natural queue
@@ -1213,9 +1304,13 @@ pub async fn run_queue_consumer(
     // follows the first push is synchronous, the only state that can
     // survive across select re-entries is an empty buffer.
     let mut batch: Vec<(QueuedEvent, AckPosition)> = Vec::with_capacity(RECV_BATCH_MAX);
+    // Reused across both the steady-state ack arm and the post-writer drain.
+    // `recv_many` is cancel-safe while this vector is empty; after it returns,
+    // both metrics and FIFO disposition passes are synchronous (no await).
+    let mut ack_batch: Vec<AckResolution> = Vec::with_capacity(ACK_RECV_BATCH_MAX);
     metrics.queue_depth.set(receiver.depth());
 
-    loop {
+    'consumer: loop {
         tokio::select! {
             biased;
 
@@ -1272,7 +1367,6 @@ pub async fn run_queue_consumer(
                                     ack_tx.clone(),
                                     position,
                                     event.emitted_ns(),
-                                    Arc::clone(&metrics),
                                 );
                                 in_flight += 1;
                                 // `consume_shutdown` (not `consume`) — the
@@ -1310,61 +1404,75 @@ pub async fn run_queue_consumer(
                 }
             }
 
-            Some((position, disposition)) = ack_rx.recv() => {
-                handle_ack_disposition(disposition, &name, &metrics);
-                // Dropped disposition on a *disk* queue is the
-                // fail-stop wedge. `receiver.ack_to` would advance
-                // the cursor past a position we cannot honestly
-                // confirm — silently losing the event on a
-                // durable queue. On the first Dropped-on-disk we
-                // record the wedge transition (helper: log +
-                // `events_wedged++`, guarded so subsequent Dropped
-                // dispositions after the wedge do not re-emit),
-                // stop accepting new events (further `consume`
-                // calls on a bug-path output would just
-                // accumulate more doomed handles behind the
-                // wedged front), and skip `ack_to` so the
-                // disk-side in-flight bookkeeping keeps the
-                // wedged position at the front, blocking the
-                // cursor from advancing past it until replay.
-                // Subsequent Dropped dispositions after the wedge
-                // are drained through the normal `ack_to` path
-                // for their positions — the wedged front already
-                // holds the cursor.
-                // Operator intervention (fix the bug / restart
-                // the daemon so the disk queue replays from the
-                // wedge point) is the recovery contract. Memory
-                // queues cannot replay on restart, so wedging
-                // would only cause loss without a recovery path
-                // — they keep the continue-and-count behavior.
-                let was_wedged = wedged;
-                record_wedge_transition_if_first(
-                    position,
-                    disposition,
-                    &mut wedged,
-                    &name,
-                    &metrics,
-                );
-                if !was_wedged && wedged {
-                    accepting = false;
-                    // Skip ack_to on this position — the wedge
-                    // was just recorded and its position must
-                    // stay at the in-flight front.
-                } else {
-                    receiver.ack_to(position);
-                    metrics.queue_depth.set(receiver.depth());
-                }
-                in_flight = in_flight.saturating_sub(1);
-                // Natural queue-closure or wedge exit: the
-                // consumer stopped accepting (queue drained or
-                // fail-stop wedged) and the last in-flight
-                // handle just resolved. Shutdown does NOT exit
-                // here — it breaks straight out of the select
-                // arm above so the post-loop `writer.shutdown()`
-                // can drain batched buffers (which is the only
-                // thing that can resolve their parked handles).
-                if !accepting && in_flight == 0 {
+            n = ack_rx.recv_many(&mut ack_batch, ACK_RECV_BATCH_MAX) => {
+                if n == 0 {
+                    tracing::error!(
+                        "output '{}': ack channel closed while consumer was active",
+                        name
+                    );
                     break;
+                }
+                merge_delivery_metrics(&ack_batch, &metrics);
+                #[cfg(test)]
+                test_crash_after_delivery_merge();
+                for resolution in ack_batch.drain(..) {
+                    let position = resolution.position();
+                    let disposition = resolution.disposition();
+                    handle_ack_disposition(disposition, &name, &metrics);
+                    // Dropped disposition on a *disk* queue is the
+                    // fail-stop wedge. `receiver.ack_to` would advance
+                    // the cursor past a position we cannot honestly
+                    // confirm — silently losing the event on a
+                    // durable queue. On the first Dropped-on-disk we
+                    // record the wedge transition (helper: log +
+                    // `events_wedged++`, guarded so subsequent Dropped
+                    // dispositions after the wedge do not re-emit),
+                    // stop accepting new events (further `consume`
+                    // calls on a bug-path output would just
+                    // accumulate more doomed handles behind the
+                    // wedged front), and skip `ack_to` so the
+                    // disk-side in-flight bookkeeping keeps the
+                    // wedged position at the front, blocking the
+                    // cursor from advancing past it until replay.
+                    // Subsequent Dropped dispositions after the wedge
+                    // are drained through the normal `ack_to` path
+                    // for their positions — the wedged front already
+                    // holds the cursor.
+                    // Operator intervention (fix the bug / restart
+                    // the daemon so the disk queue replays from the
+                    // wedge point) is the recovery contract. Memory
+                    // queues cannot replay on restart, so wedging
+                    // would only cause loss without a recovery path
+                    // — they keep the continue-and-count behavior.
+                    let was_wedged = wedged;
+                    record_wedge_transition_if_first(
+                        position,
+                        disposition,
+                        &mut wedged,
+                        &name,
+                        &metrics,
+                    );
+                    if !was_wedged && wedged {
+                        accepting = false;
+                        // Skip ack_to on this position — the wedge
+                        // was just recorded and its position must
+                        // stay at the in-flight front.
+                    } else {
+                        receiver.ack_to(position);
+                        metrics.queue_depth.set(receiver.depth());
+                    }
+                    in_flight = in_flight.saturating_sub(1);
+                    // Natural queue-closure or wedge exit: the
+                    // consumer stopped accepting (queue drained or
+                    // fail-stop wedged) and the last in-flight
+                    // handle just resolved. Shutdown does NOT exit
+                    // here — it breaks straight out of the select
+                    // arm above so the post-loop `writer.shutdown()`
+                    // can drain batched buffers (which is the only
+                    // thing that can resolve their parked handles).
+                    if !accepting && in_flight == 0 {
+                        break 'consumer;
+                    }
                 }
             }
 
@@ -1388,7 +1496,6 @@ pub async fn run_queue_consumer(
                             ack_tx.clone(),
                             position,
                             event.emitted_ns(),
-                            Arc::clone(&metrics),
                         );
                         in_flight += 1;
                         if let Err(e) = writer.consume(&event, handle).await {
@@ -1445,26 +1552,38 @@ pub async fn run_queue_consumer(
         warn!("output '{}': shutdown flush failed: {}", name, e);
     }
     drop(ack_tx);
-    while let Some((position, disposition)) = ack_rx.recv().await {
-        handle_ack_disposition(disposition, &name, &metrics);
-        // Wedge held the cursor when it fired in the steady-state
-        // arm above; subsequent ack drain still advances via
-        // `ack_to` on delivered / recovered positions but keeps
-        // holding on Dropped-on-disk. If the FIRST Dropped-on-disk
-        // arrives here (never happened in steady-state — e.g. the
-        // wedge originates from the post-loop `writer.shutdown()`
-        // drain), the helper records the wedge transition once so
-        // the operator alarm (`events_wedged` + wedge log line)
-        // still fires. `accepting` is not touched — the loop above
-        // has already exited its accept phase.
-        record_wedge_transition_if_first(position, disposition, &mut wedged, &name, &metrics);
-        let is_disk_position = matches!(position, AckPosition::Disk { .. });
-        let is_dropped_on_disk = matches!(disposition, AckDisposition::Dropped) && is_disk_position;
-        if !is_dropped_on_disk {
-            receiver.ack_to(position);
-            metrics.queue_depth.set(receiver.depth());
+    loop {
+        let n = ack_rx.recv_many(&mut ack_batch, ACK_RECV_BATCH_MAX).await;
+        if n == 0 {
+            break;
         }
-        in_flight = in_flight.saturating_sub(1);
+        merge_delivery_metrics(&ack_batch, &metrics);
+        #[cfg(test)]
+        test_crash_after_delivery_merge();
+        for resolution in ack_batch.drain(..) {
+            let position = resolution.position();
+            let disposition = resolution.disposition();
+            handle_ack_disposition(disposition, &name, &metrics);
+            // Wedge held the cursor when it fired in the steady-state
+            // arm above; subsequent ack drain still advances via
+            // `ack_to` on delivered / recovered positions but keeps
+            // holding on Dropped-on-disk. If the FIRST Dropped-on-disk
+            // arrives here (never happened in steady-state — e.g. the
+            // wedge originates from the post-loop `writer.shutdown()`
+            // drain), the helper records the wedge transition once so
+            // the operator alarm (`events_wedged` + wedge log line)
+            // still fires. `accepting` is not touched — the loop above
+            // has already exited its accept phase.
+            record_wedge_transition_if_first(position, disposition, &mut wedged, &name, &metrics);
+            let is_disk_position = matches!(position, AckPosition::Disk { .. });
+            let is_dropped_on_disk =
+                matches!(disposition, AckDisposition::Dropped) && is_disk_position;
+            if !is_dropped_on_disk {
+                receiver.ack_to(position);
+                metrics.queue_depth.set(receiver.depth());
+            }
+            in_flight = in_flight.saturating_sub(1);
+        }
     }
     if in_flight != 0 {
         tracing::error!(
@@ -1936,6 +2055,64 @@ mod consumer_lifecycle_tests {
 
     // ---- QueueAckHandle unit tests ----
 
+    #[test]
+    fn delivery_hot_path_is_burst_aggregated_at_both_ack_consumption_points() {
+        let source = include_str!("mod.rs");
+        let handle_start = source
+            .find("pub struct QueueAckHandle")
+            .expect("QueueAckHandle must exist");
+        let handle_end = source[handle_start..]
+            .find("impl Drop for QueueAckHandle")
+            .map(|offset| handle_start + offset)
+            .expect("QueueAckHandle Drop impl must follow its definition");
+        let handle_body = &source[handle_start..handle_end];
+        assert!(
+            !handle_body.contains("Arc<crate::metrics::OutputMetrics>")
+                && !handle_body.contains("observe_delivery("),
+            "QueueAckHandle must carry a typed delivery delta, not clone metrics or observe globally"
+        );
+
+        let consumer_start = source
+            .find("pub async fn run_queue_consumer(")
+            .expect("queue consumer must exist");
+        let consumer_end = source[consumer_start..]
+            .find("\n#[cfg(test)]\nmod consumer_lifecycle_tests")
+            .map(|offset| consumer_start + offset)
+            .expect("consumer tests must follow the production consumer");
+        let consumer = &source[consumer_start..consumer_end];
+        assert!(
+            consumer.contains("ack_rx.recv_many(&mut ack_batch, ACK_RECV_BATCH_MAX)"),
+            "ack receiver must drain into its loop-owned bounded batch"
+        );
+        assert_eq!(
+            consumer
+                .matches("merge_delivery_metrics(&ack_batch")
+                .count(),
+            2,
+            "steady and post-writer ack drains must each merge Delivered samples"
+        );
+        assert!(
+            !consumer.contains("while let Some((position, disposition)) = ack_rx.recv().await"),
+            "post-writer drain must not fall back to per-ack processing"
+        );
+
+        let mut remainder = consumer;
+        for phase in ["steady", "post-writer"] {
+            let merge = remainder
+                .find("merge_delivery_metrics(&ack_batch")
+                .unwrap_or_else(|| panic!("{phase} ack drain must merge metrics"));
+            remainder = &remainder[merge..];
+            let drain = remainder
+                .find("for resolution in ack_batch.drain(..)")
+                .unwrap_or_else(|| panic!("{phase} ack drain must process FIFO dispositions"));
+            assert!(
+                !remainder[..drain].contains(".await"),
+                "{phase} ack drain must merge before cursor/disposition processing without awaiting"
+            );
+            remainder = &remainder[drain + 1..];
+        }
+    }
+
     #[tokio::test]
     async fn ack_handle_resolve_delivered_sends_delivered() {
         let (handle, mut rx) = QueueAckHandle::for_test();
@@ -1959,72 +2136,163 @@ mod consumer_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn delivery_latency_is_observed_only_for_delivered_dispositions() {
+    async fn delivery_burst_merges_only_delivered_with_exact_buckets_sum_and_reversals() {
         let metrics = crate::metrics::OutputMetrics::for_testing();
-        let emitted_at = crate::time::UnixNanos::new(1_000_000_000);
+        let delivered_at = crate::time::UnixNanos::new(20_000_000_000);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
-        QueueAckHandle::new(
-            delivered_tx,
-            AckPosition::Memory,
-            emitted_at,
-            Arc::clone(&metrics),
-        )
-        .resolve_delivered_at(crate::time::UnixNanos::new(3_000_000_000));
-        assert_eq!(
-            delivered_rx.recv().await,
-            Some((AckPosition::Memory, AckDisposition::Delivered))
-        );
-        assert_eq!(metrics.delivery_seconds.count(), 1);
-        assert!(metrics.delivery_seconds.sum() >= 2.0);
+        for index in 0..64 {
+            let elapsed_ns = if index < 32 { 500_000 } else { 10_000_000 };
+            QueueAckHandle::new(
+                tx.clone(),
+                AckPosition::Memory,
+                crate::time::UnixNanos::new(20_000_000_000 - elapsed_ns),
+            )
+            .resolve_delivered_at(delivered_at);
+        }
+        for _ in 0..7 {
+            QueueAckHandle::new(
+                tx.clone(),
+                AckPosition::Memory,
+                crate::time::UnixNanos::new(21_000_000_000),
+            )
+            .resolve_delivered_at(delivered_at);
+        }
+        QueueAckHandle::new(tx.clone(), AckPosition::Memory, delivered_at).resolve_recovered();
+        QueueAckHandle::new(tx, AckPosition::Memory, delivered_at).resolve_dropped();
 
-        let (recovered_tx, mut recovered_rx) = tokio::sync::mpsc::unbounded_channel();
-        QueueAckHandle::new(
-            recovered_tx,
-            AckPosition::Memory,
-            emitted_at,
-            Arc::clone(&metrics),
-        )
-        .resolve_recovered();
-        assert_eq!(
-            recovered_rx.recv().await,
-            Some((AckPosition::Memory, AckDisposition::Recovered))
-        );
-        assert_eq!(metrics.delivery_seconds.count(), 1);
+        let mut resolutions = Vec::new();
+        assert_eq!(rx.recv_many(&mut resolutions, 73).await, 73);
+        merge_delivery_metrics(&resolutions, &metrics);
 
-        let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
-        QueueAckHandle::new(
-            dropped_tx,
-            AckPosition::Memory,
-            emitted_at,
-            Arc::clone(&metrics),
-        )
-        .resolve_dropped();
+        assert_eq!(metrics.delivery_merge_calls(), 1);
+        assert_eq!(metrics.delivery_seconds.count(), 71);
         assert_eq!(
-            dropped_rx.recv().await,
-            Some((AckPosition::Memory, AckDisposition::Dropped))
+            metrics
+                .delivery_negative_delta
+                .load(std::sync::atomic::Ordering::Relaxed),
+            7,
+            "all reversed samples must merge, not a fixed +1"
         );
-        assert_eq!(metrics.delivery_seconds.count(), 1);
+        let buckets = metrics.delivery_seconds.raw_bucket_counts();
+        assert_eq!(buckets[0], 39, "500µs plus reversed-zero samples");
+        assert_eq!(buckets[2], 32, "10ms samples");
+        assert_eq!(buckets.iter().sum::<u64>(), 71);
+        let expected_sum = 32.0 * 0.0005 + 32.0 * 0.01;
+        assert!((metrics.delivery_seconds.sum() - expected_sum).abs() <= 4.0 * f64::EPSILON);
     }
 
     #[tokio::test]
-    async fn accepted_batch_can_resolve_multiple_acks_at_one_delivery_boundary() {
+    async fn sixty_five_deliveries_merge_as_sixty_four_plus_one_exactly_once() {
         let metrics = crate::metrics::OutputMetrics::for_testing();
         let delivered_at = crate::time::UnixNanos::new(10_000_000_000);
-        for emitted_at in [
-            crate::time::UnixNanos::new(7_000_000_000),
-            crate::time::UnixNanos::new(8_000_000_000),
-        ] {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            QueueAckHandle::new(tx, AckPosition::Memory, emitted_at, Arc::clone(&metrics))
-                .resolve_delivered_at(delivered_at);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..65 {
+            QueueAckHandle::new(
+                tx.clone(),
+                AckPosition::Memory,
+                crate::time::UnixNanos::new(9_000_000_000),
+            )
+            .resolve_delivered_at(delivered_at);
+        }
+        drop(tx);
+
+        let mut resolutions = Vec::with_capacity(ACK_RECV_BATCH_MAX);
+        assert_eq!(
+            rx.len(),
+            65,
+            "test must exercise backlog beyond one quantum"
+        );
+        assert_eq!(rx.recv_many(&mut resolutions, ACK_RECV_BATCH_MAX).await, 64);
+        merge_delivery_metrics(&resolutions, &metrics);
+        resolutions.clear();
+        assert_eq!(rx.recv_many(&mut resolutions, ACK_RECV_BATCH_MAX).await, 1);
+        merge_delivery_metrics(&resolutions, &metrics);
+        resolutions.clear();
+        assert_eq!(rx.recv_many(&mut resolutions, ACK_RECV_BATCH_MAX).await, 0);
+
+        assert_eq!(metrics.delivery_merge_calls(), 2);
+        assert_eq!(metrics.delivery_seconds.count(), 65);
+        assert_eq!(metrics.delivery_seconds.sum(), 65.0);
+    }
+
+    #[tokio::test]
+    async fn ack_recv_many_is_cancel_safe_fifo_bounded_and_reports_closure() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut resolutions = Vec::with_capacity(ACK_RECV_BATCH_MAX);
+
+        tokio::select! {
+            biased;
+            _ = std::future::ready(()) => {}
+            _ = rx.recv_many(&mut resolutions, ACK_RECV_BATCH_MAX) => {
+                panic!("ready higher-priority branch must cancel the empty recv_many")
+            }
+        }
+        assert!(resolutions.is_empty());
+
+        for seq in 0..65 {
+            tx.send(AckResolution::Recovered {
+                position: AckPosition::Disk { seq, offset: seq },
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        assert_eq!(rx.recv_many(&mut resolutions, ACK_RECV_BATCH_MAX).await, 64);
+        assert_eq!(resolutions.capacity(), ACK_RECV_BATCH_MAX);
+        for (expected, resolution) in (0..64).zip(&resolutions) {
             assert_eq!(
-                rx.recv().await,
-                Some((AckPosition::Memory, AckDisposition::Delivered))
+                resolution.position(),
+                AckPosition::Disk {
+                    seq: expected,
+                    offset: expected,
+                }
             );
         }
-        assert_eq!(metrics.delivery_seconds.count(), 2);
-        assert_eq!(metrics.delivery_seconds.sum(), 5.0);
+        resolutions.clear();
+        assert_eq!(rx.recv_many(&mut resolutions, ACK_RECV_BATCH_MAX).await, 1);
+        assert_eq!(
+            resolutions[0].position(),
+            AckPosition::Disk {
+                seq: 64,
+                offset: 64,
+            }
+        );
+        resolutions.clear();
+        assert_eq!(
+            rx.recv_many(&mut resolutions, ACK_RECV_BATCH_MAX).await,
+            0,
+            "closed ack channel must terminate the drain"
+        );
+    }
+
+    #[test]
+    fn ack_resolution_and_handle_sizes_are_explicit() {
+        let resolution = std::mem::size_of::<AckResolution>();
+        let handle = std::mem::size_of::<QueueAckHandle>();
+        eprintln!("AckResolution={resolution} QueueAckHandle(test)={handle}");
+        assert!(resolution <= 48, "ack payload must stay compact");
+    }
+
+    #[tokio::test]
+    async fn steady_ack_arm_observes_delivered_before_consumer_shutdown() {
+        let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Delivered]));
+        let metrics = crate::metrics::OutputMetrics::for_testing();
+        let (sender, shutdown, handle) = spawn_consumer(writer, Arc::clone(&metrics)).await;
+        sender.send(owned_event()).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while metrics.delivery_seconds.count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("steady ack arm must merge delivery before shutdown");
+        assert_eq!(metrics.delivery_merge_calls(), 1);
+
+        drop(sender);
+        let _ = shutdown.send(true);
+        handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -2274,6 +2542,16 @@ mod consumer_lifecycle_tests {
         );
         // Delivered dispositions: no failures bumped by the consumer.
         assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.delivery_seconds.count(),
+            5,
+            "post-writer ack drain must not lose already-confirmed deliveries"
+        );
+        assert_eq!(
+            metrics.delivery_merge_calls(),
+            1,
+            "five shutdown deliveries must merge as one cold-drain burst"
+        );
     }
 
     /// Shutdown DLQ routing: when the writer's `shutdown()` body fails
@@ -2555,6 +2833,148 @@ mod consumer_lifecycle_tests {
                 .await
                 .unwrap()
                 .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_after_delivery_merge_before_cursor_replays_disk_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = QueueType::Disk {
+            path: tmp.path().display().to_string(),
+            max_size: 4 * 1024 * 1024,
+        };
+        let (sender, receiver) = create_queue(
+            "merge_barrier".into(),
+            QueueConfig {
+                queue_type: disk.clone(),
+                capacity: 4,
+            },
+        )
+        .unwrap();
+        let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Delivered]));
+        let metrics = crate::metrics::OutputMetrics::for_testing();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(TEST_CRASH_AFTER_DELIVERY_MERGE.scope(
+            true,
+            run_queue_consumer(
+                receiver,
+                writer,
+                None,
+                Arc::clone(&metrics),
+                None,
+                shutdown_rx,
+            ),
+        ));
+
+        sender.send(owned_event()).await.unwrap();
+        let join = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("merge barrier must be reached")
+            .expect_err("test barrier must crash before cursor advancement");
+        assert!(join.is_panic());
+        assert_eq!(metrics.delivery_seconds.count(), 1);
+        drop(sender);
+
+        let (_reopen_sender, mut reopen_receiver) = create_queue(
+            "merge_barrier_reopen".into(),
+            QueueConfig {
+                queue_type: disk,
+                capacity: 4,
+            },
+        )
+        .unwrap();
+        let replay =
+            tokio::time::timeout(std::time::Duration::from_secs(2), reopen_receiver.recv())
+                .await
+                .expect("event must remain replayable after pre-cursor crash");
+        assert!(replay.is_some());
+    }
+
+    #[tokio::test]
+    async fn same_burst_out_of_order_delivery_then_drop_does_not_cross_disk_cursor() {
+        struct OutOfOrderWriter {
+            first: tokio::sync::Mutex<Option<QueueAckHandle>>,
+            metrics: Arc<crate::metrics::OutputMetrics>,
+        }
+
+        impl HasMetrics for OutOfOrderWriter {
+            type Stats = crate::metrics::OutputMetrics;
+
+            fn metrics(&self) -> Arc<Self::Stats> {
+                Arc::clone(&self.metrics)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Output for OutOfOrderWriter {
+            async fn consume(&self, _event: &Event, ack: QueueAckHandle) -> anyhow::Result<()> {
+                let mut first = self.first.lock().await;
+                if let Some(first_ack) = first.take() {
+                    // Send both resolutions synchronously in reverse queue order so
+                    // one recv_many burst sees later Delivered before front Dropped.
+                    ack.resolve_delivered();
+                    first_ack.resolve_dropped();
+                } else {
+                    *first = Some(ack);
+                }
+                Ok(())
+            }
+
+            async fn consume_shutdown(
+                &self,
+                event: &Event,
+                ack: QueueAckHandle,
+            ) -> anyhow::Result<()> {
+                self.consume(event, ack).await
+            }
+
+            async fn shutdown_wedged(
+                &self,
+                _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+            ) -> anyhow::Result<()> {
+                if let Some(ack) = self.first.lock().await.take() {
+                    ack.resolve_dropped();
+                }
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = QueueType::Disk {
+            path: tmp.path().display().to_string(),
+            max_size: 4 * 1024 * 1024,
+        };
+        let writer = Arc::new(OutOfOrderWriter {
+            first: tokio::sync::Mutex::new(None),
+            metrics: crate::metrics::OutputMetrics::for_testing(),
+        });
+        let metrics = Arc::clone(&writer.metrics);
+        let (sender, _shutdown, task) =
+            spawn_consumer_with_queue(disk.clone(), writer, Arc::clone(&metrics)).await;
+        sender.send(owned_event()).await.unwrap();
+        sender.send(owned_event()).await.unwrap();
+        wait_for_wedge(&metrics).await;
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("wedged consumer must terminate")
+            .expect("consumer task must not panic");
+        assert_eq!(metrics.delivery_seconds.count(), 1);
+
+        let (_reopen_sender, mut reopen_receiver) = create_queue(
+            "out_of_order_reopen".into(),
+            QueueConfig {
+                queue_type: disk,
+                capacity: 4,
+            },
+        )
+        .unwrap();
+        for ordinal in 1..=2 {
+            let replay =
+                tokio::time::timeout(std::time::Duration::from_secs(2), reopen_receiver.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("replay event {ordinal} must remain before cursor"));
+            assert!(replay.is_some());
         }
     }
 

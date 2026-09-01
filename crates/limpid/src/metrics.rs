@@ -44,6 +44,36 @@ pub(crate) const OUTPUT_DELIVERY_BUCKETS: [f64; 12] = [
     0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0, 30.0, 60.0, 300.0, 900.0, 3600.0,
 ];
 
+/// Burst-local output delivery observations. The queue consumer builds one
+/// value per ack burst without touching shared atomics, then merges it into
+/// the output's histogram in one pass.
+#[derive(Debug, Default)]
+pub(crate) struct DeliveryDelta {
+    bucket_hits: [u64; OUTPUT_DELIVERY_BUCKETS.len()],
+    count: u64,
+    sum: f64,
+    reversed: u64,
+}
+
+impl DeliveryDelta {
+    pub(crate) fn record(&mut self, elapsed: crate::time::ElapsedNanos) {
+        let value = elapsed.duration.as_seconds_f64();
+        if let Some(index) = OUTPUT_DELIVERY_BUCKETS
+            .iter()
+            .position(|boundary| value <= *boundary)
+        {
+            self.bucket_hits[index] += 1;
+        }
+        self.count += 1;
+        self.sum += value;
+        self.reversed += u64::from(elapsed.reversed);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DurationHistogram {
     histogram: Arc<registry_core::Histogram>,
@@ -66,6 +96,11 @@ impl DurationHistogram {
     #[cfg(test)]
     pub(crate) fn sum(&self) -> f64 {
         self.histogram.sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_bucket_counts(&self) -> Vec<u64> {
+        self.histogram.raw_bucket_counts()
     }
 
     #[cfg(test)]
@@ -492,6 +527,8 @@ pub struct OutputMetrics {
     pub(crate) in_retry: Arc<registry_core::Gauge>,
     pub(crate) delivery_seconds: DurationHistogram,
     pub(crate) delivery_negative_delta: Arc<registry_core::Counter>,
+    #[cfg(test)]
+    delivery_merge_calls: AtomicU64,
 }
 
 impl OutputMetrics {
@@ -564,9 +601,12 @@ impl OutputMetrics {
                 "limpid_output_delivery_negative_delta_total",
                 "Total output delivery durations clamped to zero after a wall-clock reversal."
             ),
+            #[cfg(test)]
+            delivery_merge_calls: AtomicU64::new(0),
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn observe_delivery(
         &self,
         emitted_at: crate::time::UnixNanos,
@@ -577,6 +617,26 @@ impl OutputMetrics {
             self.delivery_negative_delta.inc();
         }
         self.delivery_seconds.observe(elapsed.duration);
+    }
+
+    /// Merge one queue-consumer ack burst into the output delivery metrics.
+    /// Each hit raw bucket, histogram count, histogram sum, and negative
+    /// counter is updated at most once for the entire burst.
+    pub(crate) fn merge_delivery_delta(&self, delta: &DeliveryDelta) {
+        if delta.is_empty() {
+            return;
+        }
+        self.delivery_seconds.histogram.merge_delivery_delta(delta);
+        if delta.reversed != 0 {
+            self.delivery_negative_delta.inc_by(delta.reversed);
+        }
+        #[cfg(test)]
+        self.delivery_merge_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delivery_merge_calls(&self) -> u64 {
+        self.delivery_merge_calls.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -789,6 +849,30 @@ mod registry_core {
             }
         }
 
+        pub(super) fn merge_delivery_delta(&self, delta: &super::DeliveryDelta) {
+            debug_assert_eq!(self.boundaries.as_slice(), super::OUTPUT_DELIVERY_BUCKETS);
+            for (bucket, hits) in self.bucket_counts.iter().zip(delta.bucket_hits) {
+                if hits != 0 {
+                    bucket.fetch_add(hits, Ordering::Relaxed);
+                }
+            }
+            self.count.fetch_add(delta.count, Ordering::Relaxed);
+
+            let mut current = self.sum_bits.load(Ordering::Relaxed);
+            loop {
+                let next = (f64::from_bits(current) + delta.sum).to_bits();
+                match self.sum_bits.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
         #[cfg(test)]
         pub(crate) fn count(&self) -> u64 {
             self.count.load(Ordering::Relaxed)
@@ -797,6 +881,14 @@ mod registry_core {
         #[cfg(test)]
         pub(crate) fn sum(&self) -> f64 {
             f64::from_bits(self.sum_bits.load(Ordering::Relaxed))
+        }
+
+        #[cfg(test)]
+        pub(crate) fn raw_bucket_counts(&self) -> Vec<u64> {
+            self.bucket_counts
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .collect()
         }
     }
 
