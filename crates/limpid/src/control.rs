@@ -28,10 +28,13 @@ use tokio::net::UnixListener;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 
+#[cfg(test)]
 use crate::dsl::ast::*;
 use crate::event::Event;
 use crate::metrics::Registry;
+#[cfg(test)]
 use crate::pipeline::CompiledConfig;
+use crate::pipeline::RuntimeBlueprint;
 use crate::queue::QueueSender;
 use crate::tap::TapRegistry;
 
@@ -421,7 +424,7 @@ pub struct ControlServer {
     socket_path: PathBuf,
     tap: TapRegistry,
     metrics: Arc<Registry>,
-    config: Arc<CompiledConfig>,
+    blueprint: Arc<RuntimeBlueprint>,
     input_senders: Arc<HashMap<String, InputInjectTarget>>,
     output_senders: Arc<HashMap<String, QueueSender>>,
     started_at: Instant,
@@ -432,7 +435,7 @@ impl ControlServer {
         socket_path: Option<String>,
         tap: TapRegistry,
         metrics: Arc<Registry>,
-        config: Arc<CompiledConfig>,
+        blueprint: Arc<RuntimeBlueprint>,
         input_senders: HashMap<String, InputInjectTarget>,
         output_senders: Arc<HashMap<String, QueueSender>>,
         started_at: Instant,
@@ -443,7 +446,7 @@ impl ControlServer {
             ),
             tap,
             metrics,
-            config,
+            blueprint,
             input_senders: Arc::new(input_senders),
             output_senders,
             started_at,
@@ -709,7 +712,7 @@ impl ControlServer {
         info!("control socket listening on {:?}", self.socket_path);
 
         let tap = Arc::new(self.tap);
-        let config = self.config;
+        let blueprint = self.blueprint;
         let started_at = self.started_at;
         let metrics = self.metrics;
         let input_senders = self.input_senders;
@@ -756,11 +759,11 @@ impl ControlServer {
                             };
                             let tap = Arc::clone(&tap);
                             let metrics_reg = Arc::clone(&metrics);
-                            let config = Arc::clone(&config);
+                            let blueprint = Arc::clone(&blueprint);
                             let input_senders = Arc::clone(&input_senders);
                             let output_senders = Arc::clone(&output_senders);
                             conn_handles.push(tokio::spawn(async move {
-                                handle_connection(stream, tap, metrics_reg, config, input_senders, output_senders, started_at).await;
+                                handle_connection(stream, tap, metrics_reg, blueprint, input_senders, output_senders, started_at).await;
                                 drop(permit);
                             }));
                         }
@@ -835,7 +838,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     tap: Arc<TapRegistry>,
     metrics: Arc<Registry>,
-    config: Arc<CompiledConfig>,
+    blueprint: Arc<RuntimeBlueprint>,
     input_senders: Arc<HashMap<String, InputInjectTarget>>,
     output_senders: Arc<HashMap<String, QueueSender>>,
     started_at: Instant,
@@ -959,7 +962,7 @@ async fn handle_connection(
             }
             "stats" => serde_json::to_string(&metrics.snapshot())
                 .expect("MetricsSnapshot serialization must remain infallible"),
-            "list" => build_list_json(&config),
+            "list" => build_list_json(&blueprint),
             _ => json!({"error": format!("unknown command '{}'", cmd)}).to_string(),
         };
         let _ = writer.write_all(response.as_bytes()).await;
@@ -968,29 +971,14 @@ async fn handle_connection(
 }
 
 /// Build JSON listing of pipelines with their tap points in flow order.
-fn build_list_json(config: &CompiledConfig) -> String {
+fn build_list_json(blueprint: &RuntimeBlueprint) -> String {
     let mut pipelines = Vec::new();
 
-    let mut names: Vec<&String> = config.pipelines.keys().collect();
-    names.sort();
-
-    for name in names {
-        let Some(pipeline_def) = config.pipelines.get(name) else {
-            continue;
-        };
-        let mut inputs: Vec<String> = Vec::new();
-        let mut processes = Vec::new();
-        let mut outputs = Vec::new();
-
-        collect_pipeline_tap_points(
-            &pipeline_def.body,
-            &mut inputs,
-            &mut processes,
-            &mut outputs,
-        );
+    for (_, pipeline) in blueprint.pipelines() {
+        let mut inputs = pipeline.flow.inputs.clone();
 
         let mut p = Map::new();
-        p.insert("name".into(), Value::String(name.clone()));
+        p.insert("name".into(), Value::String(pipeline.name.clone()));
         // Keep scalar `input` for single-input pipelines (backward-compatible payload),
         // emit `inputs` array when fan-in is in play.
         match inputs.len() {
@@ -1007,11 +995,27 @@ fn build_list_json(config: &CompiledConfig) -> String {
         }
         p.insert(
             "processes".into(),
-            Value::Array(processes.into_iter().map(Value::String).collect()),
+            Value::Array(
+                pipeline
+                    .flow
+                    .processes
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
         );
         p.insert(
             "outputs".into(),
-            Value::Array(outputs.into_iter().map(Value::String).collect()),
+            Value::Array(
+                pipeline
+                    .flow
+                    .outputs
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
         );
         pipelines.push(Value::Object(p));
     }
@@ -1020,6 +1024,7 @@ fn build_list_json(config: &CompiledConfig) -> String {
 }
 
 /// Recursively walk pipeline statements to collect tap points in order.
+#[cfg(test)]
 fn collect_pipeline_tap_points(
     stmts: &[PipelineStatement],
     inputs: &mut Vec<String>,
@@ -1092,6 +1097,44 @@ fn collect_pipeline_tap_points(
             PipelineStatement::Drop | PipelineStatement::Finish | PipelineStatement::Error(_) => {}
         }
     }
+}
+
+#[cfg(test)]
+fn build_list_json_legacy(config: &CompiledConfig) -> String {
+    let mut pipelines = Vec::new();
+    let mut names: Vec<&String> = config.pipelines.keys().collect();
+    names.sort();
+    for name in names {
+        let pipeline = &config.pipelines[name];
+        let mut inputs = Vec::new();
+        let mut processes = Vec::new();
+        let mut outputs = Vec::new();
+        collect_pipeline_tap_points(&pipeline.body, &mut inputs, &mut processes, &mut outputs);
+        let mut value = Map::new();
+        value.insert("name".into(), Value::String(name.clone()));
+        match inputs.len() {
+            0 => {}
+            1 => {
+                value.insert("input".into(), Value::String(inputs.remove(0)));
+            }
+            _ => {
+                value.insert(
+                    "inputs".into(),
+                    Value::Array(inputs.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+        value.insert(
+            "processes".into(),
+            Value::Array(processes.into_iter().map(Value::String).collect()),
+        );
+        value.insert(
+            "outputs".into(),
+            Value::Array(outputs.into_iter().map(Value::String).collect()),
+        );
+        pipelines.push(Value::Object(value));
+    }
+    json!({"pipelines": pipelines}).to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1356,7 +1399,7 @@ def pipeline p { input i; output o }
             Some(socket_path.to_string_lossy().into_owned()),
             TapRegistry::new(),
             metrics,
-            Arc::new(config),
+            crate::pipeline::compile_runtime_blueprint(&config).expect("compile blueprint"),
             HashMap::new(),
             Arc::new(HashMap::new()),
             Instant::now(),
@@ -1528,6 +1571,68 @@ fn classify_stale_socket_removal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealed_blueprint_list_json_preserves_flow_order_and_input_shape() {
+        let config = CompiledConfig::from_config(
+            crate::dsl::parser::parse_config(
+                r#"
+def process first { egress = ingress }
+def process nested { egress = ingress }
+def input one { type syslog_udp bind "127.0.0.1:0" }
+def input two { type syslog_udp bind "127.0.0.1:0" }
+def output alpha { type stdout }
+def output omega { type stdout }
+def pipeline fan_in {
+    input one, two
+    process first
+    process { egress = ingress }
+    if true {
+        process { egress = ingress }
+        process nested
+        process { egress = ingress }
+        output omega
+    } else { output alpha }
+    output alpha
+}
+def pipeline scalar { input one; output omega }
+"#,
+            )
+            .expect("parse flow fixture"),
+        )
+        .expect("compile flow fixture");
+        let blueprint =
+            crate::pipeline::compile_runtime_blueprint(&config).expect("compile flow blueprint");
+        assert_eq!(
+            build_list_json(&blueprint),
+            build_list_json_legacy(&config),
+            "control list JSON bytes, named-only process flow, and scalar/array input shape drifted"
+        );
+
+        let routing_split = CompiledConfig::from_config(
+            crate::dsl::parser::parse_config(
+                r#"
+def input a { type syslog_udp bind "127.0.0.1:0" }
+def input b { type syslog_udp bind "127.0.0.1:0" }
+def input c { type syslog_udp bind "127.0.0.1:0" }
+def pipeline p {
+    input a
+    input b
+    if true { input c; finish } else { finish }
+}
+"#,
+            )
+            .expect("parse routing/control fixture"),
+        )
+        .expect("compile routing/control fixture");
+        let routing_blueprint = crate::pipeline::compile_runtime_blueprint(&routing_split)
+            .expect("compile routing/control blueprint");
+        assert_eq!(
+            build_list_json(&routing_blueprint),
+            build_list_json_legacy(&routing_split),
+            "recursive control input union must remain byte-exact while routing stays top-level-first"
+        );
+    }
 
     #[test]
     #[cfg(unix)]
@@ -1901,7 +2006,7 @@ mod tests {
             Some(socket.to_string_lossy().into_owned()),
             TapRegistry::new(),
             Arc::new(crate::metrics::Registry::new()),
-            Arc::new(config),
+            crate::pipeline::compile_runtime_blueprint(&config).expect("compile blueprint"),
             HashMap::new(),
             Arc::new(HashMap::new()),
             Instant::now(),

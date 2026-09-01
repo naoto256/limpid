@@ -24,6 +24,157 @@ fn run_check(config: &std::path::Path) -> std::process::Output {
         .expect("failed to spawn limpid")
 }
 
+fn run_named_test_pipeline(config: &std::path::Path, pipeline: &str) -> std::process::Output {
+    Command::new(limpid_bin())
+        .arg("--test-pipeline")
+        .arg(pipeline)
+        .arg("--input")
+        .arg(r#"{"ingress":"raw"}"#)
+        .arg("--config")
+        .arg(config)
+        .output()
+        .expect("failed to spawn limpid --test-pipeline")
+}
+
+#[test]
+fn test_pipeline_bound_ir_preserves_cli_trace_output_and_exit_status() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("single-ir-test.conf");
+    fs::write(
+        &conf,
+        r#"
+def process decorate { workspace.marker = "ok"; egress = "rendered" }
+def pipeline p { process decorate; output sink; finish }
+"#,
+    )
+    .unwrap();
+
+    let output = run_named_test_pipeline(&conf, "p");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "unexpected stderr bytes");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let ordered = [
+        "=== Pipeline: p ===",
+        "[input] → ingress: raw",
+        "[process]  decorate → ok",
+        "[output]  → sink",
+        "[finish]",
+        "[output]  → sink  egress: rendered",
+        "workspace:",
+        "marker",
+    ];
+    let mut cursor = 0;
+    for fragment in ordered {
+        let offset = stdout[cursor..]
+            .find(fragment)
+            .unwrap_or_else(|| panic!("missing ordered fragment {fragment:?}: {stdout}"));
+        cursor += offset + fragment.len();
+    }
+}
+
+#[test]
+fn test_pipeline_nested_unknown_process_warns_and_passes_event_through() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("nested-unknown.conf");
+    fs::write(
+        &conf,
+        r#"
+def process parent { process missing }
+def pipeline p { process parent; output sink; finish }
+"#,
+    )
+    .unwrap();
+
+    let output = run_named_test_pipeline(&conf, "p");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "unexpected stderr bytes");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("unknown process 'missing', passing event through unchanged"),
+        "missing compatibility warning: {stdout}"
+    );
+    assert!(
+        stdout.contains("[process]  parent → ok"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("[output]  → sink  egress: raw"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_pipeline_process_error_diagnostics_match_the_baseline_root_shapes() {
+    let dir = TempDir::new().unwrap();
+    for (name, source, site, reason, warning) in [
+        (
+            "named-direct",
+            r#"def process direct { error "expected" }
+               def pipeline p { process direct }"#,
+            "direct",
+            "process failed: expected",
+            "process 'direct': process failed: expected — event routed to error_log",
+        ),
+        (
+            "named-nested",
+            r#"def process nested { error "expected" }
+               def process outer { process nested }
+               def pipeline p { process outer }"#,
+            "outer",
+            "process failed: process failed: expected",
+            "process 'outer': process failed: process failed: expected — event routed to error_log",
+        ),
+        (
+            "inline-direct",
+            r#"def pipeline p { process { error "inline expected" } }"#,
+            "(inline)",
+            "inline expected",
+            "inline process: inline expected — event routed to error_log",
+        ),
+        (
+            "inline-nested",
+            r#"def process nested { error "expected" }
+               def pipeline p { process { process nested } }"#,
+            "(inline)",
+            "process failed: expected",
+            "inline process: process failed: expected — event routed to error_log",
+        ),
+    ] {
+        let conf = dir.path().join(format!("{name}.conf"));
+        fs::write(&conf, source).unwrap();
+        let output = run_named_test_pipeline(&conf, "p");
+        assert!(
+            output.status.success(),
+            "{name} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty(), "{name} stderr bytes");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(warning), "{name} warning: {stdout}");
+        assert!(
+            stdout.contains(&format!(
+                "[process]  {site} → error: {reason} (event → error_log)"
+            )),
+            "{name} trace: {stdout}"
+        );
+        let json = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("[error_log]  "))
+            .unwrap_or_else(|| panic!("{name} error_log: {stdout}"));
+        let json: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(json["reason"], reason, "{name} reason");
+        assert_eq!(json["process"]["name"], site, "{name} site");
+    }
+}
+
 #[test]
 fn check_clean_emits_summary_and_configuration_ok() {
     let dir = TempDir::new().unwrap();
