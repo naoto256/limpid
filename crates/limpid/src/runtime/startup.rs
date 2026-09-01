@@ -41,15 +41,17 @@ fn late_post_listener_failure() -> Result<()> {
     Ok(())
 }
 
-pub(super) fn configured_ltp_peer_ids(config: &CompiledConfig) -> Result<BTreeSet<String>> {
+pub(super) fn configured_ltp_peer_ids(
+    blueprint: &crate::pipeline::RuntimeBlueprint,
+) -> Result<BTreeSet<String>> {
     let mut peers = BTreeSet::new();
-    for (kind, name, properties) in config
-        .inputs
+    for (kind, name, properties) in blueprint
+        .inputs()
         .iter()
         .map(|(name, def)| ("input", name, &def.properties))
         .chain(
-            config
-                .outputs
+            blueprint
+                .outputs()
                 .iter()
                 .map(|(name, def)| ("output", name, &def.properties)),
         )
@@ -76,16 +78,36 @@ pub(super) fn configured_ltp_peer_ids(config: &CompiledConfig) -> Result<BTreeSe
 
 impl Runtime {
     pub async fn start(config: CompiledConfig, config_file: PathBuf) -> Result<Self> {
-        Self::start_with_registry(config, config_file, Arc::new(Registry::new())).await
+        config.validate()?;
+        let blueprint = crate::pipeline::compile_runtime_blueprint(&config)?;
+        Self::start_blueprint(blueprint, config_file).await
     }
 
+    pub(crate) async fn start_blueprint(
+        blueprint: Arc<crate::pipeline::RuntimeBlueprint>,
+        config_file: PathBuf,
+    ) -> Result<Self> {
+        Self::start_blueprint_with_registry(blueprint, config_file, Arc::new(Registry::new())).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn start_with_registry(
         config: CompiledConfig,
         config_file: PathBuf,
         metrics_registry: Arc<Registry>,
     ) -> Result<Self> {
-        Self::start_with_registry_and_node_id_resolver(
-            config,
+        config.validate()?;
+        let blueprint = crate::pipeline::compile_runtime_blueprint(&config)?;
+        Self::start_blueprint_with_registry(blueprint, config_file, metrics_registry).await
+    }
+
+    async fn start_blueprint_with_registry(
+        blueprint: Arc<crate::pipeline::RuntimeBlueprint>,
+        config_file: PathBuf,
+        metrics_registry: Arc<Registry>,
+    ) -> Result<Self> {
+        Self::start_blueprint_with_registry_and_node_id_resolver(
+            blueprint,
             config_file,
             metrics_registry,
             || Ok(gethostname::gethostname().to_string_lossy().into_owned()),
@@ -93,6 +115,7 @@ impl Runtime {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_with_registry_and_node_id_resolver<F>(
         config: CompiledConfig,
         config_file: PathBuf,
@@ -102,36 +125,60 @@ impl Runtime {
     where
         F: FnOnce() -> Result<String>,
     {
+        config.validate()?;
+        let blueprint = crate::pipeline::compile_runtime_blueprint(&config)?;
+        Self::start_blueprint_with_registry_and_node_id_resolver(
+            blueprint,
+            config_file,
+            metrics_registry,
+            resolve_hostname,
+        )
+        .await
+    }
+
+    async fn start_blueprint_with_registry_and_node_id_resolver<F>(
+        blueprint: Arc<crate::pipeline::RuntimeBlueprint>,
+        config_file: PathBuf,
+        metrics_registry: Arc<Registry>,
+        resolve_hostname: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<String>,
+    {
+        // Bind every descriptor before any table, socket, module, or task is
+        // acquired. A failed bind therefore leaves external resources at 0.
+        let bound_blueprint = Arc::new(blueprint.bind(&metrics_registry)?);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let mut registry = ModuleRegistry::new();
         modules::register_builtins(&mut registry);
         // Future: dynamic plugin loading from /etc/limpid/plugins/
 
-        init_geoip(&config);
-        let table_store = init_tables(&config)?;
+        init_geoip_from_globals(blueprint.global_blocks());
+        let table_store = init_tables_from_globals(blueprint.global_blocks())?;
 
         let mut func_registry = FunctionRegistry::new();
         crate::functions::register_builtins(&mut func_registry, table_store);
-        crate::functions::register_user_functions(&mut func_registry, &config);
+        crate::functions::register_user_function_defs(
+            &mut func_registry,
+            blueprint.functions().values(),
+        );
         let func_registry = Arc::new(func_registry);
 
-        config.validate()?;
-        let ltp_peer_ids = configured_ltp_peer_ids(&config)?;
+        let ltp_peer_ids = configured_ltp_peer_ids(&blueprint)?;
         let ltp_metrics = if ltp_peer_ids.is_empty() {
             None
         } else {
             Some(LtpMetrics::register(&metrics_registry, &ltp_peer_ids)?)
         };
-        let ltp_node_key = config
-            .node_key
-            .as_deref()
+        let ltp_node_key = blueprint
+            .node_key()
             .map(Path::new)
             .map(crate::ltp::load_node_key)
             .transpose()?
             .map(Arc::new);
-        let node_id = match &config.node_id {
-            Some(node_id) => node_id.clone(),
+        let node_id = match blueprint.node_id() {
+            Some(node_id) => node_id.to_string(),
             None => resolve_hostname()?,
         };
         crate::metrics::register_build_info(
@@ -164,8 +211,8 @@ impl Runtime {
         // queue consumer hands `error_log` to `run_queue_consumer`,
         // which routes the retry-exhausted payload to the DLQ once
         // each handle resolves.
-        let error_log_path = config
-            .global_blocks
+        let error_log_path = blueprint
+            .global_blocks()
             .get("control")
             .and_then(|p| props::get_string(p, "error_log"));
         let error_log = match error_log_path {
@@ -180,8 +227,8 @@ impl Runtime {
         // Fallback policy for the tracing line when `error_log` write
         // fails or is unset. Parsed here so invalid values fail
         // daemon startup (matching `--check`'s config-time refusal).
-        let error_log_fallback = match config
-            .global_blocks
+        let error_log_fallback = match blueprint
+            .global_blocks()
             .get("control")
             .and_then(|p| props::get_string(p, "error_log_fallback"))
         {
@@ -217,14 +264,13 @@ impl Runtime {
 
         // Complete every deterministic plan named by the startup contract
         // before an output factory can acquire a resource.
-        let compiled_config = config.clone();
-        let control_path = config
-            .global_blocks
+        let control_path = blueprint
+            .global_blocks()
             .get("control")
             .and_then(|p| props::get_string(p, "socket"));
         crate::control::validate_control_socket_parent(control_path.as_deref())?;
-        let stdout_regular_file = if config
-            .outputs
+        let stdout_regular_file = if blueprint
+            .outputs()
             .values()
             .any(|output| output.properties.type_name() == "stdout")
         {
@@ -234,15 +280,19 @@ impl Runtime {
             false
         };
 
-        // Group pipelines by input and compile every process-metric plan.
+        // Group sealed pipeline identities by input. The worker never owns an
+        // AST PipelineDef/ProcessDef clone.
         let mut input_pipelines: HashMap<String, Vec<Arc<PipelineWorker>>> = HashMap::new();
-        for pipeline_def in config.pipelines.values() {
-            let worker = Arc::new(PipelineWorker::new_with_process_metrics(
-                pipeline_def.clone(),
-                &config.processes,
+        for (pipeline_id, pipeline) in blueprint.pipelines() {
+            let worker = Arc::new(PipelineWorker::from_bound(
+                pipeline_id,
+                &blueprint,
                 &metrics_registry,
             )?);
-            for input_name in get_pipeline_inputs(pipeline_def) {
+            // Routing deliberately uses only the first top-level `input`
+            // statement. Control-list flow remains a recursive union for
+            // compatibility; changing that historical split is a separate WI.
+            for input_name in routing_inputs(pipeline) {
                 input_pipelines
                     .entry(input_name.clone())
                     .or_default()
@@ -253,8 +303,8 @@ impl Runtime {
         let mut input_queue_sizes = HashMap::new();
         let mut prepared_ltp_inputs = HashMap::new();
         for input_name in input_pipelines.keys() {
-            let input_def = config
-                .inputs
+            let input_def = blueprint
+                .inputs()
                 .get(input_name)
                 .ok_or_else(|| anyhow::anyhow!("input '{}' not found", input_name))?;
             let queue_size =
@@ -276,9 +326,7 @@ impl Runtime {
         for input_name in input_pipelines.keys() {
             tap.register(&format!("input {}", input_name)).await;
         }
-        for proc_name in config.processes.keys() {
-            tap.register(&format!("process {}", proc_name)).await;
-        }
+        register_process_taps(&tap, &blueprint).await;
 
         // From this point on, every acquired output resource is transactionally
         // owned. Each real queue consumer is spawned and registered immediately
@@ -294,7 +342,7 @@ impl Runtime {
         // `PipelineContext::disk_outputs` for the runtime contract.
         let mut disk_outputs: HashSet<String> = HashSet::new();
 
-        for (name, output_def) in &config.outputs {
+        for (name, output_def) in blueprint.outputs() {
             let queue_config = match QueueConfig::from_output_properties(
                 name,
                 output_def.properties.user_properties(),
@@ -372,8 +420,6 @@ impl Runtime {
         let has_disk_output = !disk_outputs.is_empty();
         let disk_outputs = Arc::new(disk_outputs);
 
-        let config = Arc::new(config);
-
         // --- 3. Start inputs (each input owns its own InputMetrics) ---
 
         let mut input_senders: HashMap<
@@ -383,7 +429,10 @@ impl Runtime {
         let mut ltp_inputs = Vec::new();
 
         for (input_name, pipelines) in input_pipelines {
-            let input_def = config.inputs.get(&input_name).expect("input preflight");
+            let input_def = blueprint
+                .inputs()
+                .get(&input_name)
+                .expect("input preflight");
             let queue_size = input_queue_sizes
                 .remove(&input_name)
                 .expect("input queue-size preflight");
@@ -403,7 +452,7 @@ impl Runtime {
             let ctx = PipelineContext {
                 output_senders: Arc::clone(&output_senders),
                 disk_outputs: Arc::clone(&disk_outputs),
-                config: Arc::clone(&config),
+                bound_blueprint: Arc::clone(&bound_blueprint),
                 funcs: Arc::clone(&func_registry),
                 tap: tap.clone(),
                 error_log: error_log.as_ref().map(Arc::clone),
@@ -532,7 +581,7 @@ impl Runtime {
             control_path,
             tap.clone(),
             Arc::clone(&metrics_registry),
-            Arc::clone(&config),
+            Arc::clone(&blueprint),
             input_senders,
             Arc::clone(&output_senders),
             started_at,
@@ -565,18 +614,35 @@ impl Runtime {
             shutdown_tx,
             handles,
             config_file,
-            compiled_config,
+            blueprint,
+            #[cfg(test)]
+            test_identity: RuntimeTestIdentity {
+                metrics_registry,
+                funcs: func_registry,
+                tap,
+            },
         })
     }
+}
+
+async fn register_process_taps(tap: &TapRegistry, blueprint: &crate::pipeline::RuntimeBlueprint) {
+    for (name, kind) in blueprint.process_body_inventory() {
+        if kind == crate::pipeline::SiteKind::Named {
+            tap.register(&format!("process {name}")).await;
+        }
+    }
+}
+
+fn routing_inputs(pipeline: &crate::pipeline::PipelineBlueprint) -> &[String] {
+    &pipeline.subscription_inputs
 }
 
 // ---------------------------------------------------------------------------
 // Global subsystem initialization
 // ---------------------------------------------------------------------------
 
-fn init_geoip(config: &CompiledConfig) {
-    let db_path = config
-        .global_blocks
+fn init_geoip_from_globals(global_blocks: &HashMap<String, Vec<Property>>) {
+    let db_path = global_blocks
         .get("geoip")
         .and_then(|p| props::get_string(p, "database"))
         .map(PathBuf::from);
@@ -584,13 +650,19 @@ fn init_geoip(config: &CompiledConfig) {
 }
 
 pub(crate) fn init_tables(config: &CompiledConfig) -> Result<crate::functions::table::TableStore> {
+    init_tables_from_globals(&config.global_blocks)
+}
+
+fn init_tables_from_globals(
+    global_blocks: &HashMap<String, Vec<Property>>,
+) -> Result<crate::functions::table::TableStore> {
     use crate::dsl::ast::Property;
     use crate::functions::table::{TableConfig, TableStore};
     use std::time::Duration;
 
     let mut configs = Vec::new();
 
-    if let Some(props) = config.global_blocks.get("table") {
+    if let Some(props) = global_blocks.get("table") {
         for prop in props {
             if let Property::Block {
                 key: table_name,
@@ -621,6 +693,62 @@ mod tests {
     use crate::dsl::parser::parse_config;
     use base64::Engine as _;
 
+    #[tokio::test]
+    async fn process_tap_inventory_registers_named_definitions_but_no_inline_sites() {
+        let config = CompiledConfig::from_config(
+            parse_config(
+                "def process named { egress = ingress } \
+                 def process unused { egress = ingress } \
+                 def pipeline p { process named; process { egress = ingress }; \
+                   if true { process { egress = ingress }; finish } else { finish } }",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let blueprint = crate::pipeline::compile_runtime_blueprint(&config).unwrap();
+        let tap = TapRegistry::new();
+        register_process_taps(&tap, &blueprint).await;
+
+        let mut named = 0;
+        let mut inline = 0;
+        for (name, kind) in blueprint.process_body_inventory() {
+            let subscription = tap.subscribe(&format!("process {name}")).await;
+            match kind {
+                crate::pipeline::SiteKind::Named => {
+                    named += 1;
+                    assert!(subscription.is_some(), "missing named tap for {}", name);
+                }
+                crate::pipeline::SiteKind::Inline => {
+                    inline += 1;
+                    assert!(
+                        subscription.is_none(),
+                        "inline body {name} produced a ghost tap"
+                    );
+                }
+            }
+        }
+        assert_eq!(named, 2, "fixture must exercise every named body");
+        assert_eq!(inline, 2, "fixture must exercise multiple inline bodies");
+    }
+
+    #[test]
+    fn routing_helper_uses_only_the_first_top_level_input_statement() {
+        let config = CompiledConfig::from_config(
+            parse_config(
+                "def pipeline p { input a; input b; if true { input c; finish } else { finish } } \
+                 def pipeline fan_in { input a, b, c; finish }",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let blueprint = crate::pipeline::compile_runtime_blueprint(&config).unwrap();
+        assert_eq!(routing_inputs(blueprint.pipeline("p").unwrap()), ["a"]);
+        assert_eq!(
+            routing_inputs(blueprint.pipeline("fan_in").unwrap()),
+            ["a", "b", "c"]
+        );
+    }
+
     #[test]
     fn ltp_peer_registration_uses_deduplicated_input_output_union() {
         let mut spki = crate::ltp::ED25519_SPKI_PREFIX.to_vec();
@@ -637,7 +765,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            configured_ltp_peer_ids(&config).unwrap(),
+            configured_ltp_peer_ids(&crate::pipeline::compile_runtime_blueprint(&config).unwrap(),)
+                .unwrap(),
             BTreeSet::from([
                 "peer-a".to_owned(),
                 "peer-b".to_owned(),

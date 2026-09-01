@@ -14,25 +14,12 @@
 //! sends, DLQ persistence) keeps the same `OwnedEvent` shape it had
 //! before v0.6.0.
 
-use std::collections::{HashMap, HashSet};
-
-use anyhow::{Result, bail};
-use tracing::trace;
-
-use crate::dsl::arena::EventArena;
-use crate::dsl::ast::*;
-use crate::dsl::eval::{
-    eval_expr, select_if_branch_with_ordinal, select_switch_arm_with_ordinal, value_to_string,
-};
-use crate::dsl::exec::{
-    CompiledProcessRegistry, ExecResult, ProcessError, ProcessMetricStatement, ProcessRegistry,
-    exec_process_body, exec_process_body_with_metric_plan,
-};
-use crate::event::{BorrowedEvent, OwnedEvent, QueuedEvent};
-use crate::functions::FunctionRegistry;
-use crate::tap::TapRegistry;
-
+mod blueprint;
 mod compiled_config;
+pub(crate) use blueprint::{
+    BoundRuntimeBlueprint, PipelineBlueprint, PipelineId, RuntimeBlueprint, SiteKind,
+    compile_runtime_blueprint,
+};
 pub use compiled_config::CompiledConfig;
 
 // ---------------------------------------------------------------------------
@@ -40,24 +27,24 @@ pub use compiled_config::CompiledConfig;
 // ---------------------------------------------------------------------------
 
 mod execution;
+#[cfg(test)]
+pub use execution::run_pipeline;
 #[allow(unused_imports)] // Public facade: TraceEntry is consumed by external callers.
 pub use execution::{
     ErroredEventContext, OutputCapturePolicy, OutputEvent, PipelineRunResult, PipelineTermination,
-    ProcessEvent, TraceEntry, run_pipeline,
+    ProcessEvent, TraceEntry,
 };
-pub(crate) use execution::{run_pipeline_at, run_pipeline_with_process_metrics_at};
-
-mod metrics_plan;
-use metrics_plan::PipelineMetricStatement;
-pub(crate) use metrics_plan::PipelineProcessMetrics;
-#[cfg(test)]
-pub(crate) use metrics_plan::{MetricNodeSelectionTrap, RawPipelineProcessMetrics};
+pub(crate) use execution::{run_pipeline_blueprint, run_pipeline_blueprint_resolved_at};
 
 /// A process registry backed by compiled DSL process definitions.
 #[cfg(test)]
 mod tests {
+    use anyhow::Result;
+
     use super::*;
+    use crate::dsl::ast::*;
     use crate::dsl::parser::parse_config;
+    use crate::functions::FunctionRegistry;
 
     fn compile(src: &str) -> Result<CompiledConfig> {
         CompiledConfig::from_config(parse_config(src)?)
@@ -533,10 +520,10 @@ def pipeline p {
 "#,
         )
         .unwrap();
-        let pipeline = cfg.pipelines.get("p").unwrap();
         let registry = crate::metrics::Registry::new();
-        let output_metrics =
-            PipelineProcessMetrics::register(pipeline, &cfg.processes, &registry).unwrap();
+        let blueprint = compile_runtime_blueprint(&cfg).unwrap();
+        let bound = blueprint.bind(&registry).unwrap();
+        let pipeline_id = blueprint.pipeline_id("p").unwrap();
         let mut funcs = FunctionRegistry::new();
         register_builtins(&mut funcs, TableStore::from_configs(vec![]).unwrap());
         let mut event = OwnedEvent::new(
@@ -546,16 +533,15 @@ def pipeline p {
         event.received_at = chrono::Utc::now() - chrono::Duration::seconds(60);
 
         let dispatch_started_at = crate::time::UnixNanos::now();
-        let result = run_pipeline_with_process_metrics_at(
-            pipeline,
+        let result = execution::run_pipeline_blueprint_at(
+            &bound,
+            "p",
             &event,
-            &cfg,
             &funcs,
             None,
             None,
             OutputCapturePolicy::StripAll,
             &mut bumpalo::Bump::new(),
-            &output_metrics,
             dispatch_started_at,
         )
         .unwrap();
@@ -564,18 +550,10 @@ def pipeline p {
         assert!(result.outputs.iter().all(|(_, queued)| {
             queued.emitted_ns() >= crate::time::UnixNanos::from_datetime(event.received_at)
         }));
-        let timers: Vec<&crate::metrics::PipelineOutputTimer> = output_metrics
-            .statements
-            .iter()
-            .filter_map(|stmt| match stmt {
-                PipelineMetricStatement::Output(timer) => Some(timer),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(timers.len(), 2);
-        assert_eq!(timers[0].count(), 2);
-        assert_eq!(timers[1].count(), 2);
-        assert!(timers[0].sum() < 5.0);
+        let metrics = bound.pipeline_metrics(pipeline_id).unwrap();
+        assert_eq!(metrics.output_timers.len(), 1);
+        assert_eq!(metrics.output_timers[0].count(), 2);
+        assert!(metrics.output_timers[0].sum() < 5.0);
     }
 
     #[test]

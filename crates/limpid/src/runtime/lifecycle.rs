@@ -285,8 +285,8 @@ impl Runtime {
         &self.config_file
     }
 
-    pub fn compiled_config(&self) -> CompiledConfig {
-        self.compiled_config.clone()
+    pub(crate) fn blueprint(&self) -> Arc<crate::pipeline::RuntimeBlueprint> {
+        Arc::clone(&self.blueprint)
     }
 
     pub async fn shutdown(self) {

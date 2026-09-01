@@ -579,7 +579,14 @@ pub fn register_user_functions(
     reg: &mut FunctionRegistry,
     config: &crate::pipeline::CompiledConfig,
 ) {
-    for fn_def in config.functions.values() {
+    register_user_function_defs(reg, config.functions.values());
+}
+
+pub(crate) fn register_user_function_defs<'a>(
+    reg: &mut FunctionRegistry,
+    definitions: impl IntoIterator<Item = &'a FunctionDef>,
+) {
+    for fn_def in definitions {
         reg.register_user_function(fn_def.clone());
     }
 }

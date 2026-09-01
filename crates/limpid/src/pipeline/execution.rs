@@ -1,4 +1,31 @@
-use super::*;
+use anyhow::{Result, bail};
+use thiserror::Error;
+
+use crate::dsl::arena::EventArena;
+use crate::dsl::eval::{eval_expr, value_to_string};
+use crate::event::{BorrowedEvent, OwnedEvent, QueuedEvent};
+use crate::functions::FunctionRegistry;
+use crate::tap::TapRegistry;
+use tracing::trace;
+
+#[derive(Debug, Error)]
+enum ProcessError {
+    #[error("process failed: {0}")]
+    Failed(String),
+}
+
+impl ProcessError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Failed(message) => message,
+        }
+    }
+}
+
+enum ExecResult<'bump> {
+    Continue(BorrowedEvent<'bump>),
+    Dropped,
+}
 
 #[cfg(test)]
 std::thread_local! {
@@ -18,7 +45,7 @@ fn process_event_from_owned_calls_for_testing() -> usize {
 }
 
 /// Trace entry for --test mode output.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TraceEntry {
     pub stage: String,
     pub label: String,
@@ -275,173 +302,52 @@ pub struct PipelineRunResult {
     pub errored: Vec<ErroredEventContext>,
 }
 
-///
-/// Only user-defined `def process { ... }` blocks resolve here.
-/// Built-in processes were removed in v0.3.0 — former native
-/// transforms are now DSL functions (`syslog.parse`, `parse_json`,
-/// `regex_replace`, …) invoked via expression statements.
-struct DslProcessRegistry<'a> {
-    processes: &'a HashMap<String, ProcessDef>,
-    funcs: &'a FunctionRegistry,
-    tap: Option<&'a TapRegistry>,
-    process_metrics: Option<&'a PipelineProcessMetrics>,
-}
-
-impl<'a> DslProcessRegistry<'a> {
-    fn new(
-        processes: &'a HashMap<String, ProcessDef>,
-        funcs: &'a FunctionRegistry,
-        tap: Option<&'a TapRegistry>,
-        process_metrics: Option<&'a PipelineProcessMetrics>,
-    ) -> Self {
-        Self {
-            processes,
-            funcs,
-            tap,
-            process_metrics,
-        }
-    }
-
-    fn call_node<'bump>(
-        &self,
-        metric_token: Option<usize>,
-        name: &str,
-        event: BorrowedEvent<'bump>,
-        arena: &'bump EventArena<'bump>,
-    ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
-        let metric_node = match (self.process_metrics, metric_token) {
-            (Some(metrics), Some(token)) => Some(metrics.select_node(token).ok_or_else(|| {
-                ProcessError::Failed("compiled process metric token is out of range".to_owned())
-            })?),
-            (Some(_), None) => {
-                return Err(ProcessError::Failed(
-                    "compiled process metric token is missing".to_owned(),
-                ));
-            }
-            (None, _) => None,
-        };
-        if let Some(node) = metric_node {
-            node.counters.start();
-        }
-
-        let result = if let Some(process_def) = self.processes.get(name) {
-            trace!("process '{}' (user-defined): executing", name);
-            match metric_node {
-                Some(node) => exec_process_body_with_metric_plan(
-                    &process_def.body,
-                    &node.body_plan,
-                    event,
-                    self,
-                    self.funcs,
-                    arena,
-                ),
-                None => exec_process_body(&process_def.body, event, self, self.funcs, arena),
-            }
-            .map_err(|error| ProcessError::Failed(error.to_string()))
-        } else {
-            tracing::warn!(
-                "unknown process '{}', passing event through unchanged",
-                name
-            );
-            Ok(ExecResult::Continue(event))
-        };
-
-        match result {
-            Ok(ExecResult::Continue(event)) => {
-                if let Some(node) = metric_node {
-                    node.counters.continued();
-                }
-                trace!("process '{}': ok", name);
-                self.emit_tap(name, &event);
-                Ok(Some(event))
-            }
-            Ok(ExecResult::Dropped) => {
-                if let Some(node) = metric_node {
-                    node.counters.dropped();
-                }
-                trace!("process '{}': dropped", name);
-                Ok(None)
-            }
-            Err(error) => {
-                if let Some(node) = metric_node {
-                    node.counters.errored();
-                }
-                Err(error)
-            }
-        }
-    }
-}
-
-impl ProcessRegistry for DslProcessRegistry<'_> {
-    fn call<'bump>(
-        &self,
-        name: &str,
-        event: BorrowedEvent<'bump>,
-        arena: &'bump EventArena<'bump>,
-    ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
-        self.call_node(None, name, event, arena)
-    }
-}
-
-impl CompiledProcessRegistry for DslProcessRegistry<'_> {
-    fn call_pre_resolved<'bump>(
-        &self,
-        name: &str,
-        metric_token: usize,
-        event: BorrowedEvent<'bump>,
-        arena: &'bump EventArena<'bump>,
-    ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
-        self.call_node(Some(metric_token), name, event, arena)
-    }
-}
-
-impl DslProcessRegistry<'_> {
-    fn emit_tap<'bump>(&self, process_name: &str, event: &BorrowedEvent<'bump>) {
-        if let Some(tap) = self.tap {
-            let key = format!("process {}", process_name);
-            // Avoid the per-event `to_owned()` workspace clone unless a
-            // tap subscriber is actually attached. `is_subscribed`
-            // collapses to a single relaxed atomic load on the hot path
-            // (no lock when the registry isn't being mutated).
-            if tap.is_subscribed(&key) {
-                let owned = event.to_owned();
-                tap.try_emit(&key, &owned);
-            }
-        }
-    }
-}
-
-/// Run a single event through a pipeline definition.
-///
-/// After this change the executor never resolves an output sink — the `output`
-/// statement just enqueues the owned event, and render happens
-/// consumer-side inside each sink's `Output::consume`. The previous
-/// `output_sinks: &HashMap<String, Arc<dyn Output>>` parameter is gone
-/// as part of that cleanup.
-///
-/// `trace` collects a human-readable execution trace for
-/// `--test-pipeline` (see `main.rs::run_test`). Pass `None` on the
-/// daemon hot path (`runtime/pipeline_worker.rs::run_pipeline_with_outputs_inner`) — every
-/// trace push site (and the `format!`/`to_string` calls that build
-/// its fields) is gated on `trace.is_some()` so no throwaway
-/// formatting work runs when nothing will read it. The collected
-/// entries live in the caller's `Vec`; `PipelineRunResult` does not
-/// carry them.
+/// Compatibility facade for callers that hold a compiled config and pipeline
+/// definition. Execution still goes through the same sealed IR and normal
+/// registry as the daemon and `--test-pipeline`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn run_pipeline(
-    pipeline: &PipelineDef,
+    pipeline: &crate::dsl::ast::PipelineDef,
     event: &OwnedEvent,
-    config: &CompiledConfig,
+    config: &super::CompiledConfig,
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
     trace: Option<&mut Vec<TraceEntry>>,
     output_capture: OutputCapturePolicy<'_>,
     bump: &mut bumpalo::Bump,
 ) -> Result<PipelineRunResult> {
-    run_pipeline_at(
-        pipeline,
+    let blueprint = super::blueprint::compile_runtime_blueprint(config)?;
+    let registry = crate::metrics::Registry::new();
+    let bound = blueprint.bind(&registry)?;
+    run_pipeline_blueprint(
+        &bound,
+        &pipeline.name,
         event,
-        config,
+        funcs,
+        tap,
+        trace,
+        output_capture,
+        bump,
+    )
+}
+
+/// Execute the sealed single IR with its per-start metric binding.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_pipeline_blueprint(
+    bound: &super::blueprint::BoundRuntimeBlueprint,
+    pipeline_name: &str,
+    event: &OwnedEvent,
+    funcs: &FunctionRegistry,
+    tap: Option<&TapRegistry>,
+    trace: Option<&mut Vec<TraceEntry>>,
+    output_capture: OutputCapturePolicy<'_>,
+    bump: &mut bumpalo::Bump,
+) -> Result<PipelineRunResult> {
+    run_pipeline_blueprint_at(
+        bound,
+        pipeline_name,
+        event,
         funcs,
         tap,
         trace,
@@ -452,10 +358,10 @@ pub fn run_pipeline(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_pipeline_at(
-    pipeline: &PipelineDef,
+pub(crate) fn run_pipeline_blueprint_at(
+    bound: &super::blueprint::BoundRuntimeBlueprint,
+    pipeline_name: &str,
     event: &OwnedEvent,
-    config: &CompiledConfig,
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
     trace: Option<&mut Vec<TraceEntry>>,
@@ -463,69 +369,75 @@ pub(crate) fn run_pipeline_at(
     bump: &mut bumpalo::Bump,
     dispatch_started_at: crate::time::UnixNanos,
 ) -> Result<PipelineRunResult> {
-    run_pipeline_inner(
-        pipeline,
+    let pipeline_id = bound
+        .blueprint
+        .pipeline_id(pipeline_name)
+        .ok_or_else(|| anyhow::anyhow!("pipeline '{pipeline_name}' is not in the blueprint"))?;
+    run_pipeline_blueprint_by_id_at(
+        bound,
+        pipeline_id,
         event,
-        config,
         funcs,
         tap,
         trace,
         output_capture,
         bump,
-        None,
         dispatch_started_at,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_pipeline_with_process_metrics_at(
-    pipeline: &PipelineDef,
+pub(crate) fn run_pipeline_blueprint_by_id_at(
+    bound: &super::blueprint::BoundRuntimeBlueprint,
+    pipeline_id: super::blueprint::PipelineId,
     event: &OwnedEvent,
-    config: &CompiledConfig,
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
     trace: Option<&mut Vec<TraceEntry>>,
     output_capture: OutputCapturePolicy<'_>,
     bump: &mut bumpalo::Bump,
-    process_metrics: &PipelineProcessMetrics,
     dispatch_started_at: crate::time::UnixNanos,
 ) -> Result<PipelineRunResult> {
-    run_pipeline_inner(
+    let pipeline = bound
+        .blueprint
+        .pipeline_by_id(pipeline_id)
+        .ok_or_else(|| anyhow::anyhow!("pipeline id is not in the blueprint"))?;
+    run_pipeline_blueprint_resolved_at(
+        bound,
         pipeline,
         event,
-        config,
         funcs,
         tap,
         trace,
         output_capture,
         bump,
-        Some(process_metrics),
         dispatch_started_at,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_pipeline_inner(
-    pipeline: &PipelineDef,
+pub(crate) fn run_pipeline_blueprint_resolved_at(
+    bound: &super::blueprint::BoundRuntimeBlueprint,
+    pipeline: &super::blueprint::PipelineBlueprint,
     event: &OwnedEvent,
-    config: &CompiledConfig,
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
     trace: Option<&mut Vec<TraceEntry>>,
     output_capture: OutputCapturePolicy<'_>,
     bump: &mut bumpalo::Bump,
-    process_metrics: Option<&PipelineProcessMetrics>,
     dispatch_started_at: crate::time::UnixNanos,
 ) -> Result<PipelineRunResult> {
-    let registry = DslProcessRegistry::new(&config.processes, funcs, tap, process_metrics);
+    let pipeline_name = pipeline.name.as_str();
+    let metrics = bound
+        .pipeline_metrics_resolved(pipeline)
+        .ok_or_else(|| anyhow::anyhow!("pipeline '{pipeline_name}' metric binding is missing"))?;
+    if metrics.process_counters.len() != pipeline.metric_nodes.len()
+        || metrics.output_timers.len() != pipeline.output_timers.len()
+    {
+        bail!("pipeline '{pipeline_name}' metric binding shape mismatch");
+    }
+
     let mut trace = trace;
-    let mut outputs = Vec::new();
-
-    // Log initial state — formatted from `event` while it's still in
-    // owned form, before we view it into the arena. The `format!` /
-    // `from_utf8_lossy` here only run when a caller actually wants a
-    // trace (--test-pipeline); the daemon hot path passes `None` and
-    // skips this entirely.
     if let Some(trace) = trace.as_mut() {
         trace.push(TraceEntry {
             stage: "input".into(),
@@ -534,43 +446,32 @@ fn run_pipeline_inner(
         });
     }
 
-    // Per-event arena. The entire `Value` tree built during execution
-    // (HashLits, parser outputs, workspace mutations) lives in `bump`
-    // and is reset to offset zero by the caller after this function
-    // returns — see `runtime::run_pipeline_workers`. The `Bump` itself
-    // is owned by the per-input pipeline-worker task and reused
-    // across events, so the underlying chunk-group is malloc'd once
-    // at task startup and never again on the hot path. This
-    // eliminates the xzm-zone-lock contention that capped
-    // multi-pipeline scaling at ~2.4× / 4 cores on v0.6.0 (where
-    // every event called `Bump::new` and the system allocator
-    // serialised concurrent malloc/free across pipelines).
     let arena = EventArena::new(bump);
     let bevent = event.view_in(&arena);
-
-    let mut errored: Vec<ErroredEventContext> = Vec::new();
-    let exec_ctx = PipelineExecCtx {
-        pipeline_name: &pipeline.name,
+    let process_registry = IrProcessRegistry {
+        blueprint: &bound.blueprint,
+        pipeline,
+        metrics,
+        funcs,
+        tap,
+    };
+    let mut outputs = Vec::new();
+    let mut errored = Vec::new();
+    let ctx = IrPipelineExecCtx {
+        pipeline_name,
         original_event: event,
-        registry: &registry,
+        process_registry: &process_registry,
         funcs,
         arena: &arena,
         output_capture,
         dispatch_started_at,
     };
-    let mut exec_out = PipelineExecOut {
+    let mut out = PipelineExecOut {
         trace,
         outputs: &mut outputs,
         errored: &mut errored,
     };
-    let (_, termination) = exec_pipeline_body(
-        &pipeline.body,
-        process_metrics.map(|metrics| metrics.statements.as_slice()),
-        bevent,
-        &exec_ctx,
-        &mut exec_out,
-    )?;
-
+    let (_, termination) = exec_ir_pipeline_body(&pipeline.code, bevent, &ctx, &mut out)?;
     let had_outputs = !outputs.is_empty();
     Ok(PipelineRunResult {
         outputs,
@@ -578,6 +479,527 @@ fn run_pipeline_inner(
         termination,
         errored,
     })
+}
+
+struct IrProcessRegistry<'a> {
+    blueprint: &'a super::blueprint::RuntimeBlueprint,
+    pipeline: &'a super::blueprint::PipelineBlueprint,
+    metrics: &'a super::blueprint::BoundPipelineMetrics,
+    funcs: &'a FunctionRegistry,
+    tap: Option<&'a TapRegistry>,
+}
+
+impl IrProcessRegistry<'_> {
+    fn call<'bump>(
+        &self,
+        target: super::blueprint::ProcessTarget,
+        process_name: &str,
+        metric_node_id: super::blueprint::MetricNodeId,
+        event: BorrowedEvent<'bump>,
+        arena: &'bump EventArena<'bump>,
+        site_kind: super::blueprint::SiteKind,
+    ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
+        let node = self
+            .pipeline
+            .metric_nodes
+            .get(metric_node_id.index())
+            .ok_or_else(|| ProcessError::Failed("metric node id is out of range".to_owned()))?;
+        if node.target != target {
+            return Err(ProcessError::Failed(
+                "process body and metric node identity mismatch".to_owned(),
+            ));
+        }
+        let counters = self
+            .metrics
+            .process_counters
+            .get(metric_node_id.index())
+            .ok_or_else(|| ProcessError::Failed("process counter id is out of range".to_owned()))?;
+        counters.start();
+        let result = match target {
+            super::blueprint::ProcessTarget::Known(body_id) => {
+                let body = self
+                    .blueprint
+                    .process_bodies()
+                    .get(body_id.index())
+                    .ok_or_else(|| {
+                        ProcessError::Failed("process body id is out of range".to_owned())
+                    })?;
+                if site_kind == super::blueprint::SiteKind::Named {
+                    trace!("process '{}' (user-defined): executing", process_name);
+                }
+                exec_ir_process_body(&body.code, metric_node_id, event, self, self.funcs, arena)
+                    .map_err(|error| ProcessError::Failed(error.to_string()))
+            }
+            super::blueprint::ProcessTarget::Unknown => {
+                tracing::warn!(
+                    "unknown process '{}', passing event through unchanged",
+                    process_name
+                );
+                Ok(ExecResult::Continue(event))
+            }
+        };
+        match result {
+            Ok(ExecResult::Continue(event)) => {
+                counters.continued();
+                if site_kind == super::blueprint::SiteKind::Named {
+                    trace!("process '{}': ok", process_name);
+                    self.emit_tap(process_name, &event);
+                }
+                Ok(Some(event))
+            }
+            Ok(ExecResult::Dropped) => {
+                counters.dropped();
+                if site_kind == super::blueprint::SiteKind::Named {
+                    trace!("process '{}': dropped", process_name);
+                }
+                Ok(None)
+            }
+            Err(error) => {
+                counters.errored();
+                Err(error)
+            }
+        }
+    }
+
+    fn emit_tap<'bump>(&self, process_name: &str, event: &BorrowedEvent<'bump>) {
+        if let Some(tap) = self.tap {
+            let key = format!("process {process_name}");
+            if tap.is_subscribed(&key) {
+                tap.try_emit(&key, &event.to_owned());
+            }
+        }
+    }
+}
+
+fn exec_ir_process_body<'bump>(
+    code: &[super::blueprint::ProcessCode],
+    metric_node_id: super::blueprint::MetricNodeId,
+    event: BorrowedEvent<'bump>,
+    registry: &IrProcessRegistry<'_>,
+    funcs: &FunctionRegistry,
+    arena: &'bump EventArena<'bump>,
+) -> Result<ExecResult<'bump>> {
+    let mut scope = crate::dsl::eval::LocalScope::new();
+    exec_ir_process_code(
+        code,
+        metric_node_id,
+        event,
+        registry,
+        funcs,
+        &mut scope,
+        arena,
+    )
+}
+
+fn exec_ir_process_code<'bump>(
+    code: &[super::blueprint::ProcessCode],
+    metric_node_id: super::blueprint::MetricNodeId,
+    mut event: BorrowedEvent<'bump>,
+    registry: &IrProcessRegistry<'_>,
+    funcs: &FunctionRegistry,
+    scope: &mut crate::dsl::eval::LocalScope<'bump>,
+    arena: &'bump EventArena<'bump>,
+) -> Result<ExecResult<'bump>> {
+    use super::blueprint::ProcessCode;
+    for statement in code {
+        match statement {
+            ProcessCode::Assign(target, expression) => {
+                let value = crate::dsl::eval::eval_expr_with_scope(
+                    expression, &event, funcs, scope, arena,
+                )?;
+                crate::dsl::exec::apply_assign(&mut event, target, value, arena)?;
+            }
+            ProcessCode::LetBinding(name, expression) => {
+                let value = crate::dsl::eval::eval_expr_with_scope(
+                    expression, &event, funcs, scope, arena,
+                )?;
+                scope.bind(name, value);
+            }
+            ProcessCode::Call { name, edge_slot } => {
+                let current_node = registry
+                    .pipeline
+                    .metric_nodes
+                    .get(metric_node_id.index())
+                    .ok_or_else(|| anyhow::anyhow!("metric node id is out of range"))?;
+                let super::blueprint::ProcessTarget::Known(current_body) = current_node.target
+                else {
+                    bail!("unknown process metric node cannot execute a process body");
+                };
+                let body = registry
+                    .blueprint
+                    .process_bodies()
+                    .get(current_body.index())
+                    .ok_or_else(|| anyhow::anyhow!("process body id is out of range"))?;
+                let edge = body
+                    .edges
+                    .get(edge_slot.index())
+                    .ok_or_else(|| anyhow::anyhow!("process edge slot is out of range"))?;
+                if edge.name != *name {
+                    bail!("process edge identity mismatch");
+                }
+                let child_node = *current_node
+                    .children
+                    .get(edge_slot.index())
+                    .ok_or_else(|| anyhow::anyhow!("metric child slot is out of range"))?;
+                match registry.call(
+                    edge.target,
+                    &edge.name,
+                    child_node,
+                    event,
+                    arena,
+                    super::blueprint::SiteKind::Named,
+                )? {
+                    Some(next) => event = next,
+                    None => return Ok(ExecResult::Dropped),
+                }
+            }
+            ProcessCode::Drop => return Ok(ExecResult::Dropped),
+            ProcessCode::Error(expression) => {
+                let message = match expression {
+                    Some(expression) => value_to_string(&crate::dsl::eval::eval_expr_with_scope(
+                        expression, &event, funcs, scope, arena,
+                    )?),
+                    None => "explicit error routing".to_owned(),
+                };
+                bail!(message);
+            }
+            ProcessCode::If {
+                branches,
+                else_body,
+            } => {
+                let mut selected = None;
+                for (condition, body) in branches {
+                    if crate::dsl::eval::eval_expr_with_scope(
+                        condition, &event, funcs, scope, arena,
+                    )?
+                    .is_truthy()
+                    {
+                        selected = Some(body.as_slice());
+                        break;
+                    }
+                }
+                if let Some(body) = selected.or(else_body.as_deref()) {
+                    match exec_ir_process_code(
+                        body,
+                        metric_node_id,
+                        event,
+                        registry,
+                        funcs,
+                        scope,
+                        arena,
+                    )? {
+                        ExecResult::Continue(next) => event = next,
+                        ExecResult::Dropped => return Ok(ExecResult::Dropped),
+                    }
+                }
+            }
+            ProcessCode::Switch { discriminant, arms } => {
+                let value = crate::dsl::eval::eval_expr_with_scope(
+                    discriminant,
+                    &event,
+                    funcs,
+                    scope,
+                    arena,
+                )?;
+                let mut selected = None;
+                for (pattern, body) in arms {
+                    match pattern {
+                        Some(pattern)
+                            if crate::dsl::eval::values_match(
+                                &value,
+                                &crate::dsl::eval::eval_expr_with_scope(
+                                    pattern, &event, funcs, scope, arena,
+                                )?,
+                            ) =>
+                        {
+                            selected = Some(body.as_slice());
+                            break;
+                        }
+                        None => {
+                            selected = Some(body.as_slice());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(body) = selected {
+                    match exec_ir_process_code(
+                        body,
+                        metric_node_id,
+                        event,
+                        registry,
+                        funcs,
+                        scope,
+                        arena,
+                    )? {
+                        ExecResult::Continue(next) => event = next,
+                        ExecResult::Dropped => return Ok(ExecResult::Dropped),
+                    }
+                }
+            }
+            ProcessCode::TryCatch {
+                try_body,
+                catch_body,
+            } => {
+                let event_backup = event.snapshot_in(arena);
+                let scope_backup = scope.clone();
+                match exec_ir_process_code(
+                    try_body,
+                    metric_node_id,
+                    event,
+                    registry,
+                    funcs,
+                    scope,
+                    arena,
+                ) {
+                    Ok(ExecResult::Continue(next)) => event = next,
+                    Ok(ExecResult::Dropped) => return Ok(ExecResult::Dropped),
+                    Err(error) => {
+                        *scope = scope_backup;
+                        let mut recovered = event_backup;
+                        let message = arena.alloc_str(&error.to_string());
+                        recovered.workspace_set_str(
+                            arena,
+                            "_error",
+                            crate::dsl::value::Value::String(message),
+                        );
+                        match exec_ir_process_code(
+                            catch_body,
+                            metric_node_id,
+                            recovered,
+                            registry,
+                            funcs,
+                            scope,
+                            arena,
+                        )? {
+                            ExecResult::Continue(mut next) => {
+                                next.workspace_remove("_error");
+                                event = next;
+                            }
+                            ExecResult::Dropped => return Ok(ExecResult::Dropped),
+                        }
+                    }
+                }
+            }
+            ProcessCode::Expr(expression) => {
+                let value = crate::dsl::eval::eval_expr_with_scope(
+                    expression, &event, funcs, scope, arena,
+                )?;
+                match value {
+                    crate::dsl::value::Value::Object(entries) => {
+                        for (key, value) in entries {
+                            event.workspace_set(key, *value);
+                        }
+                    }
+                    crate::dsl::value::Value::Null => {}
+                    other => bail!(
+                        "bare expression statement must return Object or Null; got {}",
+                        other.type_name()
+                    ),
+                }
+            }
+        }
+    }
+    Ok(ExecResult::Continue(event))
+}
+
+struct IrPipelineExecCtx<'a, 'bump: 'a> {
+    pipeline_name: &'a str,
+    original_event: &'a OwnedEvent,
+    process_registry: &'a IrProcessRegistry<'a>,
+    funcs: &'a FunctionRegistry,
+    arena: &'bump EventArena<'bump>,
+    output_capture: OutputCapturePolicy<'a>,
+    dispatch_started_at: crate::time::UnixNanos,
+}
+
+fn exec_ir_pipeline_body<'bump>(
+    code: &[super::blueprint::PipelineCode],
+    mut event: BorrowedEvent<'bump>,
+    ctx: &IrPipelineExecCtx<'_, 'bump>,
+    out: &mut PipelineExecOut<'_>,
+) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
+    use super::blueprint::PipelineCode;
+    for statement in code {
+        match statement {
+            PipelineCode::Input(_) => {}
+            PipelineCode::ProcessChain(sites) => {
+                for site in sites {
+                    match ctx.process_registry.call(
+                        super::blueprint::ProcessTarget::Known(site.body),
+                        &site.name,
+                        site.metric_node,
+                        event,
+                        ctx.arena,
+                        site.kind,
+                    ) {
+                        Ok(Some(next)) => {
+                            out.push_trace(|| TraceEntry {
+                                stage: "process".into(),
+                                label: site.name.clone(),
+                                detail: "ok".into(),
+                            });
+                            event = next;
+                        }
+                        Ok(None) => {
+                            out.push_trace(|| TraceEntry {
+                                stage: "process".into(),
+                                label: site.name.clone(),
+                                detail: "dropped".into(),
+                            });
+                            return Ok((None, PipelineTermination::Dropped));
+                        }
+                        Err(error) => {
+                            let reason = match site.kind {
+                                super::blueprint::SiteKind::Named => {
+                                    tracing::warn!(
+                                        "process '{}': {} — event routed to error_log",
+                                        site.name,
+                                        error
+                                    );
+                                    error.to_string()
+                                }
+                                super::blueprint::SiteKind::Inline => {
+                                    let reason = error.into_message();
+                                    tracing::warn!(
+                                        "inline process: {} — event routed to error_log",
+                                        reason
+                                    );
+                                    reason
+                                }
+                            };
+                            out.push_trace(|| TraceEntry {
+                                stage: "process".into(),
+                                label: site.name.clone(),
+                                detail: format!("error: {reason} (event → error_log)"),
+                            });
+                            out.errored.push(ErroredEventContext::Process {
+                                timestamp: chrono::Utc::now(),
+                                pipeline: ctx.pipeline_name.to_owned(),
+                                site: site.name.clone(),
+                                reason,
+                                event: ProcessEvent::from_owned(ctx.original_event),
+                            });
+                            return Ok((None, PipelineTermination::Errored));
+                        }
+                    }
+                }
+            }
+            PipelineCode::Output { name, timer_slot } => {
+                trace!(target: "limpid::pipeline", "output → {}", name);
+                out.push_trace(|| TraceEntry {
+                    stage: "output".into(),
+                    label: format!("→ {name}"),
+                    detail: String::new(),
+                });
+                let snapshot = if ctx.output_capture.should_capture_workspace(name) {
+                    event.to_owned()
+                } else {
+                    event.to_owned_without_workspace()
+                };
+                let emitted_at = crate::time::UnixNanos::now();
+                ctx.process_registry
+                    .metrics
+                    .output_timers
+                    .get(timer_slot.index())
+                    .ok_or_else(|| anyhow::anyhow!("output timer slot is out of range"))?
+                    .observe_between(ctx.dispatch_started_at, emitted_at);
+                out.outputs
+                    .push((name.clone(), QueuedEvent::new(snapshot, emitted_at)));
+            }
+            PipelineCode::Drop => {
+                trace!(target: "limpid::pipeline", "drop");
+                out.push_trace(|| TraceEntry {
+                    stage: "drop".into(),
+                    label: String::new(),
+                    detail: String::new(),
+                });
+                return Ok((None, PipelineTermination::Dropped));
+            }
+            PipelineCode::Finish => {
+                trace!(target: "limpid::pipeline", "finish");
+                out.push_trace(|| TraceEntry {
+                    stage: "finish".into(),
+                    label: String::new(),
+                    detail: String::new(),
+                });
+                return Ok((None, PipelineTermination::Finished));
+            }
+            PipelineCode::Error(expression) => {
+                let message = match expression {
+                    Some(expression) => {
+                        value_to_string(&eval_expr(expression, &event, ctx.funcs, ctx.arena)?)
+                    }
+                    None => "explicit error routing".to_owned(),
+                };
+                tracing::warn!(
+                    "pipeline '{}': error '{}' — event routed to error_log",
+                    ctx.pipeline_name,
+                    message
+                );
+                out.push_trace(|| TraceEntry {
+                    stage: "error".into(),
+                    label: message.clone(),
+                    detail: "event → error_log".into(),
+                });
+                out.errored.push(ErroredEventContext::Process {
+                    timestamp: chrono::Utc::now(),
+                    pipeline: ctx.pipeline_name.to_owned(),
+                    site: "(pipeline)".to_owned(),
+                    reason: message,
+                    event: ProcessEvent::from_owned(ctx.original_event),
+                });
+                return Ok((None, PipelineTermination::Errored));
+            }
+            PipelineCode::If {
+                branches,
+                else_body,
+            } => {
+                let mut selected = None;
+                for (condition, body) in branches {
+                    if eval_expr(condition, &event, ctx.funcs, ctx.arena)?.is_truthy() {
+                        selected = Some(body.as_slice());
+                        break;
+                    }
+                }
+                if let Some(body) = selected.or(else_body.as_deref()) {
+                    match exec_ir_pipeline_body(body, event, ctx, out)? {
+                        (Some(next), _) => event = next,
+                        (None, termination) => return Ok((None, termination)),
+                    }
+                }
+            }
+            PipelineCode::Switch { discriminant, arms } => {
+                let value = eval_expr(discriminant, &event, ctx.funcs, ctx.arena)?;
+                let mut selected = None;
+                for (pattern, body) in arms {
+                    match pattern {
+                        Some(pattern)
+                            if crate::dsl::eval::values_match(
+                                &value,
+                                &eval_expr(pattern, &event, ctx.funcs, ctx.arena)?,
+                            ) =>
+                        {
+                            selected = Some(body.as_slice());
+                            break;
+                        }
+                        None => {
+                            selected = Some(body.as_slice());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(body) = selected {
+                    match exec_ir_pipeline_body(body, event, ctx, out)? {
+                        (Some(next), _) => event = next,
+                        (None, termination) => return Ok((None, termination)),
+                    }
+                }
+            }
+        }
+    }
+    Ok((Some(event), PipelineTermination::Finished))
 }
 
 /// Whether each per-output `OwnedEvent` snapshot pushed at
@@ -635,36 +1057,6 @@ impl<'a> OutputCapturePolicy<'a> {
     }
 }
 
-/// Immutable shared context threaded through the pipeline executor.
-///
-/// `pipeline_name` is here purely so a process-runtime error can
-/// populate the [`ErroredEventContext`] surfaced in [`PipelineExecOut::errored`].
-///
-/// `original_event` is the immutable input header used to build a
-/// [`ProcessEvent`] only when execution fails. Process evaluation may mutate
-/// the arena-side workspace and egress, but key / source / received_at /
-/// ingress / LTP history remain the original input contract; borrowing that
-/// header here keeps the successful process path free of snapshots, refcount
-/// bumps, and bump-arena allocations.
-///
-/// `arena` is the per-event bump arena — the same one
-/// `run_pipeline` opened on the stack. The reference itself is held at
-/// `'bump` so closures and primitive impls allocating into it can
-/// produce values that live for the rest of the pipeline body.
-///
-/// `output_capture` decides per output whether the snapshot pushed
-/// to `PipelineExecOut::outputs` carries the workspace — see
-/// [`OutputCapturePolicy`].
-struct PipelineExecCtx<'a, 'bump: 'a> {
-    pipeline_name: &'a str,
-    original_event: &'a OwnedEvent,
-    registry: &'a DslProcessRegistry<'a>,
-    funcs: &'a FunctionRegistry,
-    arena: &'bump EventArena<'bump>,
-    output_capture: OutputCapturePolicy<'a>,
-    dispatch_started_at: crate::time::UnixNanos,
-}
-
 /// Mutable accumulators threaded through the pipeline executor:
 /// trace entries, output queue pushes, and the optional errored event
 /// context. Bundled together to keep the recursive helpers under
@@ -699,371 +1091,94 @@ impl PipelineExecOut<'_> {
     }
 }
 
-/// Execute a pipeline body (sequence of pipeline statements).
-/// Returns (remaining event if any, how the pipeline terminated).
-fn exec_pipeline_body<'bump>(
-    stmts: &[PipelineStatement],
-    metric_stmts: Option<&[PipelineMetricStatement]>,
-    mut event: BorrowedEvent<'bump>,
-    ctx: &PipelineExecCtx<'_, 'bump>,
-    out: &mut PipelineExecOut<'_>,
-) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
-    if ctx.registry.process_metrics.is_some() {
-        let metric_stmts = metric_stmts
-            .ok_or_else(|| anyhow::anyhow!("compiled pipeline metric plan is missing"))?;
-        if metric_stmts.len() != stmts.len() {
-            bail!("compiled pipeline metric plan length does not match the pipeline body");
-        }
-    }
-    for (index, stmt) in stmts.iter().enumerate() {
-        let metric_stmt = match ctx.registry.process_metrics {
-            Some(_) => Some(
-                metric_stmts
-                    .and_then(|metrics| metrics.get(index))
-                    .ok_or_else(|| anyhow::anyhow!("compiled pipeline metric entry is missing"))?,
-            ),
-            None => None,
-        };
-        match exec_pipeline_stmt(stmt, metric_stmt, event, ctx, out)? {
-            (Some(e), _) => event = e,
-            (None, term) => return Ok((None, term)),
-        }
-    }
-    Ok((Some(event), PipelineTermination::Finished))
-}
-
-fn exec_pipeline_stmt<'bump>(
-    stmt: &PipelineStatement,
-    metric_stmt: Option<&PipelineMetricStatement>,
-    event: BorrowedEvent<'bump>,
-    ctx: &PipelineExecCtx<'_, 'bump>,
-    out: &mut PipelineExecOut<'_>,
-) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
-    let cont = |event| Ok((Some(event), PipelineTermination::Finished));
-    let dropped = || Ok((None, PipelineTermination::Dropped));
-    let finished = || Ok((None, PipelineTermination::Finished));
-
-    match stmt {
-        PipelineStatement::Input(_) => cont(event),
-
-        PipelineStatement::Error(msg_expr) => {
-            // Render the optional message and route the event to the
-            // error_log via PipelineTermination::Errored, mirroring how
-            // a process-level Err lands in the DLQ.
-            let msg = match msg_expr {
-                Some(e) => value_to_string(&eval_expr(e, &event, ctx.funcs, ctx.arena)?),
-                None => "explicit error routing".to_string(),
-            };
-            tracing::warn!(
-                "pipeline '{}': error '{}' — event routed to error_log",
-                ctx.pipeline_name,
-                msg
-            );
-            out.push_trace(|| TraceEntry {
-                stage: "error".into(),
-                label: msg.clone(),
-                detail: "event → error_log".into(),
-            });
-            out.errored.push(ErroredEventContext::Process {
-                timestamp: chrono::Utc::now(),
-                pipeline: ctx.pipeline_name.to_string(),
-                site: "(pipeline)".to_string(),
-                reason: msg,
-                event: ProcessEvent::from_owned(ctx.original_event),
-            });
-            Ok((None, PipelineTermination::Errored))
-        }
-
-        PipelineStatement::ProcessChain(chain) => {
-            let mut current = event;
-            let metric_nodes = match metric_stmt {
-                Some(PipelineMetricStatement::ProcessChain(nodes)) => Some(nodes.as_slice()),
-                _ => None,
-            };
-            for (index, element) in chain.iter().enumerate() {
-                let metric_token = metric_nodes.and_then(|nodes| nodes.get(index)).copied();
-                match element {
-                    ProcessChainElement::Named(name) => {
-                        let call_result = match ctx.registry.process_metrics {
-                            Some(_) => {
-                                let token = metric_token.ok_or_else(|| {
-                                    anyhow::anyhow!("compiled root process token is missing")
-                                })?;
-                                ctx.registry
-                                    .call_pre_resolved(name, token, current, ctx.arena)
-                            }
-                            None => ctx.registry.call(name, current, ctx.arena),
-                        };
-                        match call_result {
-                            Ok(Some(e)) => {
-                                out.push_trace(|| TraceEntry {
-                                    stage: "process".into(),
-                                    label: name.clone(),
-                                    detail: "ok".into(),
-                                });
-                                current = e;
-                            }
-                            Ok(None) => {
-                                out.push_trace(|| TraceEntry {
-                                    stage: "process".into(),
-                                    label: name.clone(),
-                                    detail: "dropped".into(),
-                                });
-                                return dropped();
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "process '{}': {} — event routed to error_log",
-                                    name,
-                                    e
-                                );
-                                out.push_trace(|| TraceEntry {
-                                    stage: "process".into(),
-                                    label: name.clone(),
-                                    detail: format!("error: {} (event → error_log)", e),
-                                });
-                                out.errored.push(ErroredEventContext::Process {
-                                    timestamp: chrono::Utc::now(),
-                                    pipeline: ctx.pipeline_name.to_string(),
-                                    site: name.clone(),
-                                    reason: e.to_string(),
-                                    event: ProcessEvent::from_owned(ctx.original_event),
-                                });
-                                return Ok((None, PipelineTermination::Errored));
-                            }
-                        }
-                    }
-                    ProcessChainElement::Inline(body) => {
-                        let metric_node = match ctx.registry.process_metrics {
-                            Some(metrics) => {
-                                let token = metric_token.ok_or_else(|| {
-                                    anyhow::anyhow!("compiled inline process token is missing")
-                                })?;
-                                Some(metrics.select_node(token).ok_or_else(|| {
-                                    anyhow::anyhow!("compiled inline process token is out of range")
-                                })?)
-                            }
-                            None => None,
-                        };
-                        if let Some(node) = metric_node {
-                            node.counters.start();
-                        }
-                        let result = match metric_node {
-                            Some(node) => exec_process_body_with_metric_plan(
-                                body,
-                                &node.body_plan,
-                                current,
-                                ctx.registry,
-                                ctx.funcs,
-                                ctx.arena,
-                            ),
-                            None => {
-                                exec_process_body(body, current, ctx.registry, ctx.funcs, ctx.arena)
-                            }
-                        };
-                        match result {
-                            Ok(ExecResult::Continue(e)) => {
-                                if let Some(node) = metric_node {
-                                    node.counters.continued();
-                                }
-                                out.push_trace(|| TraceEntry {
-                                    stage: "process".into(),
-                                    label: "(inline)".into(),
-                                    detail: "ok".into(),
-                                });
-                                current = e;
-                            }
-                            Ok(ExecResult::Dropped) => {
-                                if let Some(node) = metric_node {
-                                    node.counters.dropped();
-                                }
-                                out.push_trace(|| TraceEntry {
-                                    stage: "process".into(),
-                                    label: "(inline)".into(),
-                                    detail: "dropped".into(),
-                                });
-                                return dropped();
-                            }
-                            Err(e) => {
-                                if let Some(node) = metric_node {
-                                    node.counters.errored();
-                                }
-                                tracing::warn!("inline process: {} — event routed to error_log", e);
-                                out.push_trace(|| TraceEntry {
-                                    stage: "process".into(),
-                                    label: "(inline)".into(),
-                                    detail: format!("error: {} (event → error_log)", e),
-                                });
-                                out.errored.push(ErroredEventContext::Process {
-                                    timestamp: chrono::Utc::now(),
-                                    pipeline: ctx.pipeline_name.to_string(),
-                                    site: "(inline)".to_string(),
-                                    reason: e.to_string(),
-                                    event: ProcessEvent::from_owned(ctx.original_event),
-                                });
-                                return Ok((None, PipelineTermination::Errored));
-                            }
-                        }
-                    }
-                }
-            }
-            cont(current)
-        }
-
-        PipelineStatement::Output(name) => {
-            trace!(target: "limpid::pipeline", "output → {}", name);
-            out.push_trace(|| TraceEntry {
-                stage: "output".into(),
-                label: format!("→ {}", name),
-                detail: String::new(),
-            });
-            // The queue transports a plain `OwnedEvent`; both memory
-            // and disk queues carry `Event` end-to-end and render
-            // runs consumer-side inside each sink's `Output::consume`.
-            // What the snapshot pushed here contains is decided by
-            // `OutputCapturePolicy`:
-            //
-            // - Memory queue + non-test-pipeline: the snapshot drops
-            //   the `workspace` (via `to_owned_without_workspace`).
-            //   The downstream sink reads `egress` (and, for `file`
-            //   and `kafka`, `source` / `received_at` / `source.ip`),
-            //   the DLQ path projects to `OutputEvent`'s five fields,
-            //   and the output-flavor `tap` strips `workspace` on the
-            //   emit side too — so nobody observes the missing
-            //   workspace.
-            // - Disk queue (or `--test-pipeline`): the snapshot keeps
-            //   the `workspace` (via `to_owned`). Disk queues need it
-            //   because the WAL persists the full `Event` JSON and
-            //   replay rehydrates it; `--test-pipeline` needs it
-            //   because its CLI display shows the snapshot verbatim.
-            //
-            // The live `event` is unchanged either way — any
-            // subsequent `if workspace.x == ...` gate at pipeline
-            // scope still sees the populated workspace on the
-            // borrowed view.
-            let snapshot = if ctx.output_capture.should_capture_workspace(name) {
-                event.to_owned()
-            } else {
-                event.to_owned_without_workspace()
-            };
-            let emitted_at = crate::time::UnixNanos::now();
-            if let Some(PipelineMetricStatement::Output(timer)) = metric_stmt {
-                timer.observe_between(ctx.dispatch_started_at, emitted_at);
-            } else if ctx.registry.process_metrics.is_some() {
-                bail!("compiled pipeline output metric entry is missing");
-            }
-            out.outputs
-                .push((name.clone(), QueuedEvent::new(snapshot, emitted_at)));
-            cont(event)
-        }
-
-        PipelineStatement::Drop => {
-            trace!(target: "limpid::pipeline", "drop");
-            out.push_trace(|| TraceEntry {
-                stage: "drop".into(),
-                label: String::new(),
-                detail: String::new(),
-            });
-            dropped()
-        }
-
-        PipelineStatement::Finish => {
-            trace!(target: "limpid::pipeline", "finish");
-            out.push_trace(|| TraceEntry {
-                stage: "finish".into(),
-                label: String::new(),
-                detail: String::new(),
-            });
-            finished()
-        }
-
-        PipelineStatement::If(if_chain) => {
-            match select_if_branch_with_ordinal(if_chain, |c| {
-                eval_expr(c, &event, ctx.funcs, ctx.arena)
-            })? {
-                Some(selection) => {
-                    let metric_body = match metric_stmt {
-                        Some(PipelineMetricStatement::If {
-                            branches,
-                            else_body,
-                        }) => match selection.ordinal {
-                            Some(ordinal) => branches.get(ordinal).map(Vec::as_slice),
-                            None => else_body.as_deref(),
-                        },
-                        _ => None,
-                    };
-                    exec_pipeline_branch_body(selection.body, metric_body, event, ctx, out)
-                }
-                None => cont(event),
-            }
-        }
-
-        PipelineStatement::Switch(discriminant, arms) => {
-            let disc_val = eval_expr(discriminant, &event, ctx.funcs, ctx.arena)?;
-            match select_switch_arm_with_ordinal(&disc_val, arms, |e| {
-                eval_expr(e, &event, ctx.funcs, ctx.arena)
-            })? {
-                Some((ordinal, body)) => {
-                    let metric_body = match metric_stmt {
-                        Some(PipelineMetricStatement::Switch(metrics)) => {
-                            metrics.get(ordinal).map(Vec::as_slice)
-                        }
-                        _ => None,
-                    };
-                    exec_pipeline_branch_body(body, metric_body, event, ctx, out)
-                }
-                None => cont(event),
-            }
-        }
-    }
-}
-
-fn exec_pipeline_branch_body<'bump>(
-    body: &[BranchBody],
-    metric_body: Option<&[PipelineMetricStatement]>,
-    mut event: BorrowedEvent<'bump>,
-    ctx: &PipelineExecCtx<'_, 'bump>,
-    out: &mut PipelineExecOut<'_>,
-) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
-    if ctx.registry.process_metrics.is_some() {
-        let metric_body = metric_body
-            .ok_or_else(|| anyhow::anyhow!("compiled pipeline branch plan is missing"))?;
-        if metric_body.len() != body.len() {
-            bail!("compiled pipeline branch plan length does not match the selected body");
-        }
-    }
-    for (index, item) in body.iter().enumerate() {
-        let metric_stmt = match ctx.registry.process_metrics {
-            Some(_) => Some(
-                metric_body
-                    .and_then(|metrics| metrics.get(index))
-                    .ok_or_else(|| anyhow::anyhow!("compiled pipeline branch entry is missing"))?,
-            ),
-            None => None,
-        };
-        match item {
-            BranchBody::Pipeline(stmt) => {
-                match exec_pipeline_stmt(stmt, metric_stmt, event, ctx, out)? {
-                    (Some(e), _) => event = e,
-                    (None, term) => return Ok((None, term)),
-                }
-            }
-            BranchBody::Process(_) => {
-                bail!("process statement found in pipeline context")
-            }
-        }
-    }
-    Ok((Some(event), PipelineTermination::Finished))
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::CompiledConfig;
     use super::*;
     use crate::dsl::parser::parse_config;
     use crate::event::{reset_snapshot_in_calls_for_testing, snapshot_in_calls_for_testing};
     use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::subscriber::Interest;
+    use tracing::{Event, Metadata, Subscriber};
+
+    struct CapturingSubscriber {
+        messages: Arc<Mutex<Vec<String>>>,
+        next_span: AtomicU64,
+    }
+
+    struct MessageVisitor(Option<String>);
+
+    impl Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl Subscriber for CapturingSubscriber {
+        fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+            // The tracing-core callsite cache is global. `sometimes` forces
+            // each thread-local dispatch to evaluate `enabled` even when a
+            // parallel test first registered this callsite as disabled.
+            Interest::sometimes()
+        }
+
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(self.next_span.fetch_add(1, Ordering::Relaxed) + 1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = MessageVisitor(None);
+            event.record(&mut visitor);
+            if let Some(message) = visitor.0 {
+                self.messages
+                    .lock()
+                    .expect("trace capture lock")
+                    .push(message);
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    fn capture_tracing(f: impl FnOnce()) -> String {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let keepalive = tracing::Dispatch::new(CapturingSubscriber {
+            messages: Arc::new(Mutex::new(Vec::new())),
+            next_span: AtomicU64::new(0),
+        });
+        let dispatch = tracing::Dispatch::new(CapturingSubscriber {
+            messages: Arc::clone(&messages),
+            next_span: AtomicU64::new(0),
+        });
+        // Keep two scoped dispatches registered while capturing. tracing-core's
+        // single-dispatch fast path rebuilds against the current default before
+        // `with_default` installs a newly-created dispatch; a parallel test can
+        // therefore leave a first-use callsite cached as disabled. The second
+        // live dispatch forces the ordinary multi-dispatch rebuild, while each
+        // callsite remains dynamically filtered through `Interest::sometimes`.
+        // This neither resets nor explicitly rebuilds the global cache.
+        tracing::dispatcher::with_default(&dispatch, f);
+        drop(keepalive);
+        messages.lock().expect("trace capture lock").join("\n")
+    }
 
     fn functions() -> FunctionRegistry {
         let mut functions = FunctionRegistry::new();
@@ -1072,6 +1187,40 @@ mod tests {
             TableStore::from_configs(Vec::new()).unwrap(),
         );
         functions
+    }
+
+    fn functions_for(config: &CompiledConfig) -> FunctionRegistry {
+        let mut functions = functions();
+        crate::functions::register_user_functions(&mut functions, config);
+        functions
+    }
+
+    fn run_with_trace(
+        source: &str,
+        pipeline_name: &str,
+        event: &OwnedEvent,
+    ) -> (PipelineRunResult, Vec<TraceEntry>) {
+        let config = CompiledConfig::from_config(parse_config(source).expect("parse fixture"))
+            .expect("compile fixture");
+        let functions = functions_for(&config);
+        let blueprint =
+            super::super::blueprint::compile_runtime_blueprint(&config).expect("compile sealed IR");
+        let registry = crate::metrics::Registry::new();
+        let bound = blueprint.bind(&registry).expect("bind sealed IR");
+        let mut trace = Vec::new();
+        let result = run_pipeline_blueprint_at(
+            &bound,
+            pipeline_name,
+            event,
+            &functions,
+            None,
+            Some(&mut trace),
+            OutputCapturePolicy::CaptureAll,
+            &mut bumpalo::Bump::new(),
+            crate::time::UnixNanos::new(100),
+        )
+        .expect("run sealed executor");
+        (result, trace)
     }
 
     fn run(source: &str, pipeline: &str, event: &OwnedEvent) -> PipelineRunResult {
@@ -1101,6 +1250,346 @@ mod tests {
                 departure_unix_nano: 110,
             }],
         )
+    }
+
+    #[test]
+    fn sealed_ir_deep_control_flow_has_exact_outputs_workspace_and_trace_order() {
+        let source = r#"
+def process leaf {
+    let selected = "first"
+    if true { workspace.if_value = selected } else { workspace.if_value = "wrong" }
+    switch selected {
+        "first" { workspace.switch_value = "matched" }
+        default { error "wrong arm" }
+    }
+
+    try {
+        workspace.rolled_back = "wrong"
+        error "caught"
+    } catch {
+        workspace.caught = workspace._error
+    }
+    egress = "first:matched"
+}
+def process parent { process leaf }
+def pipeline p {
+    process parent | { workspace.inline = "yes" }
+    if workspace.inline == "yes" { output first } else { error "wrong branch" }
+    switch workspace.switch_value {
+        "matched" { output second }
+        default { drop }
+    }
+    finish
+}
+"#;
+        let event = binary_ltp_event();
+        let (result, trace) = run_with_trace(source, "p", &event);
+        assert_eq!(result.termination, PipelineTermination::Finished);
+        assert_eq!(
+            trace
+                .iter()
+                .map(|entry| (&*entry.stage, &*entry.label))
+                .collect::<Vec<_>>(),
+            vec![
+                ("input", ""),
+                ("process", "parent"),
+                ("process", "(inline)"),
+                ("output", "→ first"),
+                ("output", "→ second"),
+                ("finish", ""),
+            ]
+        );
+        assert_eq!(result.outputs.len(), 2);
+        assert_eq!(result.outputs[0].0, "first");
+        assert_eq!(result.outputs[1].0, "second");
+        for (_, output) in &result.outputs {
+            assert_eq!(output.egress, Bytes::from_static(b"first:matched"));
+            assert_eq!(
+                output.workspace.get("inline"),
+                Some(&crate::dsl::value::OwnedValue::String("yes".into()))
+            );
+            assert!(!output.workspace.contains_key("rolled_back"));
+            assert_eq!(output.ltp_stamps(), event.ltp_stamps());
+        }
+    }
+
+    #[test]
+    fn nested_unknown_process_passes_through_and_counts_the_unknown_frame() {
+        let source = r#"
+def process parent { process missing }
+def pipeline p { process parent; output sink; finish }
+"#;
+        let config = CompiledConfig::from_config(parse_config(source).expect("parse fixture"))
+            .expect("compile fixture");
+        let functions = functions_for(&config);
+        let blueprint =
+            super::super::blueprint::compile_runtime_blueprint(&config).expect("seal blueprint");
+        let registry = crate::metrics::Registry::new();
+        let bound = blueprint.bind(&registry).expect("bind blueprint");
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"raw"),
+            "127.0.0.1:1514".parse().unwrap(),
+        );
+        let result = run_pipeline_blueprint(
+            &bound,
+            "p",
+            &event,
+            &functions,
+            None,
+            None,
+            OutputCapturePolicy::CaptureAll,
+            &mut bumpalo::Bump::new(),
+        )
+        .expect("unknown nested process is a runtime passthrough");
+        assert_eq!(result.termination, PipelineTermination::Finished);
+        assert_eq!(result.outputs.len(), 1);
+        assert_eq!(result.outputs[0].1.ingress, Bytes::from_static(b"raw"));
+
+        let snapshot = serde_json::to_value(registry.snapshot()).expect("serialize metrics");
+        for family in [
+            "limpid_process_events_in_total",
+            "limpid_process_events_out_total",
+        ] {
+            let series = snapshot["metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|candidate| candidate["name"] == family)
+                .unwrap_or_else(|| panic!("missing family {family}"))["series"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|series| {
+                    series["labels"]
+                        == serde_json::json!({
+                            "pipeline": "p",
+                            "step": "2",
+                            "process_path": "/parent/missing",
+                            "process_name": "missing",
+                        })
+                })
+                .unwrap_or_else(|| panic!("missing nested unknown series for {family}"));
+            assert_eq!(series["value"], 1, "unexpected {family} count");
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_nested_unknown_process_preserves_event_and_emits_its_tap() {
+        let source = r#"
+def pipeline p { process { process missing }; output sink; finish }
+"#;
+        let config = CompiledConfig::from_config(parse_config(source).expect("parse fixture"))
+            .expect("compile fixture");
+        let functions = functions_for(&config);
+        let blueprint =
+            super::super::blueprint::compile_runtime_blueprint(&config).expect("seal blueprint");
+        let registry = crate::metrics::Registry::new();
+        let bound = blueprint.bind(&registry).expect("bind blueprint");
+        let tap = TapRegistry::new();
+        tap.register("process missing").await;
+        tap.register("process (inline)").await;
+        let mut subscription = tap
+            .subscribe("process missing")
+            .await
+            .expect("missing-process tap");
+        let mut inline_subscription = tap
+            .subscribe("process (inline)")
+            .await
+            .expect("test-only inline tap registration");
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"inline-raw"),
+            "127.0.0.1:1514".parse().unwrap(),
+        );
+        let result = run_pipeline_blueprint(
+            &bound,
+            "p",
+            &event,
+            &functions,
+            Some(&tap),
+            None,
+            OutputCapturePolicy::CaptureAll,
+            &mut bumpalo::Bump::new(),
+        )
+        .expect("inline unknown process is a runtime passthrough");
+        assert_eq!(result.outputs[0].1.ingress, event.ingress);
+        let tapped = tokio::time::timeout(std::time::Duration::from_secs(1), subscription.recv())
+            .await
+            .expect("tap delivery timeout")
+            .expect("tap delivery");
+        assert_eq!(tapped.ingress, event.ingress);
+        assert_eq!(tapped.key(), event.key());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                inline_subscription.recv()
+            )
+            .await
+            .is_err(),
+            "inline lexical sites must not emit a ghost process tap"
+        );
+
+        let pipeline = blueprint.pipeline("p").expect("pipeline p");
+        let missing = pipeline
+            .metric_nodes
+            .iter()
+            .find(|node| node.process_name == "missing")
+            .expect("unknown metric frame");
+        assert_eq!(missing.process_path, "/(inline)/missing");
+    }
+
+    #[test]
+    fn sealed_ir_drop_and_error_diagnostics_are_exact() {
+        let event = binary_ltp_event();
+        for (
+            source,
+            pipeline,
+            expected_termination,
+            expected_site,
+            expected_reason,
+            expected_process_detail,
+        ) in [
+            (
+                r#"
+def process fail { workspace.partial = "discarded"; error "expected" }
+def process parent { process fail }
+def pipeline error_path { process parent; output unreachable; finish }
+"#,
+                "error_path",
+                PipelineTermination::Errored,
+                Some("parent"),
+                Some("process failed: process failed: expected"),
+                Some("error: process failed: process failed: expected (event → error_log)"),
+            ),
+            (
+                r#"def pipeline inline_error { process { error "inline expected" } }"#,
+                "inline_error",
+                PipelineTermination::Errored,
+                Some("(inline)"),
+                Some("inline expected"),
+                Some("error: inline expected (event → error_log)"),
+            ),
+            (
+                r#"def pipeline pipeline_error { error "pipeline expected" }"#,
+                "pipeline_error",
+                PipelineTermination::Errored,
+                Some("(pipeline)"),
+                Some("pipeline expected"),
+                None,
+            ),
+            (
+                r#"def pipeline dropped { drop }"#,
+                "dropped",
+                PipelineTermination::Dropped,
+                None,
+                None,
+                None,
+            ),
+        ] {
+            let (result, trace) = run_with_trace(source, pipeline, &event);
+            assert_eq!(result.termination, expected_termination);
+            match (expected_site, expected_reason) {
+                (Some(site), Some(reason)) => {
+                    assert_eq!(result.errored.len(), 1);
+                    assert_eq!(result.errored[0].site(), site);
+                    assert_eq!(result.errored[0].reason(), reason);
+                    assert_eq!(result.errored[0].payload_size_hint(), event.ingress.len());
+                }
+                _ => assert!(result.errored.is_empty()),
+            }
+            assert_eq!(
+                trace.first().map(|entry| entry.stage.as_str()),
+                Some("input")
+            );
+            if let Some(detail) = expected_process_detail {
+                let process = trace
+                    .iter()
+                    .find(|entry| entry.stage == "process")
+                    .expect("process diagnostic trace");
+                assert_eq!(process.detail, detail);
+            }
+        }
+    }
+
+    #[test]
+    fn process_error_diagnostics_match_the_baseline_for_all_root_site_shapes() {
+        let event = binary_ltp_event();
+        for (source, site, reason, warning) in [
+            (
+                r#"def process direct { error "expected" }
+                   def pipeline p { process direct }"#,
+                "direct",
+                "process failed: expected",
+                "process 'direct': process failed: expected — event routed to error_log",
+            ),
+            (
+                r#"def process nested { error "expected" }
+                   def process outer { process nested }
+                   def pipeline p { process outer }"#,
+                "outer",
+                "process failed: process failed: expected",
+                "process 'outer': process failed: process failed: expected — event routed to error_log",
+            ),
+            (
+                r#"def pipeline p { process { error "inline expected" } }"#,
+                "(inline)",
+                "inline expected",
+                "inline process: inline expected — event routed to error_log",
+            ),
+            (
+                r#"def process nested { error "expected" }
+                   def pipeline p { process { process nested } }"#,
+                "(inline)",
+                "process failed: expected",
+                "inline process: process failed: expected — event routed to error_log",
+            ),
+        ] {
+            let mut observed = None;
+            let logs = capture_tracing(|| {
+                observed = Some(run_with_trace(source, "p", &event));
+            });
+            let (result, trace) = observed.expect("captured execution result");
+            let warnings = logs
+                .lines()
+                .filter(|line| line.contains("event routed to error_log"))
+                .collect::<Vec<_>>();
+            assert_eq!(warnings, [warning]);
+            assert_eq!(result.termination, PipelineTermination::Errored);
+            assert_eq!(result.errored.len(), 1);
+            assert_eq!(result.errored[0].site(), site);
+            assert_eq!(result.errored[0].reason(), reason);
+            let process = trace
+                .iter()
+                .find(|entry| entry.stage == "process")
+                .expect("process diagnostic trace");
+            assert_eq!(process.label, site);
+            assert_eq!(
+                process.detail,
+                format!("error: {reason} (event → error_log)")
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipeline_source_uses_bound_ir_and_discards_its_normal_registry() {
+        let main = include_str!("../main.rs");
+        let run_test = main
+            .split("fn run_test(")
+            .nth(1)
+            .expect("run_test function")
+            .split("fn build_test_event")
+            .next()
+            .expect("run_test body");
+        assert!(run_test.contains("compile_runtime_blueprint(&compiled)"));
+        assert!(run_test.contains("crate::metrics::Registry::new()"));
+        assert!(run_test.contains("blueprint.bind(&metric_registry)"));
+        assert!(run_test.contains("run_pipeline_blueprint("));
+        assert!(!run_test.contains("run_pipeline("));
+        assert!(!run_test.contains("process_metrics: Option"));
+        assert!(
+            run_test.find("compile_runtime_blueprint").unwrap()
+                < run_test.find("runtime::init_tables").unwrap(),
+            "IR compile/seal/bind failures must occur before external table acquisition"
+        );
     }
 
     fn assert_process_jsonl_matches_original(result: &PipelineRunResult, original: &OwnedEvent) {
@@ -1242,6 +1731,11 @@ def pipeline p { process { error "inline failure" } }
         );
 
         assert_eq!(process_event_from_owned_calls_for_testing(), 1);
+        assert_eq!(result.errored[0].site(), "(inline)");
+        assert_eq!(result.errored[0].reason(), "inline failure");
+        let jsonl = result.errored[0].to_jsonl();
+        assert!(jsonl.contains(r#""reason":"inline failure""#));
+        assert!(!jsonl.contains("process failed: inline failure"));
         assert_process_jsonl_matches_original(&result, &event);
     }
 
@@ -1351,44 +1845,123 @@ def pipeline p { process recover output o }
 
     #[test]
     fn process_executor_does_not_write_immutable_header_fields() {
-        let source = include_str!("../dsl/exec.rs");
+        let source = include_str!("execution.rs");
+        let ir_process = &source[source.find("fn exec_ir_process_code").unwrap()
+            ..source.find("struct IrPipelineExecCtx").unwrap()];
         for forbidden in [".ingress =", ".source =", ".received_at =", ".ltp_stamps ="] {
             assert!(
-                !source.contains(forbidden),
+                !ir_process.contains(forbidden),
                 "process executor mutates immutable event header via {forbidden}"
             );
         }
-        assert!(source.contains("event.egress ="));
-        assert!(source.contains("workspace_set"));
         assert_eq!(
-            source
-                .matches("let event_backup = clone_borrowed_event(&event, arena);")
+            ir_process
+                .matches("let event_backup = event.snapshot_in(arena);")
                 .count(),
             1
         );
-        assert_eq!(source.matches("src.snapshot_in(arena)").count(), 1);
+        assert_eq!(ir_process.matches("snapshot_in(arena)").count(), 1);
     }
 
     #[test]
-    fn process_chain_constructs_dlq_headers_only_in_its_two_error_arms() {
+    fn operational_tracing_matches_the_base_executor_without_name_allocation() {
+        let source = include_str!("execution.rs");
+        let process_call = &source[source.find("impl IrProcessRegistry").unwrap()
+            ..source.find("fn exec_ir_process_body").unwrap()];
+        for message in [
+            "process '{}' (user-defined): executing",
+            "unknown process '{}', passing event through unchanged",
+            "process '{}': ok",
+            "process '{}': dropped",
+        ] {
+            assert!(
+                process_call.contains(message),
+                "missing base trace: {message}"
+            );
+        }
+        assert!(!process_call.contains("process_name.to_owned()"));
+        assert!(!process_call.contains("process_name.to_string()"));
+
+        let pipeline = &source[source.find("fn exec_ir_pipeline_body").unwrap()
+            ..source.find("pub enum OutputCapturePolicy").unwrap()];
+        for message in [
+            "trace!(target: \"limpid::pipeline\", \"drop\")",
+            "trace!(target: \"limpid::pipeline\", \"finish\")",
+            "pipeline '{}': error '{}' — event routed to error_log",
+        ] {
+            assert!(pipeline.contains(message), "missing base trace: {message}");
+        }
+        assert!(pipeline.contains("match site.kind"));
+        assert!(pipeline.contains("site.kind,"));
+        assert!(pipeline.contains("inline process: {} — event routed to error_log"));
+        assert!(!pipeline.contains("starts_with(\"(inline"));
+        assert!(!pipeline.contains("process_bodies()[site.body.index()]"));
+    }
+
+    #[test]
+    fn operational_tracing_distinguishes_named_unknown_and_root_inline_sites() {
+        let event = binary_ltp_event();
+        let logs = capture_tracing(|| {
+            for source in [
+                r#"def process named { egress = "ok" }
+                   def pipeline p { process named }"#,
+                r#"def process named { drop }
+                   def pipeline p { process named }"#,
+                r#"def pipeline p { process { egress = "inline-ok" } }"#,
+                r#"def pipeline p { process { drop } }"#,
+                r#"def pipeline p { process { error "inline expected" } }"#,
+                r#"def process parent { process missing }
+                   def pipeline p { process parent }"#,
+            ] {
+                let _ = run_with_trace(source, "p", &event);
+            }
+        });
+        assert_eq!(
+            logs.lines().collect::<Vec<_>>(),
+            [
+                "process 'named' (user-defined): executing",
+                "process 'named': ok",
+                "process 'named' (user-defined): executing",
+                "process 'named': dropped",
+                "inline process: inline expected — event routed to error_log",
+                "process 'parent' (user-defined): executing",
+                "unknown process 'missing', passing event through unchanged",
+                "process 'missing': ok",
+                "process 'parent': ok",
+            ],
+            "base operational tracing order and wording must remain exact"
+        );
+        assert!(!logs.contains("inline-ok"));
+        assert!(!logs.contains("(inline"));
+    }
+
+    #[test]
+    fn single_ir_process_chain_constructs_dlq_headers_only_in_its_cold_error_arm() {
         let source = include_str!("execution.rs");
         let production = source
             .split_once("#[cfg(test)]\nmod tests")
             .expect("tests follow production")
             .0;
-        assert_eq!(production.matches("original_event: event,").count(), 1);
-        let body = production
-            .split_once("PipelineStatement::ProcessChain(chain) => {")
-            .expect("process-chain arm exists")
+        let ir = production
+            .split_once("pub(crate) fn run_pipeline_blueprint_by_id_at")
+            .expect("single IR runner exists")
             .1
-            .split_once("PipelineStatement::Output(name) => {")
-            .expect("output arm follows process-chain arm")
+            .split_once("fn exec_ir_process_body")
+            .expect("single IR runner precedes process executor")
+            .0;
+        assert_eq!(ir.matches("original_event: event,").count(), 1);
+        let body = production
+            .split_once("PipelineCode::ProcessChain(sites) => {")
+            .expect("single IR process-chain arm exists")
+            .1
+            .split_once("PipelineCode::Output { name, timer_slot } => {")
+            .expect("single IR output arm follows process-chain arm")
             .0;
 
         assert_eq!(
             body.matches("ProcessEvent::from_owned(ctx.original_event)")
                 .count(),
-            2
+            1
         );
         assert!(!body.contains("ingress.clone()"));
         assert!(!body.contains("ltp_stamps_arc()"));
