@@ -1,5 +1,22 @@
 use super::*;
 
+#[cfg(test)]
+std::thread_local! {
+    static PROCESS_EVENT_FROM_OWNED_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_process_event_from_owned_calls_for_testing() {
+    PROCESS_EVENT_FROM_OWNED_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn process_event_from_owned_calls_for_testing() -> usize {
+    PROCESS_EVENT_FROM_OWNED_CALLS.with(std::cell::Cell::get)
+}
+
 /// Trace entry for --test mode output.
 #[derive(Debug)]
 pub struct TraceEntry {
@@ -127,6 +144,9 @@ pub struct OutputEvent {
 impl ProcessEvent {
     /// Snapshot the process-flavor fields from an [`OwnedEvent`].
     pub fn from_owned(ev: &OwnedEvent) -> Self {
+        #[cfg(test)]
+        PROCESS_EVENT_FROM_OWNED_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         Self {
             key: ev.key(),
             source: ev.source,
@@ -531,6 +551,7 @@ fn run_pipeline_inner(
     let mut errored: Vec<ErroredEventContext> = Vec::new();
     let exec_ctx = PipelineExecCtx {
         pipeline_name: &pipeline.name,
+        original_event: event,
         registry: &registry,
         funcs,
         arena: &arena,
@@ -619,6 +640,13 @@ impl<'a> OutputCapturePolicy<'a> {
 /// `pipeline_name` is here purely so a process-runtime error can
 /// populate the [`ErroredEventContext`] surfaced in [`PipelineExecOut::errored`].
 ///
+/// `original_event` is the immutable input header used to build a
+/// [`ProcessEvent`] only when execution fails. Process evaluation may mutate
+/// the arena-side workspace and egress, but key / source / received_at /
+/// ingress / LTP history remain the original input contract; borrowing that
+/// header here keeps the successful process path free of snapshots, refcount
+/// bumps, and bump-arena allocations.
+///
 /// `arena` is the per-event bump arena — the same one
 /// `run_pipeline` opened on the stack. The reference itself is held at
 /// `'bump` so closures and primitive impls allocating into it can
@@ -629,6 +657,7 @@ impl<'a> OutputCapturePolicy<'a> {
 /// [`OutputCapturePolicy`].
 struct PipelineExecCtx<'a, 'bump: 'a> {
     pipeline_name: &'a str,
+    original_event: &'a OwnedEvent,
     registry: &'a DslProcessRegistry<'a>,
     funcs: &'a FunctionRegistry,
     arena: &'bump EventArena<'bump>,
@@ -735,15 +764,12 @@ fn exec_pipeline_stmt<'bump>(
                 label: msg.clone(),
                 detail: "event → error_log".into(),
             });
-            // Cross to owned form for the DLQ context (which must
-            // outlive the per-event arena).
-            let owned = event.to_owned();
             out.errored.push(ErroredEventContext::Process {
                 timestamp: chrono::Utc::now(),
                 pipeline: ctx.pipeline_name.to_string(),
                 site: "(pipeline)".to_string(),
                 reason: msg,
-                event: ProcessEvent::from_owned(&owned),
+                event: ProcessEvent::from_owned(ctx.original_event),
             });
             Ok((None, PipelineTermination::Errored))
         }
@@ -758,25 +784,6 @@ fn exec_pipeline_stmt<'bump>(
                 let metric_token = metric_nodes.and_then(|nodes| nodes.get(index)).copied();
                 match element {
                     ProcessChainElement::Named(name) => {
-                        // Snapshot the pre-call view before the registry
-                        // consumes the borrowed event — the Err arm
-                        // needs a stable, DLQ-ready event. Use an
-                        // arena-local shallow snapshot rather than
-                        // `to_owned`: the success path (dominant on the
-                        // hot path) only needs the snapshot to survive
-                        // until the `match` returns `Ok(...)`, and
-                        // paying the heap materialization of the
-                        // workspace `HashMap` + `Value` tree on every
-                        // successful process call was a significant
-                        // fraction of the runtime for multi-process
-                        // pipelines where `parse | enrich | route`-shaped
-                        // chains re-entered process #2+ with a populated
-                        // workspace. `snapshot_in` bumps `Bytes`
-                        // refcounts and copies the workspace index vec;
-                        // the deep `to_owned` clone happens only in the
-                        // Err arm below, where the DLQ record's owned
-                        // event has to cross the arena boundary anyway.
-                        let backup_view = current.snapshot_in(ctx.arena);
                         let call_result = match ctx.registry.process_metrics {
                             Some(_) => {
                                 let token = metric_token.ok_or_else(|| {
@@ -820,21 +827,13 @@ fn exec_pipeline_stmt<'bump>(
                                     pipeline: ctx.pipeline_name.to_string(),
                                     site: name.clone(),
                                     reason: e.to_string(),
-                                    // Cross the arena boundary here on
-                                    // the (rare) failure path only: the
-                                    // owned DLQ record outlives the
-                                    // per-event arena.
-                                    event: ProcessEvent::from_owned(&backup_view.to_owned()),
+                                    event: ProcessEvent::from_owned(ctx.original_event),
                                 });
                                 return Ok((None, PipelineTermination::Errored));
                             }
                         }
                     }
                     ProcessChainElement::Inline(body) => {
-                        // Same rationale as the Named arm: arena-local
-                        // shallow snapshot for the DLQ Err path; the
-                        // heap materialization happens only on failure.
-                        let backup_view = current.snapshot_in(ctx.arena);
                         let metric_node = match ctx.registry.process_metrics {
                             Some(metrics) => {
                                 let token = metric_token.ok_or_else(|| {
@@ -900,7 +899,7 @@ fn exec_pipeline_stmt<'bump>(
                                     pipeline: ctx.pipeline_name.to_string(),
                                     site: "(inline)".to_string(),
                                     reason: e.to_string(),
-                                    event: ProcessEvent::from_owned(&backup_view.to_owned()),
+                                    event: ProcessEvent::from_owned(ctx.original_event),
                                 });
                                 return Ok((None, PipelineTermination::Errored));
                             }
@@ -1061,8 +1060,71 @@ fn exec_pipeline_branch_body<'bump>(
 mod tests {
     use super::*;
     use crate::dsl::parser::parse_config;
+    use crate::event::{reset_snapshot_in_calls_for_testing, snapshot_in_calls_for_testing};
     use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
     use bytes::Bytes;
+    use chrono::{TimeZone, Utc};
+
+    fn functions() -> FunctionRegistry {
+        let mut functions = FunctionRegistry::new();
+        register_builtins(
+            &mut functions,
+            TableStore::from_configs(Vec::new()).unwrap(),
+        );
+        functions
+    }
+
+    fn run(source: &str, pipeline: &str, event: &OwnedEvent) -> PipelineRunResult {
+        let config = CompiledConfig::from_config(parse_config(source).unwrap()).unwrap();
+        run_pipeline(
+            config.pipelines.get(pipeline).unwrap(),
+            event,
+            &config,
+            &functions(),
+            None,
+            None,
+            OutputCapturePolicy::CaptureAll,
+            &mut bumpalo::Bump::new(),
+        )
+        .unwrap()
+    }
+
+    fn binary_ltp_event() -> OwnedEvent {
+        OwnedEvent::from_ltp_parts(
+            uuid::Uuid::now_v7(),
+            Utc.timestamp_nanos(123),
+            "127.0.0.1:1514".parse().unwrap(),
+            Bytes::from_static(&[0, 0xff, b'\n', 0x80]),
+            vec![crate::ltp::HopStamp {
+                node_id: "upstream".to_owned(),
+                arrival_unix_nano: 100,
+                departure_unix_nano: 110,
+            }],
+        )
+    }
+
+    fn assert_process_jsonl_matches_original(result: &PipelineRunResult, original: &OwnedEvent) {
+        assert_eq!(result.termination, PipelineTermination::Errored);
+        assert_eq!(result.errored.len(), 1);
+        let actual = &result.errored[0];
+        let expected = match actual {
+            ErroredEventContext::Process {
+                timestamp,
+                pipeline,
+                site,
+                reason,
+                ..
+            } => ErroredEventContext::Process {
+                timestamp: *timestamp,
+                pipeline: pipeline.clone(),
+                site: site.clone(),
+                reason: reason.clone(),
+                event: ProcessEvent::from_owned(original),
+            },
+            other => panic!("expected process error, got {other:?}"),
+        };
+        assert_eq!(actual.to_jsonl(), expected.to_jsonl());
+    }
 
     #[test]
     fn finish_terminates_without_emitting_an_output() {
@@ -1093,5 +1155,242 @@ mod tests {
         assert_eq!(result.termination, PipelineTermination::Finished);
         assert!(result.outputs.is_empty());
         assert!(!result.had_outputs);
+    }
+
+    #[test]
+    fn named_process_success_takes_no_dlq_snapshot() {
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        reset_snapshot_in_calls_for_testing();
+        reset_process_event_from_owned_calls_for_testing();
+
+        let result = run(
+            r#"
+def process pass { egress = ingress }
+def pipeline p { process pass }
+"#,
+            "p",
+            &event,
+        );
+
+        assert_eq!(result.termination, PipelineTermination::Finished);
+        assert_eq!(snapshot_in_calls_for_testing(), 0);
+        assert_eq!(process_event_from_owned_calls_for_testing(), 0);
+    }
+
+    #[test]
+    fn inline_process_success_takes_no_dlq_snapshot() {
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        reset_snapshot_in_calls_for_testing();
+        reset_process_event_from_owned_calls_for_testing();
+
+        let result = run(
+            r#"
+def pipeline p { process { egress = ingress } }
+"#,
+            "p",
+            &event,
+        );
+
+        assert_eq!(result.termination, PipelineTermination::Finished);
+        assert_eq!(snapshot_in_calls_for_testing(), 0);
+        assert_eq!(process_event_from_owned_calls_for_testing(), 0);
+    }
+
+    #[test]
+    fn named_process_error_jsonl_matches_the_original_binary_ltp_header() {
+        let event = binary_ltp_event();
+        reset_process_event_from_owned_calls_for_testing();
+        let result = run(
+            r#"
+def process fail { error "named failure" }
+def pipeline p { process fail }
+"#,
+            "p",
+            &event,
+        );
+
+        assert_eq!(process_event_from_owned_calls_for_testing(), 1);
+        let ErroredEventContext::Process {
+            event: captured, ..
+        } = &result.errored[0]
+        else {
+            panic!("expected process error");
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            event.ltp_stamps_arc().as_ref().unwrap(),
+            captured.ltp_stamps_arc().as_ref().unwrap(),
+        ));
+        assert_process_jsonl_matches_original(&result, &event);
+    }
+
+    #[test]
+    fn inline_process_error_jsonl_matches_the_original_binary_ltp_header() {
+        let event = binary_ltp_event();
+        reset_process_event_from_owned_calls_for_testing();
+        let result = run(
+            r#"
+def pipeline p { process { error "inline failure" } }
+"#,
+            "p",
+            &event,
+        );
+
+        assert_eq!(process_event_from_owned_calls_for_testing(), 1);
+        assert_process_jsonl_matches_original(&result, &event);
+    }
+
+    #[test]
+    fn pipeline_error_jsonl_matches_the_original_binary_ltp_header() {
+        let event = binary_ltp_event();
+        reset_process_event_from_owned_calls_for_testing();
+        let result = run(
+            r#"
+def pipeline p { error "pipeline failure" }
+"#,
+            "p",
+            &event,
+        );
+
+        assert_eq!(process_event_from_owned_calls_for_testing(), 1);
+        assert_process_jsonl_matches_original(&result, &event);
+    }
+
+    #[test]
+    fn named_process_error_with_empty_ltp_omits_history() {
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let result = run(
+            r#"
+def process fail { error "named failure" }
+def pipeline p { process fail }
+"#,
+            "p",
+            &event,
+        );
+        let json: serde_json::Value = serde_json::from_str(&result.errored[0].to_jsonl()).unwrap();
+
+        let ErroredEventContext::Process {
+            event: captured, ..
+        } = &result.errored[0]
+        else {
+            panic!("expected process error");
+        };
+        assert!(!captured.has_ltp_history_storage());
+        assert!(json["event"].get("ltp_stamps").is_none());
+    }
+
+    #[test]
+    fn fanout_pipelines_share_the_same_original_process_dlq_header() {
+        let event = binary_ltp_event();
+        reset_process_event_from_owned_calls_for_testing();
+        let source = r#"
+def process fail { error "named failure" }
+def pipeline named { process fail }
+def pipeline inline { process { error "inline failure" } }
+"#;
+
+        let named = run(source, "named", &event);
+        let inline = run(source, "inline", &event);
+        let named_json: serde_json::Value =
+            serde_json::from_str(&named.errored[0].to_jsonl()).unwrap();
+        let inline_json: serde_json::Value =
+            serde_json::from_str(&inline.errored[0].to_jsonl()).unwrap();
+
+        assert_eq!(named_json["event"], inline_json["event"]);
+        assert_eq!(
+            named_json["event"]["ingress"],
+            event.to_json_value()["ingress"]
+        );
+        assert_eq!(
+            named_json["event"]["ltp_stamps"],
+            event.to_json_value()["ltp_stamps"]
+        );
+        assert!(named_json["event"]["egress"].is_null());
+        assert!(named_json["event"]["workspace"].is_null());
+        assert_eq!(process_event_from_owned_calls_for_testing(), 2);
+    }
+
+    #[test]
+    fn try_catch_keeps_its_single_rollback_snapshot() {
+        let event = binary_ltp_event();
+        reset_snapshot_in_calls_for_testing();
+        reset_process_event_from_owned_calls_for_testing();
+
+        let result = run(
+            r#"
+def process recover {
+    try { workspace.before = "mutated" egress = "partial" error "expected" }
+    catch { egress = "recovered" }
+}
+def output o { type stdout }
+def pipeline p { process recover output o }
+"#,
+            "p",
+            &event,
+        );
+
+        assert_eq!(result.termination, PipelineTermination::Finished);
+        assert_eq!(result.outputs.len(), 1);
+        assert_eq!(result.outputs[0].1.egress, Bytes::from_static(b"recovered"));
+        assert!(!result.outputs[0].1.workspace.contains_key("before"));
+        assert!(std::sync::Arc::ptr_eq(
+            event.ltp_stamps_arc().as_ref().unwrap(),
+            result.outputs[0].1.ltp_stamps_arc().as_ref().unwrap(),
+        ));
+        assert_eq!(snapshot_in_calls_for_testing(), 1);
+        assert_eq!(process_event_from_owned_calls_for_testing(), 0);
+    }
+
+    #[test]
+    fn process_executor_does_not_write_immutable_header_fields() {
+        let source = include_str!("../dsl/exec.rs");
+        for forbidden in [".ingress =", ".source =", ".received_at =", ".ltp_stamps ="] {
+            assert!(
+                !source.contains(forbidden),
+                "process executor mutates immutable event header via {forbidden}"
+            );
+        }
+        assert!(source.contains("event.egress ="));
+        assert!(source.contains("workspace_set"));
+        assert_eq!(
+            source
+                .matches("let event_backup = clone_borrowed_event(&event, arena);")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches("src.snapshot_in(arena)").count(), 1);
+    }
+
+    #[test]
+    fn process_chain_constructs_dlq_headers_only_in_its_two_error_arms() {
+        let source = include_str!("execution.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("tests follow production")
+            .0;
+        assert_eq!(production.matches("original_event: event,").count(), 1);
+        let body = production
+            .split_once("PipelineStatement::ProcessChain(chain) => {")
+            .expect("process-chain arm exists")
+            .1
+            .split_once("PipelineStatement::Output(name) => {")
+            .expect("output arm follows process-chain arm")
+            .0;
+
+        assert_eq!(
+            body.matches("ProcessEvent::from_owned(ctx.original_event)")
+                .count(),
+            2
+        );
+        assert!(!body.contains("ingress.clone()"));
+        assert!(!body.contains("ltp_stamps_arc()"));
     }
 }

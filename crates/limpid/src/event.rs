@@ -25,8 +25,9 @@
 //!   produce a borrowed event. Called at `run_pipeline` entry.
 //! - [`BorrowedEvent::to_owned`] — heap-allocate a fresh `OwnedEvent`
 //!   from the borrowed form. Called at `run_pipeline` exit when an
-//!   output is reached, and when a process-level error needs to land
-//!   in the DLQ context (which holds an `OwnedEvent` for replay).
+//!   output is reached. Process-level DLQ records instead copy their
+//!   immutable header directly from the original [`OwnedEvent`] only
+//!   after an error occurs.
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -38,6 +39,21 @@ use std::sync::Arc;
 use crate::dsl::arena::EventArena;
 use crate::dsl::value::{Map, OwnedValue, Value};
 use crate::dsl::value_json::{json_to_value, value_to_json};
+
+#[cfg(test)]
+std::thread_local! {
+    static SNAPSHOT_IN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_snapshot_in_calls_for_testing() {
+    SNAPSHOT_IN_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_in_calls_for_testing() -> usize {
+    SNAPSHOT_IN_CALLS.get()
+}
 
 // ===========================================================================
 // Ack token — input → pipeline-worker-completion ack
@@ -585,9 +601,8 @@ impl<'bump> BorrowedEvent<'bump> {
     }
 
     /// Heap-allocate a fresh [`OwnedEvent`] from this borrowed view.
-    /// Called at `run_pipeline` exit and at error path setup
-    /// (`ErroredEventContext` holds an `OwnedEvent` because the DLQ
-    /// outlives the per-event arena).
+    /// Called at `run_pipeline` output boundaries where the event must
+    /// outlive the per-event arena.
     pub fn to_owned(&self) -> OwnedEvent {
         let mut workspace = HashMap::with_capacity(self.workspace.len());
         for (k, v) in self.workspace.iter() {
@@ -673,13 +688,14 @@ impl<'bump> BorrowedEvent<'bump> {
     /// allocations, no `Value` tree materialization — the deep-clone
     /// path that `to_owned` walks is not entered.
     ///
-    /// Called by the `ProcessChain` executor to hold a stable
-    /// pre-process view for the Err arm's DLQ context without paying
-    /// `to_owned`'s heap materialization on every success. The Err
-    /// arm still calls `.to_owned()` on the snapshot at DLQ-record
-    /// build time to cross the arena boundary once — only the failure
-    /// path pays that cost, not every successful process call.
+    /// Used by `try { ... } catch { ... }` to preserve the mutable
+    /// workspace / egress rollback point. Process-level DLQ records do
+    /// not call this method: their immutable header comes from the
+    /// original [`OwnedEvent`] only after an error occurs.
     pub fn snapshot_in(&self, arena: &EventArena<'bump>) -> BorrowedEvent<'bump> {
+        #[cfg(test)]
+        SNAPSHOT_IN_CALLS.set(SNAPSHOT_IN_CALLS.get() + 1);
+
         let mut workspace =
             bumpalo::collections::Vec::with_capacity_in(self.workspace.len(), arena.bump());
         for entry in self.workspace.iter() {
