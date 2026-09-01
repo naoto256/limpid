@@ -13,7 +13,7 @@ pub(super) struct PipelineContext {
     /// downstream reader (sink, DLQ record, output tap) touches
     /// workspace on that path.
     pub(super) disk_outputs: Arc<HashSet<String>>,
-    pub(super) config: Arc<CompiledConfig>,
+    pub(super) bound_blueprint: Arc<crate::pipeline::BoundRuntimeBlueprint>,
     pub(super) funcs: Arc<FunctionRegistry>,
     pub(super) tap: TapRegistry,
     /// Dead-letter queue writer used for: (1) `process` runtime
@@ -36,109 +36,32 @@ pub(super) struct PipelineContext {
     /// the sink-side DLQ paths.
     pub(super) error_log_fallback: crate::error_log::ErrorLogFallback,
 }
-
 // ---------------------------------------------------------------------------
 // Pipeline worker — owns its own metrics via HasMetrics
 // ---------------------------------------------------------------------------
 
 pub(super) struct PipelineWorker {
-    pub(super) def: PipelineDef,
+    pub(super) pipeline_id: crate::pipeline::PipelineId,
     pub(super) metrics: Arc<PipelineMetrics>,
-    pub(super) process_metrics: Option<Arc<crate::pipeline::PipelineProcessMetrics>>,
     #[cfg(test)]
     pub(super) serial_test_gate: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl PipelineWorker {
-    #[cfg(test)]
-    pub(super) fn new(
-        def: PipelineDef,
-        registry: &Registry,
-    ) -> Result<Self, crate::metrics::MetricsError> {
-        let metrics = PipelineMetrics::register(registry, &def.name)?;
-        Ok(Self {
-            def,
-            metrics,
-            process_metrics: None,
-            serial_test_gate: None,
-        })
-    }
-
-    pub(super) fn new_with_process_metrics(
-        def: PipelineDef,
-        processes: &HashMap<String, crate::dsl::ast::ProcessDef>,
+    pub(super) fn from_bound(
+        pipeline_id: crate::pipeline::PipelineId,
+        blueprint: &crate::pipeline::RuntimeBlueprint,
         registry: &Registry,
     ) -> anyhow::Result<Self> {
-        let metrics = PipelineMetrics::register(registry, &def.name)?;
-        let process_metrics = Arc::new(crate::pipeline::PipelineProcessMetrics::register(
-            &def, processes, registry,
-        )?);
+        let pipeline = blueprint
+            .pipeline_by_id(pipeline_id)
+            .ok_or_else(|| anyhow::anyhow!("pipeline id is not in the blueprint"))?;
         Ok(Self {
-            def,
-            metrics,
-            process_metrics: Some(process_metrics),
+            pipeline_id,
+            metrics: PipelineMetrics::register(registry, &pipeline.name)?,
             #[cfg(test)]
             serial_test_gate: None,
         })
-    }
-
-    #[cfg(test)]
-    pub(super) fn compile_process_metric_plan_for_testing(
-        def: &PipelineDef,
-        processes: &HashMap<String, crate::dsl::ast::ProcessDef>,
-        registry: &Registry,
-    ) -> Result<CompiledProcessMetricPlan, crate::metrics::MetricsError> {
-        Ok(CompiledProcessMetricPlan {
-            pipeline_metrics: PipelineMetrics::register(registry, &def.name)?,
-            process_metrics: crate::pipeline::PipelineProcessMetrics::compile_raw(
-                def, processes, registry,
-            )?,
-        })
-    }
-
-    #[cfg(test)]
-    pub(super) fn new_with_compiled_process_metrics_for_testing(
-        def: PipelineDef,
-        processes: &HashMap<String, crate::dsl::ast::ProcessDef>,
-        plan: CompiledProcessMetricPlan,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
-            process_metrics: Some(Arc::new(plan.process_metrics.validate(&def, processes)?)),
-            def,
-            metrics: plan.pipeline_metrics,
-            serial_test_gate: None,
-        })
-    }
-}
-
-#[cfg(test)]
-pub(super) struct CompiledProcessMetricPlan {
-    pipeline_metrics: Arc<PipelineMetrics>,
-    process_metrics: crate::pipeline::RawPipelineProcessMetrics,
-}
-
-#[cfg(test)]
-impl CompiledProcessMetricPlan {
-    pub(super) fn process_metrics_mut_for_testing(
-        &mut self,
-    ) -> &mut crate::pipeline::RawPipelineProcessMetrics {
-        &mut self.process_metrics
-    }
-
-    pub(super) fn root_token_for_testing(&self, step: usize) -> Option<usize> {
-        self.process_metrics.root_token_for_testing(step)
-    }
-
-    pub(super) fn child_token_for_testing(&self, parent: usize, ordinal: usize) -> Option<usize> {
-        self.process_metrics
-            .child_token_for_testing(parent, ordinal)
-    }
-
-    pub(super) fn metric_node_selection_trap_for_testing(
-        &self,
-    ) -> crate::pipeline::MetricNodeSelectionTrap {
-        self.process_metrics
-            .metric_node_selection_trap_for_testing()
     }
 }
 
@@ -237,27 +160,8 @@ pub(super) async fn run_pipeline_workers(
     info!("pipeline worker for input '{}' stopped", input_name);
 }
 
-#[cfg(test)]
-pub(super) async fn run_pipeline_with_outputs(
-    pipeline: &PipelineDef,
-    event: &Event,
-    ctx: &PipelineContext,
-    bump: &mut bumpalo::Bump,
-) -> Result<crate::pipeline::PipelineRunResult> {
-    run_pipeline_with_outputs_inner(
-        pipeline,
-        None,
-        event,
-        ctx,
-        bump,
-        crate::time::UnixNanos::now(),
-    )
-    .await
-}
-
 pub(super) async fn run_pipeline_with_outputs_inner(
-    pipeline: &PipelineDef,
-    process_metrics: Option<&crate::pipeline::PipelineProcessMetrics>,
+    pipeline: &crate::pipeline::PipelineBlueprint,
     event: &Event,
     ctx: &PipelineContext,
     bump: &mut bumpalo::Bump,
@@ -267,32 +171,26 @@ pub(super) async fn run_pipeline_with_outputs_inner(
     // passing `None` skips every trace push (and the `format!` /
     // `to_string` work behind it) in `run_pipeline`, since nothing
     // here reads `PipelineRunResult::trace`.
-    let mut result = match process_metrics {
-        Some(process_metrics) => crate::pipeline::run_pipeline_with_process_metrics_at(
-            pipeline,
-            event,
-            &ctx.config,
-            &ctx.funcs,
-            Some(&ctx.tap),
-            None,
-            crate::pipeline::OutputCapturePolicy::DiskOnly(&ctx.disk_outputs),
-            bump,
-            process_metrics,
-            dispatch_started_at,
-        )?,
-        None => crate::pipeline::run_pipeline_at(
-            pipeline,
-            event,
-            &ctx.config,
-            &ctx.funcs,
-            Some(&ctx.tap),
-            None,
-            crate::pipeline::OutputCapturePolicy::DiskOnly(&ctx.disk_outputs),
-            bump,
-            dispatch_started_at,
-        )?,
-    };
+    let mut result = crate::pipeline::run_pipeline_blueprint_resolved_at(
+        &ctx.bound_blueprint,
+        pipeline,
+        event,
+        &ctx.funcs,
+        Some(&ctx.tap),
+        None,
+        crate::pipeline::OutputCapturePolicy::DiskOnly(&ctx.disk_outputs),
+        bump,
+        dispatch_started_at,
+    )?;
+    enqueue_pipeline_outputs(&pipeline.name, &mut result, ctx).await;
+    Ok(result)
+}
 
+async fn enqueue_pipeline_outputs(
+    pipeline_name: &str,
+    result: &mut crate::pipeline::PipelineRunResult,
+    ctx: &PipelineContext,
+) {
     // Drain the per-event outputs vec into the queues. After this
     // change every output statement enqueues a plain `OwnedEvent`
     // regardless of the queue kind; render happens consumer-side
@@ -334,7 +232,7 @@ pub(super) async fn run_pipeline_with_outputs_inner(
                 // counting it as `events_finished`.
                 error!(
                     "pipeline '{}': enqueue to output '{}' failed: {}",
-                    pipeline.name, output_name, e
+                    pipeline_name, output_name, e
                 );
                 failed_outputs.push((output_name, snapshot));
             }
@@ -344,7 +242,7 @@ pub(super) async fn run_pipeline_with_outputs_inner(
             // the event still hits the DLQ.
             error!(
                 "pipeline '{}': output '{}' not found",
-                pipeline.name, output_name
+                pipeline_name, output_name
             );
             failed_outputs.push((
                 output_name,
@@ -376,7 +274,7 @@ pub(super) async fn run_pipeline_with_outputs_inner(
                 .errored
                 .push(crate::pipeline::ErroredEventContext::Output {
                     timestamp: chrono::Utc::now(),
-                    pipeline: pipeline.name.clone(),
+                    pipeline: pipeline_name.to_string(),
                     site: format!("{} enqueue", output_name),
                     reason: reason.clone(),
                     output_name: output_name.clone(),
@@ -384,8 +282,6 @@ pub(super) async fn run_pipeline_with_outputs_inner(
                 });
         }
     }
-
-    Ok(result)
 }
 
 pub(super) async fn process_event(
@@ -446,16 +342,23 @@ pub(super) async fn process_event_at(
             gate.wait().await;
         }
         worker.metrics.inflight.inc();
-        match run_pipeline_with_outputs_inner(
-            &worker.def,
-            worker.process_metrics.as_deref(),
-            event,
-            ctx,
-            bump,
-            dispatch_started_at,
-        )
-        .await
-        {
+        let Some(pipeline) = ctx
+            .bound_blueprint
+            .blueprint
+            .pipeline_by_id(worker.pipeline_id)
+        else {
+            // A sealed immutable blueprint cannot lose a PipelineId that was
+            // assigned to this worker. Keep accounting balanced and fail
+            // closed if that internal invariant is ever violated.
+            worker.metrics.events_errored.inc();
+            error!("pipeline id is not in the runtime blueprint");
+            worker.metrics.inflight.dec();
+            continue;
+        };
+        let pipeline_name = pipeline.name.as_str();
+        let run_result =
+            run_pipeline_with_outputs_inner(pipeline, event, ctx, bump, dispatch_started_at).await;
+        match run_result {
             Ok(result) => {
                 use crate::pipeline::PipelineTermination;
                 match result.termination {
@@ -474,7 +377,7 @@ pub(super) async fn process_event_at(
                         if result.errored.is_empty() {
                             error!(
                                 "pipeline '{}': Errored termination without error context — bug",
-                                worker.def.name
+                                pipeline_name
                             );
                         } else {
                             for err_ctx in &result.errored {
@@ -514,7 +417,7 @@ pub(super) async fn process_event_at(
                 let owned = event.to_owned();
                 let err_ctx = crate::pipeline::ErroredEventContext::Process {
                     timestamp: chrono::Utc::now(),
-                    pipeline: worker.def.name.clone(),
+                    pipeline: pipeline_name.to_string(),
                     site: "(pipeline body)".to_string(),
                     reason: e.to_string(),
                     event: crate::pipeline::ProcessEvent::from_owned(&owned),
@@ -579,49 +482,5 @@ pub(super) async fn write_errored_to_dlq(
                 None,
             );
         }
-    }
-}
-
-/// Return the list of input names a pipeline subscribes to (fan-in).
-///
-/// Empty if no `input` statement is present. A pipeline declared with
-/// `input a, b;` returns `["a", "b"]`; the legacy single-input form
-/// `input a;` returns `["a"]`.
-pub(super) fn get_pipeline_inputs(pipeline: &PipelineDef) -> &[String] {
-    for stmt in &pipeline.body {
-        if let PipelineStatement::Input(names) = stmt {
-            return names;
-        }
-    }
-    &[]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dsl::parser::parse_config;
-
-    fn pipeline(source: &str) -> PipelineDef {
-        parse_config(source)
-            .unwrap()
-            .definitions
-            .into_iter()
-            .find_map(|definition| match definition {
-                crate::dsl::ast::Definition::Pipeline(pipeline) => Some(pipeline),
-                _ => None,
-            })
-            .unwrap()
-    }
-
-    #[test]
-    fn input_lookup_preserves_fan_in_order_and_handles_missing_statement() {
-        let fan_in = pipeline("def pipeline p { input a, b, c; drop }");
-        assert_eq!(
-            get_pipeline_inputs(&fan_in),
-            &["a".to_owned(), "b".to_owned(), "c".to_owned()]
-        );
-
-        let missing = pipeline("def pipeline p { drop }");
-        assert!(get_pipeline_inputs(&missing).is_empty());
     }
 }

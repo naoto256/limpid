@@ -11,9 +11,7 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 
 use super::arena::EventArena;
-use super::ast::{
-    BinOp, BlockArg, BranchBody, Expr, ExprKind, IfChain, SwitchStmtArm, TemplateFragment, UnaryOp,
-};
+use super::ast::{BinOp, BlockArg, Expr, ExprKind, TemplateFragment, UnaryOp};
 use super::value::{ArrayBuilder, ObjectBuilder, Value};
 use crate::event::BorrowedEvent;
 use crate::functions::FunctionRegistry;
@@ -755,103 +753,6 @@ pub fn values_match(left: &Value<'_>, right: &Value<'_>) -> bool {
         (Value::Object(a), Value::Object(b)) => a == b,
         _ => false,
     }
-}
-
-/// Select the matching arm body of a statement-form `switch`.
-///
-/// Walks `arms` in source order and returns the body of the first arm
-/// whose pattern equals `disc_val` (per [`values_match`]). A `default`
-/// arm (`pattern.is_none()`) is returned immediately if encountered —
-/// `--check` enforces `default` as the last arm so only a trailing
-/// default can be hit this way, matching the documented
-/// `docs/src/dsl-syntax.md` dispatch contract.
-///
-/// Returns `None` when no pattern matched and no `default` is present.
-///
-/// Pure dispatch logic: the caller supplies `eval_pattern` to evaluate
-/// each arm's pattern expression against its execution context (with or
-/// without a `LocalScope`, with whichever funcs/arena), and is
-/// responsible for executing the returned body. Lets the pipeline and
-/// process executors share one first-match algorithm without coupling
-/// to either context.
-#[allow(dead_code)]
-pub fn select_switch_arm<'bump, 'a, F>(
-    disc_val: &Value<'bump>,
-    arms: &'a [SwitchStmtArm],
-    eval_pattern: F,
-) -> Result<Option<&'a [BranchBody]>>
-where
-    F: FnMut(&Expr) -> Result<Value<'bump>>,
-{
-    Ok(select_switch_arm_with_ordinal(disc_val, arms, eval_pattern)?.map(|(_, body)| body))
-}
-
-pub(crate) fn select_switch_arm_with_ordinal<'bump, 'a, F>(
-    disc_val: &Value<'bump>,
-    arms: &'a [SwitchStmtArm],
-    mut eval_pattern: F,
-) -> Result<Option<(usize, &'a [BranchBody])>>
-where
-    F: FnMut(&Expr) -> Result<Value<'bump>>,
-{
-    for (ordinal, arm) in arms.iter().enumerate() {
-        let Some(pattern) = arm.pattern.as_ref() else {
-            return Ok(Some((ordinal, &arm.body)));
-        };
-        if values_match(disc_val, &eval_pattern(pattern)?) {
-            return Ok(Some((ordinal, &arm.body)));
-        }
-    }
-    Ok(None)
-}
-
-/// Select the matching branch body of an `if`/`else if`/`else` chain.
-///
-/// Walks `chain.branches` in source order and returns the first body
-/// whose condition evaluates truthy (per [`Value::is_truthy`]). Falls
-/// back to `chain.else_body` if no condition matched, returning `None`
-/// when both produce nothing.
-///
-/// Same pure-dispatch shape as [`select_switch_arm`]: the caller
-/// supplies `eval_condition` and executes the returned body.
-#[allow(dead_code)]
-pub fn select_if_branch<'bump, 'a, F>(
-    chain: &'a IfChain,
-    eval_condition: F,
-) -> Result<Option<&'a [BranchBody]>>
-where
-    F: FnMut(&Expr) -> Result<Value<'bump>>,
-{
-    Ok(select_if_branch_with_ordinal(chain, eval_condition)?.map(|selection| selection.body))
-}
-
-/// Chosen branch plus its zero-based ordinal, so the caller can
-/// index the parallel metric plan without re-matching AST branches.
-/// `ordinal` is `None` for the else branch.
-pub(crate) struct SelectedIfBranch<'a> {
-    pub(crate) ordinal: Option<usize>,
-    pub(crate) body: &'a [BranchBody],
-}
-
-pub(crate) fn select_if_branch_with_ordinal<'bump, 'a, F>(
-    chain: &'a IfChain,
-    mut eval_condition: F,
-) -> Result<Option<SelectedIfBranch<'a>>>
-where
-    F: FnMut(&Expr) -> Result<Value<'bump>>,
-{
-    for (ordinal, (condition, body)) in chain.branches.iter().enumerate() {
-        if eval_condition(condition)?.is_truthy() {
-            return Ok(Some(SelectedIfBranch {
-                ordinal: Some(ordinal),
-                body,
-            }));
-        }
-    }
-    Ok(chain.else_body.as_deref().map(|body| SelectedIfBranch {
-        ordinal: None,
-        body,
-    }))
 }
 
 /// String coercion used by templates, format() placeholders, and any

@@ -34,7 +34,7 @@ use clap::Parser;
 
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
-use crate::pipeline::{CompiledConfig, run_pipeline};
+use crate::pipeline::{CompiledConfig, compile_runtime_blueprint, run_pipeline_blueprint};
 
 #[derive(Parser)]
 #[command(name = "limpid", about = "Log pipelines, limpid as intent.")]
@@ -242,7 +242,7 @@ fn run_daemon(config_path: &str) -> Result<()> {
                     // Snapshot the running config (in-memory, not from disk)
                     // so we can fall back to it if the new config fails to
                     // start.
-                    let old_config = runtime.compiled_config();
+                    let old_blueprint = runtime.blueprint();
 
                     // Load + validate + analyze the new config from disk.
                     // Any analyzer error (= what `--check` would reject) is
@@ -274,7 +274,7 @@ fn run_daemon(config_path: &str) -> Result<()> {
                         Err(e) => {
                             tracing::error!("reload: failed to start new runtime: {}", e);
                             // Rollback with in-memory snapshot of previous config
-                            match runtime::Runtime::start(old_config, file).await {
+                            match runtime::Runtime::start_blueprint(old_blueprint, file).await {
                                 Ok(restored) => {
                                     runtime = restored;
                                     tracing::warn!("reload: rolled back to previous configuration");
@@ -453,7 +453,7 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
         config::load_config(Path::new(config_path)).context("failed to load configuration")?;
     let compiled = CompiledConfig::from_config(config)?;
 
-    let pipeline_def = compiled.pipelines.get(pipeline_name).context(format!(
+    compiled.pipelines.get(pipeline_name).context(format!(
         "pipeline '{}' not found. Available: {}",
         pipeline_name,
         compiled
@@ -463,6 +463,13 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
             .collect::<Vec<_>>()
             .join(", ")
     ))?;
+
+    // Compile, seal, and bind the same immutable execution IR used by the
+    // daemon before acquiring tables or any other external resource. The
+    // test-only registry is intentionally dropped when this command exits.
+    let blueprint = compile_runtime_blueprint(&compiled)?;
+    let metric_registry = crate::metrics::Registry::new();
+    let bound_blueprint = blueprint.bind(&metric_registry)?;
 
     let table_store = runtime::init_tables(&compiled)?;
     let mut func_registry = FunctionRegistry::new();
@@ -475,10 +482,10 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
     // (render moved consumer-side, see `pipeline::run_pipeline`).
     let mut bump = bumpalo::Bump::new();
     let mut trace = Vec::new();
-    let result = run_pipeline(
-        pipeline_def,
+    let result = run_pipeline_blueprint(
+        &bound_blueprint,
+        pipeline_name,
         &event,
-        &compiled,
         &func_registry,
         None,
         Some(&mut trace),
