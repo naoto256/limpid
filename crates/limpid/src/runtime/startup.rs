@@ -286,7 +286,7 @@ impl Runtime {
         for (pipeline_id, pipeline) in blueprint.pipelines() {
             let worker = Arc::new(PipelineWorker::from_bound(
                 pipeline_id,
-                &blueprint,
+                &bound_blueprint,
                 &metrics_registry,
             )?);
             // Routing deliberately uses only the first top-level `input`
@@ -452,7 +452,6 @@ impl Runtime {
             let ctx = PipelineContext {
                 output_senders: Arc::clone(&output_senders),
                 disk_outputs: Arc::clone(&disk_outputs),
-                bound_blueprint: Arc::clone(&bound_blueprint),
                 funcs: Arc::clone(&func_registry),
                 tap: tap.clone(),
                 error_log: error_log.as_ref().map(Arc::clone),

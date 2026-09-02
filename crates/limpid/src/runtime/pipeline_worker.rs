@@ -13,7 +13,6 @@ pub(super) struct PipelineContext {
     /// downstream reader (sink, DLQ record, output tap) touches
     /// workspace on that path.
     pub(super) disk_outputs: Arc<HashSet<String>>,
-    pub(super) bound_blueprint: Arc<crate::pipeline::BoundRuntimeBlueprint>,
     pub(super) funcs: Arc<FunctionRegistry>,
     pub(super) tap: TapRegistry,
     /// Dead-letter queue writer used for: (1) `process` runtime
@@ -41,7 +40,7 @@ pub(super) struct PipelineContext {
 // ---------------------------------------------------------------------------
 
 pub(super) struct PipelineWorker {
-    pub(super) pipeline_id: crate::pipeline::PipelineId,
+    pub(super) execution: Arc<crate::pipeline::BoundPipelineExecution>,
     pub(super) metrics: Arc<PipelineMetrics>,
     #[cfg(test)]
     pub(super) serial_test_gate: Option<Arc<tokio::sync::Barrier>>,
@@ -50,15 +49,15 @@ pub(super) struct PipelineWorker {
 impl PipelineWorker {
     pub(super) fn from_bound(
         pipeline_id: crate::pipeline::PipelineId,
-        blueprint: &crate::pipeline::RuntimeBlueprint,
+        bound: &Arc<crate::pipeline::BoundRuntimeBlueprint>,
         registry: &Registry,
     ) -> anyhow::Result<Self> {
-        let pipeline = blueprint
-            .pipeline_by_id(pipeline_id)
-            .ok_or_else(|| anyhow::anyhow!("pipeline id is not in the blueprint"))?;
+        let execution = bound
+            .pipeline_execution(pipeline_id)
+            .ok_or_else(|| anyhow::anyhow!("pipeline id is not in the bound blueprint"))?;
         Ok(Self {
-            pipeline_id,
-            metrics: PipelineMetrics::register(registry, &pipeline.name)?,
+            execution: Arc::clone(execution),
+            metrics: PipelineMetrics::register(registry, &execution.pipeline().name)?,
             #[cfg(test)]
             serial_test_gate: None,
         })
@@ -161,7 +160,7 @@ pub(super) async fn run_pipeline_workers(
 }
 
 pub(super) async fn run_pipeline_with_outputs_inner(
-    pipeline: &crate::pipeline::PipelineBlueprint,
+    execution: &crate::pipeline::BoundPipelineExecution,
     event: &Event,
     ctx: &PipelineContext,
     bump: &mut bumpalo::Bump,
@@ -172,8 +171,7 @@ pub(super) async fn run_pipeline_with_outputs_inner(
     // `to_string` work behind it) in `run_pipeline`, since nothing
     // here reads `PipelineRunResult::trace`.
     let mut result = crate::pipeline::run_pipeline_blueprint_resolved_at(
-        &ctx.bound_blueprint,
-        pipeline,
+        execution,
         event,
         &ctx.funcs,
         Some(&ctx.tap),
@@ -182,7 +180,7 @@ pub(super) async fn run_pipeline_with_outputs_inner(
         bump,
         dispatch_started_at,
     )?;
-    enqueue_pipeline_outputs(&pipeline.name, &mut result, ctx).await;
+    enqueue_pipeline_outputs(&execution.pipeline().name, &mut result, ctx).await;
     Ok(result)
 }
 
@@ -342,22 +340,15 @@ pub(super) async fn process_event_at(
             gate.wait().await;
         }
         worker.metrics.inflight.inc();
-        let Some(pipeline) = ctx
-            .bound_blueprint
-            .blueprint
-            .pipeline_by_id(worker.pipeline_id)
-        else {
-            // A sealed immutable blueprint cannot lose a PipelineId that was
-            // assigned to this worker. Keep accounting balanced and fail
-            // closed if that internal invariant is ever violated.
-            worker.metrics.events_errored.inc();
-            error!("pipeline id is not in the runtime blueprint");
-            worker.metrics.inflight.dec();
-            continue;
-        };
-        let pipeline_name = pipeline.name.as_str();
-        let run_result =
-            run_pipeline_with_outputs_inner(pipeline, event, ctx, bump, dispatch_started_at).await;
+        let pipeline_name = worker.execution.pipeline().name.as_str();
+        let run_result = run_pipeline_with_outputs_inner(
+            &worker.execution,
+            event,
+            ctx,
+            bump,
+            dispatch_started_at,
+        )
+        .await;
         match run_result {
             Ok(result) => {
                 use crate::pipeline::PipelineTermination;
