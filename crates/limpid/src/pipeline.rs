@@ -17,8 +17,8 @@
 mod blueprint;
 mod compiled_config;
 pub(crate) use blueprint::{
-    BoundRuntimeBlueprint, PipelineBlueprint, PipelineId, RuntimeBlueprint, SiteKind,
-    compile_runtime_blueprint,
+    BoundPipelineExecution, BoundRuntimeBlueprint, PipelineBlueprint, PipelineId, RuntimeBlueprint,
+    SiteKind, compile_runtime_blueprint,
 };
 pub use compiled_config::CompiledConfig;
 

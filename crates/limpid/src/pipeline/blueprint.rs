@@ -15,6 +15,7 @@ use super::CompiledConfig;
 #[cfg(test)]
 std::thread_local! {
     static PIPELINE_BY_ID_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BOUND_PIPELINE_EXECUTION_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -213,7 +214,10 @@ pub(crate) struct UnsealedRuntimeBlueprint {
     pub(crate) global_blocks: HashMap<String, Vec<Property>>,
     pub(crate) process_bodies: Vec<ProcessBodyCode>,
     pub(crate) process_names: BTreeMap<String, ProcessBodyId>,
-    pub(crate) pipelines: BTreeMap<String, PipelineBlueprint>,
+    /// Declarative IR ownership only. The Arc lets per-start bound execution
+    /// descriptors share these sealed bytes without cloning pipeline code; it
+    /// is not a registry, counter, task, socket, table, or resource handle.
+    pub(crate) pipelines: BTreeMap<String, Arc<PipelineBlueprint>>,
     pub(crate) pipeline_ids: BTreeMap<String, PipelineId>,
     pub(crate) pipeline_order: Vec<String>,
 }
@@ -230,13 +234,22 @@ pub(crate) struct RuntimeBlueprint {
 /// registry before acquiring modules, sockets, tables, or tasks.
 pub(crate) struct BoundRuntimeBlueprint {
     pub(crate) blueprint: Arc<RuntimeBlueprint>,
-    pub(crate) pipelines: BTreeMap<String, BoundPipelineMetrics>,
+    pipelines: Vec<Arc<BoundPipelineExecution>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct BoundPipelineMetrics {
     pub(crate) process_counters: Vec<crate::metrics::ProcessCounters>,
     pub(crate) output_timers: Vec<crate::metrics::PipelineOutputTimer>,
+}
+
+/// Startup-resolved execution authority for one pipeline. Workers share this
+/// immutable descriptor, so event dispatch never re-enters identity or metric
+/// maps and never repeats binding-shape validation.
+pub(crate) struct BoundPipelineExecution {
+    blueprint: Arc<RuntimeBlueprint>,
+    pipeline: Arc<PipelineBlueprint>,
+    metrics: BoundPipelineMetrics,
 }
 
 pub(crate) fn compile_runtime_blueprint(config: &CompiledConfig) -> Result<Arc<RuntimeBlueprint>> {
@@ -270,16 +283,27 @@ impl RuntimeBlueprint {
 
     #[cfg(test)]
     pub(crate) fn pipeline(&self, name: &str) -> Option<&PipelineBlueprint> {
-        self.unsealed.pipelines.get(name)
+        self.unsealed.pipelines.get(name).map(Arc::as_ref)
     }
 
     pub(crate) fn pipeline_id(&self, name: &str) -> Option<PipelineId> {
         self.unsealed.pipeline_ids.get(name).copied()
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Mutant seam: a restored event-path lookup increments the observer.
     pub(crate) fn pipeline_by_id(&self, id: PipelineId) -> Option<&PipelineBlueprint> {
         #[cfg(test)]
         PIPELINE_BY_ID_CALLS.with(|calls| calls.set(calls.get() + 1));
+        self.unsealed
+            .pipeline_order
+            .get(id.index())
+            .and_then(|name| self.unsealed.pipelines.get(name))
+            .map(Arc::as_ref)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pipeline_arc(&self, id: PipelineId) -> Option<&Arc<PipelineBlueprint>> {
         self.unsealed
             .pipeline_order
             .get(id.index())
@@ -304,7 +328,7 @@ impl RuntimeBlueprint {
             .filter_map(|(index, name)| {
                 Some((
                     PipelineId::from_index(index).ok()?,
-                    self.unsealed.pipelines.get(name)?,
+                    self.unsealed.pipelines.get(name)?.as_ref(),
                 ))
             })
     }
@@ -337,8 +361,12 @@ impl RuntimeBlueprint {
         self: &Arc<Self>,
         registry: &crate::metrics::Registry,
     ) -> Result<BoundRuntimeBlueprint> {
-        let mut pipelines = BTreeMap::new();
-        for (pipeline_name, pipeline) in &self.unsealed.pipelines {
+        let mut pipelines = Vec::with_capacity(self.unsealed.pipeline_order.len());
+        for pipeline_name in &self.unsealed.pipeline_order {
+            let pipeline =
+                self.unsealed.pipelines.get(pipeline_name).ok_or_else(|| {
+                    anyhow::anyhow!("pipeline '{pipeline_name}' is missing at bind")
+                })?;
             let process_counters = pipeline
                 .metric_nodes
                 .iter()
@@ -359,13 +387,14 @@ impl RuntimeBlueprint {
                     crate::metrics::PipelineOutputTimer::register(registry, pipeline_name, output)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            pipelines.insert(
-                pipeline_name.clone(),
+            pipelines.push(Arc::new(BoundPipelineExecution::new(
+                Arc::clone(self),
+                Arc::clone(pipeline),
                 BoundPipelineMetrics {
                     process_counters,
                     output_timers,
                 },
-            );
+            )?));
         }
         Ok(BoundRuntimeBlueprint {
             blueprint: Arc::clone(self),
@@ -375,18 +404,65 @@ impl RuntimeBlueprint {
 }
 
 impl BoundRuntimeBlueprint {
-    #[cfg(test)]
-    pub(crate) fn pipeline_metrics(&self, id: PipelineId) -> Option<&BoundPipelineMetrics> {
-        let pipeline = self.blueprint.pipeline_by_id(id)?;
-        self.pipeline_metrics_resolved(pipeline)
+    pub(crate) fn pipeline_execution(
+        &self,
+        id: PipelineId,
+    ) -> Option<&Arc<BoundPipelineExecution>> {
+        self.pipelines.get(id.index())
     }
 
-    pub(crate) fn pipeline_metrics_resolved(
-        &self,
-        pipeline: &PipelineBlueprint,
-    ) -> Option<&BoundPipelineMetrics> {
-        self.pipelines.get(&pipeline.name)
+    #[cfg(test)]
+    pub(crate) fn pipeline_metrics(&self, id: PipelineId) -> Option<&BoundPipelineMetrics> {
+        self.pipeline_execution(id).map(|bound| bound.metrics())
     }
+}
+
+impl BoundPipelineExecution {
+    fn new(
+        blueprint: Arc<RuntimeBlueprint>,
+        pipeline: Arc<PipelineBlueprint>,
+        metrics: BoundPipelineMetrics,
+    ) -> Result<Self> {
+        if metrics.process_counters.len() != pipeline.metric_nodes.len()
+            || metrics.output_timers.len() != pipeline.output_timers.len()
+        {
+            bail!("pipeline '{}' metric binding shape mismatch", pipeline.name);
+        }
+        #[cfg(test)]
+        BOUND_PIPELINE_EXECUTION_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        Ok(Self {
+            blueprint,
+            pipeline,
+            metrics,
+        })
+    }
+
+    pub(crate) fn blueprint(&self) -> &RuntimeBlueprint {
+        &self.blueprint
+    }
+
+    pub(crate) fn pipeline(&self) -> &PipelineBlueprint {
+        &self.pipeline
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pipeline_arc(&self) -> &Arc<PipelineBlueprint> {
+        &self.pipeline
+    }
+
+    pub(crate) fn metrics(&self) -> &BoundPipelineMetrics {
+        &self.metrics
+    }
+}
+
+#[cfg(test)]
+fn reset_bound_pipeline_execution_constructions_for_testing() {
+    BOUND_PIPELINE_EXECUTION_CONSTRUCTIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn bound_pipeline_execution_constructions_for_testing() -> usize {
+    BOUND_PIPELINE_EXECUTION_CONSTRUCTIONS.with(std::cell::Cell::get)
 }
 
 impl UnsealedRuntimeBlueprint {
@@ -402,7 +478,7 @@ impl UnsealedRuntimeBlueprint {
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("pipeline '{name}' disappeared during compile"))?;
             let compiled = compiler.compile_pipeline(pipeline)?;
-            pipelines.insert(name.clone(), compiled);
+            pipelines.insert(name.clone(), Arc::new(compiled));
         }
         let pipeline_order: Vec<String> = pipelines.keys().cloned().collect();
         let pipeline_ids = pipeline_order
@@ -1217,6 +1293,13 @@ mod tests {
         UnsealedRuntimeBlueprint::compile(&config).expect("compile unsealed blueprint")
     }
 
+    fn pipeline_mut<'a>(
+        blueprint: &'a mut UnsealedRuntimeBlueprint,
+        name: &str,
+    ) -> &'a mut PipelineBlueprint {
+        Arc::make_mut(blueprint.pipelines.get_mut(name).expect("pipeline"))
+    }
+
     fn topology_fixture() -> &'static str {
         r#"
 def process leaf { egress = ingress }
@@ -1589,35 +1672,19 @@ def pipeline p { process root; finish }
         assert!(seal_error(cycle).contains("process call cycle"));
 
         let mut bad_child = compile(source);
-        bad_child
-            .pipelines
-            .get_mut("p")
-            .expect("pipeline")
-            .metric_nodes[0]
-            .children[0] = MetricNodeId(u32::MAX);
+        pipeline_mut(&mut bad_child, "p").metric_nodes[0].children[0] = MetricNodeId(u32::MAX);
         assert!(seal_error(bad_child).contains("metric child id is out of range"));
 
         let mut bad_identity = compile(source);
-        bad_identity
-            .pipelines
-            .get_mut("p")
-            .expect("pipeline")
-            .metric_nodes[1]
-            .process_name = "wrong".to_owned();
+        pipeline_mut(&mut bad_identity, "p").metric_nodes[1].process_name = "wrong".to_owned();
         assert!(seal_error(bad_identity).contains("metric child identity mismatch"));
 
         let mut bad_target = compile(source);
-        bad_target
-            .pipelines
-            .get_mut("p")
-            .expect("pipeline")
-            .metric_nodes[1]
-            .target = ProcessTarget::Unknown;
+        pipeline_mut(&mut bad_target, "p").metric_nodes[1].target = ProcessTarget::Unknown;
         assert!(seal_error(bad_target).contains("metric child identity mismatch"));
 
         let mut bad_site_kind = compile(source);
-        let PipelineCode::ProcessChain(sites) =
-            &mut bad_site_kind.pipelines.get_mut("p").expect("pipeline").code[0]
+        let PipelineCode::ProcessChain(sites) = &mut pipeline_mut(&mut bad_site_kind, "p").code[0]
         else {
             panic!("first statement must be a process chain");
         };
@@ -1625,10 +1692,7 @@ def pipeline p { process root; finish }
         assert!(seal_error(bad_site_kind).contains("process site kind mismatch"));
 
         let mut bad_subscription = compile("def pipeline p { input a, b; finish }");
-        bad_subscription
-            .pipelines
-            .get_mut("p")
-            .expect("pipeline")
+        pipeline_mut(&mut bad_subscription, "p")
             .subscription_inputs
             .clear();
         assert!(seal_error(bad_subscription).contains("subscription input identity mismatch"));
@@ -1636,30 +1700,18 @@ def pipeline p { process root; finish }
         let mut unknown_with_child = compile(
             "def process parent { process missing } def pipeline p { process parent; finish }",
         );
-        unknown_with_child
-            .pipelines
-            .get_mut("p")
-            .expect("pipeline")
-            .metric_nodes[1]
+        pipeline_mut(&mut unknown_with_child, "p").metric_nodes[1]
             .children
             .push(MetricNodeId(0));
         assert!(seal_error(unknown_with_child).contains("unknown metric node has children"));
 
         let mut bad_series = compile(source);
-        bad_series
-            .pipelines
-            .get_mut("p")
-            .expect("pipeline")
-            .metric_nodes[1]
-            .step = 1;
+        pipeline_mut(&mut bad_series, "p").metric_nodes[1].step = 1;
         assert!(seal_error(bad_series).contains("metric step sequence mismatch"));
 
         let mut bad_root_selection = compile(source);
-        let PipelineCode::ProcessChain(sites) = &mut bad_root_selection
-            .pipelines
-            .get_mut("p")
-            .expect("pipeline")
-            .code[0]
+        let PipelineCode::ProcessChain(sites) =
+            &mut pipeline_mut(&mut bad_root_selection, "p").code[0]
         else {
             panic!("first statement must be a process chain");
         };
@@ -1670,11 +1722,8 @@ def pipeline p { process root; finish }
         );
 
         let mut bad_timer_selection = compile("def pipeline timer { output sink; finish }");
-        let PipelineCode::Output { timer_slot, .. } = &mut bad_timer_selection
-            .pipelines
-            .get_mut("timer")
-            .expect("pipeline")
-            .code[0]
+        let PipelineCode::Output { timer_slot, .. } =
+            &mut pipeline_mut(&mut bad_timer_selection, "timer").code[0]
         else {
             panic!("first statement must be output");
         };
@@ -1716,21 +1765,43 @@ def pipeline p {
         );
         let registry_one = crate::metrics::Registry::new();
         let registry_two = crate::metrics::Registry::new();
+        reset_bound_pipeline_execution_constructions_for_testing();
         let bound_one = blueprint.bind(&registry_one).expect("first fresh bind");
+        assert_eq!(bound_pipeline_execution_constructions_for_testing(), 1);
         let bound_two = blueprint.bind(&registry_two).expect("second fresh bind");
+        assert_eq!(bound_pipeline_execution_constructions_for_testing(), 2);
         assert!(Arc::ptr_eq(&bound_one.blueprint, &blueprint));
         assert!(Arc::ptr_eq(&bound_two.blueprint, &blueprint));
 
+        let pipeline_id = blueprint.pipeline_id("p").expect("pipeline id");
         let descriptor = blueprint.pipeline("p").expect("pipeline descriptor");
-        let first = bound_one.pipelines.get("p").expect("first bound pipeline");
-        let second = bound_two.pipelines.get("p").expect("second bound pipeline");
-        assert_eq!(first.process_counters.len(), descriptor.metric_nodes.len());
-        assert_eq!(second.process_counters.len(), descriptor.metric_nodes.len());
-        assert_eq!(first.output_timers.len(), descriptor.output_timers.len());
-        assert_eq!(second.output_timers.len(), descriptor.output_timers.len());
+        let first = bound_one
+            .pipeline_execution(pipeline_id)
+            .expect("first bound pipeline");
+        let second = bound_two
+            .pipeline_execution(pipeline_id)
+            .expect("second bound pipeline");
+        assert!(!Arc::ptr_eq(first, second));
+        assert!(Arc::ptr_eq(first.pipeline_arc(), second.pipeline_arc()));
+        assert_eq!(
+            first.metrics().process_counters.len(),
+            descriptor.metric_nodes.len()
+        );
+        assert_eq!(
+            second.metrics().process_counters.len(),
+            descriptor.metric_nodes.len()
+        );
+        assert_eq!(
+            first.metrics().output_timers.len(),
+            descriptor.output_timers.len()
+        );
+        assert_eq!(
+            second.metrics().output_timers.len(),
+            descriptor.output_timers.len()
+        );
         assert_eq!(descriptor.output_timers, ["sink", "other"]);
 
-        for (index, counter) in first.process_counters.iter().enumerate() {
+        for (index, counter) in first.metrics().process_counters.iter().enumerate() {
             for _ in 0..=index {
                 counter.start();
             }
@@ -1754,7 +1825,7 @@ def pipeline p {
             );
         }
 
-        first.output_timers[0].observe_between(
+        first.metrics().output_timers[0].observe_between(
             crate::time::UnixNanos::new(10),
             crate::time::UnixNanos::new(20),
         );
@@ -1800,7 +1871,7 @@ def pipeline p {
                 "pub(crate) global_blocks: HashMap<String, Vec<Property>>,",
                 "pub(crate) process_bodies: Vec<ProcessBodyCode>,",
                 "pub(crate) process_names: BTreeMap<String, ProcessBodyId>,",
-                "pub(crate) pipelines: BTreeMap<String, PipelineBlueprint>,",
+                "pub(crate) pipelines: BTreeMap<String, Arc<PipelineBlueprint>>,",
                 "pub(crate) pipeline_ids: BTreeMap<String, PipelineId>,",
                 "pub(crate) pipeline_order: Vec<String>,",
             ],
@@ -1921,6 +1992,29 @@ def pipeline p {
     }
 
     #[test]
+    fn bound_pipeline_execution_rejects_shape_corruption_before_runtime() {
+        let config = CompiledConfig::from_config(
+            parse_config("def pipeline p { process { drop }; output sink; finish }")
+                .expect("parse shape fixture"),
+        )
+        .expect("compile shape fixture");
+        let blueprint = compile_runtime_blueprint(&config).expect("compile blueprint");
+        let pipeline_id = blueprint.pipeline_id("p").expect("pipeline id");
+        let pipeline = blueprint.pipeline_arc(pipeline_id).expect("pipeline arc");
+        let error = BoundPipelineExecution::new(
+            Arc::clone(&blueprint),
+            Arc::clone(pipeline),
+            BoundPipelineMetrics {
+                process_counters: Vec::new(),
+                output_timers: Vec::new(),
+            },
+        )
+        .err()
+        .expect("shape corruption must fail at bind time");
+        assert!(error.to_string().contains("metric binding shape mismatch"));
+    }
+
+    #[test]
     fn deep_process_calls_switch_metric_frames_through_edge_slots() {
         let execution = include_str!("execution.rs");
         assert!(
@@ -1973,7 +2067,7 @@ def pipeline p {
             "#[cfg(test)]\n    pub(super) serial_test_gate: Option<Arc<tokio::sync::Barrier>>,",
             "",
         );
-        assert!(production_fields.contains("PipelineId"));
+        assert!(production_fields.contains("Arc<crate::pipeline::BoundPipelineExecution>"));
         for forbidden in ["PipelineDef", "ProcessDef", "Option<"] {
             assert!(
                 !production_fields.contains(forbidden),
@@ -2077,9 +2171,48 @@ def pipeline fan_in { input a, b, c; finish }
             .expect("process_event_at body");
         assert_eq!(
             process_event.matches("pipeline_by_id(").count(),
-            1,
-            "each pipeline/event must resolve its immutable identity exactly once"
+            0,
+            "event dispatch must use the startup-resolved pipeline descriptor"
         );
+        assert_eq!(
+            process_event.matches("pipeline_id(").count(),
+            0,
+            "event dispatch must not re-resolve a pipeline name through the id map"
+        );
+        assert_eq!(
+            process_event.matches("pipeline_metrics_resolved(").count(),
+            0,
+            "event dispatch must not resolve metric handles by pipeline name"
+        );
+        assert!(!process_event.contains("metric binding shape mismatch"));
+        assert_eq!(
+            process_event.matches("Arc::clone(").count(),
+            0,
+            "event dispatch must borrow the worker descriptor without a refcount bump"
+        );
+
+        let execution = include_str!("execution.rs");
+        let resolved = execution
+            .split("pub(crate) fn run_pipeline_blueprint_resolved_at")
+            .nth(1)
+            .expect("resolved pipeline runner")
+            .split("struct IrProcessRegistry")
+            .next()
+            .expect("resolved runner body");
+        for forbidden in [
+            "pipeline_id(",
+            "pipeline_by_id(",
+            "pipeline_metrics_resolved(",
+            "metric binding shape mismatch",
+            "process_counters.len()",
+            "output_timers.len()",
+            "Arc::clone(",
+        ] {
+            assert!(
+                !resolved.contains(forbidden),
+                "resolved event runner retained hot-path work: {forbidden}"
+            );
+        }
     }
 
     #[test]

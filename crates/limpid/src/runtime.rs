@@ -1655,12 +1655,25 @@ def pipeline p {{ input source; output sink }}
         let worker = Arc::new(
             PipelineWorker::from_bound(
                 runtime_blueprint.blueprint.pipeline_id("p").unwrap(),
-                &runtime_blueprint.blueprint,
+                &runtime_blueprint,
                 &metrics_registry,
             )
             .expect("pipeline metrics must register"),
         );
         let workers: Arc<Vec<Arc<PipelineWorker>>> = Arc::new(vec![Arc::clone(&worker)]);
+        let worker_for_a = Arc::clone(&workers[0]);
+        let worker_for_b = Arc::new(
+            PipelineWorker::from_bound(
+                runtime_blueprint.blueprint.pipeline_id("p").unwrap(),
+                &runtime_blueprint,
+                &Registry::new(),
+            )
+            .expect("a second fan-in worker must reuse the bound descriptor"),
+        );
+        assert!(Arc::ptr_eq(
+            &worker_for_a.execution,
+            &worker_for_b.execution,
+        ));
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (tx_a, rx_a) = mpsc::channel::<Event>(16);
@@ -1674,7 +1687,6 @@ def pipeline p {{ input source; output sink }}
         let ctx_a = PipelineContext {
             output_senders: Arc::new(HashMap::new()),
             disk_outputs: Arc::clone(&disk_outputs),
-            bound_blueprint: Arc::clone(&runtime_blueprint),
             funcs: Arc::new(FunctionRegistry::new()),
             tap: tap.clone(),
             error_log: None,
@@ -1683,7 +1695,6 @@ def pipeline p {{ input source; output sink }}
         let ctx_b = PipelineContext {
             output_senders: Arc::clone(&ctx_a.output_senders),
             disk_outputs: Arc::clone(&disk_outputs),
-            bound_blueprint: runtime_blueprint,
             funcs: Arc::clone(&ctx_a.funcs),
             tap: tap.clone(),
             error_log: None,
@@ -1739,7 +1750,7 @@ def pipeline p {{ input source; output sink }}
         let worker = Arc::new(
             PipelineWorker::from_bound(
                 runtime_blueprint.blueprint.pipeline_id("p").unwrap(),
-                &runtime_blueprint.blueprint,
+                &runtime_blueprint,
                 &metrics_registry,
             )
             .expect("pipeline metrics must register"),
@@ -1771,7 +1782,6 @@ def pipeline p {{ input source; output sink }}
         let ctx = Arc::new(PipelineContext {
             output_senders: Arc::new(HashMap::from([("sink".to_owned(), queue_sender)])),
             disk_outputs: Arc::new(HashSet::new()),
-            bound_blueprint: runtime_blueprint,
             funcs: Arc::new(FunctionRegistry::new()),
             tap,
             error_log: None,
@@ -1919,6 +1929,11 @@ def pipeline p {{ input source; output sink }}
             compiled_config("def pipeline p { input i; output sink_a; output sink_b; finish }");
         let runtime_blueprint = bound_blueprint(&cfg);
         let pipeline_id = runtime_blueprint.blueprint.pipeline_id("p").unwrap();
+        let execution = Arc::clone(
+            runtime_blueprint
+                .pipeline_execution(pipeline_id)
+                .expect("pipeline p"),
+        );
         let ctx = PipelineContext {
             // Empty output_senders → every `output` statement falls
             // into the "unknown output" arm and is reported as a
@@ -1926,7 +1941,6 @@ def pipeline p {{ input source; output sink }}
             // is meant to split per-output.
             output_senders: Arc::new(HashMap::new()),
             disk_outputs: Arc::new(HashSet::new()),
-            bound_blueprint: runtime_blueprint,
             funcs: Arc::new(FunctionRegistry::new()),
             tap: TapRegistry::new(),
             error_log: None,
@@ -1936,13 +1950,8 @@ def pipeline p {{ input source; output sink }}
         let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
         let event = Event::new(Bytes::from_static(b"payload"), addr);
         let mut bump = bumpalo::Bump::new();
-        let pipeline = ctx
-            .bound_blueprint
-            .blueprint
-            .pipeline_by_id(pipeline_id)
-            .expect("pipeline p");
         let result = run_pipeline_with_outputs_inner(
-            pipeline,
+            &execution,
             &event,
             &ctx,
             &mut bump,
@@ -1993,7 +2002,7 @@ def pipeline p {{ input source; output sink }}
             let worker = Arc::new(
                 PipelineWorker::from_bound(
                     runtime_blueprint.blueprint.pipeline_id("p").unwrap(),
-                    &runtime_blueprint.blueprint,
+                    &runtime_blueprint,
                     &registry,
                 )
                 .expect("pipeline metrics must register"),
@@ -2005,7 +2014,6 @@ def pipeline p {{ input source; output sink }}
             let ctx = PipelineContext {
                 output_senders: Arc::new(HashMap::new()),
                 disk_outputs: Arc::new(HashSet::new()),
-                bound_blueprint: runtime_blueprint,
                 funcs: Arc::new(FunctionRegistry::new()),
                 tap: TapRegistry::new(),
                 error_log: Some(Arc::clone(&error_log)),
@@ -2084,12 +2092,9 @@ def pipeline p {{ input source; output sink }}
         let registry = Registry::new();
         let normal_timer = crate::metrics::InputQueueTimer::register(&registry, "normal").unwrap();
         let drain_timer = crate::metrics::InputQueueTimer::register(&registry, "drain").unwrap();
-        let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
-        let runtime_blueprint = bound_blueprint(&cfg);
         let context = PipelineContext {
             output_senders: Arc::new(HashMap::new()),
             disk_outputs: Arc::new(HashSet::new()),
-            bound_blueprint: runtime_blueprint,
             funcs: Arc::new(FunctionRegistry::new()),
             tap: TapRegistry::new(),
             error_log: None,
@@ -2159,19 +2164,22 @@ def pipeline second { input i; output sink; finish }
             .map(|name| {
                 PipelineWorker::from_bound(
                     runtime_blueprint.blueprint.pipeline_id(name).unwrap(),
-                    &runtime_blueprint.blueprint,
+                    &runtime_blueprint,
                     &registry,
                 )
                 .unwrap()
             })
             .collect();
         workers[0].serial_test_gate = Some(Arc::clone(&gate));
+        let first_execution = runtime_blueprint
+            .pipeline_execution(runtime_blueprint.blueprint.pipeline_id("first").unwrap())
+            .unwrap();
+        assert!(Arc::ptr_eq(&workers[0].execution, first_execution,));
         let workers: Vec<_> = workers.into_iter().map(Arc::new).collect();
         let timer = crate::metrics::InputQueueTimer::register(&registry, "i").unwrap();
         let context = PipelineContext {
             output_senders: Arc::new(HashMap::new()),
             disk_outputs: Arc::new(HashSet::new()),
-            bound_blueprint: runtime_blueprint,
             funcs: Arc::new(FunctionRegistry::new()),
             tap: TapRegistry::new(),
             error_log: None,
@@ -2184,8 +2192,7 @@ def pipeline second { input i; output sink; finish }
         );
         event.received_at =
             crate::time::UnixNanos::new(dispatch_started_at.get() - 60_000_000_000).to_datetime();
-        context
-            .bound_blueprint
+        runtime_blueprint
             .blueprint
             .reset_pipeline_by_id_calls_for_testing();
 
@@ -2209,12 +2216,11 @@ def pipeline second { input i; output sink; finish }
         tokio::join!(process, hold_first_worker);
 
         assert_eq!(
-            context
-                .bound_blueprint
+            runtime_blueprint
                 .blueprint
                 .pipeline_by_id_calls_for_testing(),
-            2,
-            "two fan-out workers must each borrow their pipeline identity exactly once"
+            0,
+            "event dispatch must use startup-resolved pipeline descriptors"
         );
         assert_eq!(timer.count(), 1);
         assert_eq!(timer.sum(), 60.0);
@@ -2335,7 +2341,7 @@ def pipeline second { input i; output sink; finish }
         let worker = Arc::new(
             PipelineWorker::from_bound(
                 runtime_blueprint.blueprint.pipeline_id("p").unwrap(),
-                &runtime_blueprint.blueprint,
+                &runtime_blueprint,
                 &registry,
             )
             .unwrap(),
@@ -2344,7 +2350,6 @@ def pipeline second { input i; output sink; finish }
         let ctx = PipelineContext {
             output_senders: Arc::new(HashMap::new()),
             disk_outputs: Arc::new(HashSet::new()),
-            bound_blueprint: runtime_blueprint,
             funcs: Arc::new(FunctionRegistry::new()),
             tap: TapRegistry::new(),
             error_log: None,
