@@ -398,13 +398,11 @@ pub(crate) fn run_pipeline_blueprint_by_id_at(
     bump: &mut bumpalo::Bump,
     dispatch_started_at: crate::time::UnixNanos,
 ) -> Result<PipelineRunResult> {
-    let pipeline = bound
-        .blueprint
-        .pipeline_by_id(pipeline_id)
-        .ok_or_else(|| anyhow::anyhow!("pipeline id is not in the blueprint"))?;
+    let execution = bound
+        .pipeline_execution(pipeline_id)
+        .ok_or_else(|| anyhow::anyhow!("pipeline id is not in the bound blueprint"))?;
     run_pipeline_blueprint_resolved_at(
-        bound,
-        pipeline,
+        execution,
         event,
         funcs,
         tap,
@@ -417,8 +415,7 @@ pub(crate) fn run_pipeline_blueprint_by_id_at(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_pipeline_blueprint_resolved_at(
-    bound: &super::blueprint::BoundRuntimeBlueprint,
-    pipeline: &super::blueprint::PipelineBlueprint,
+    execution: &super::blueprint::BoundPipelineExecution,
     event: &OwnedEvent,
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
@@ -427,15 +424,9 @@ pub(crate) fn run_pipeline_blueprint_resolved_at(
     bump: &mut bumpalo::Bump,
     dispatch_started_at: crate::time::UnixNanos,
 ) -> Result<PipelineRunResult> {
+    let pipeline = execution.pipeline();
     let pipeline_name = pipeline.name.as_str();
-    let metrics = bound
-        .pipeline_metrics_resolved(pipeline)
-        .ok_or_else(|| anyhow::anyhow!("pipeline '{pipeline_name}' metric binding is missing"))?;
-    if metrics.process_counters.len() != pipeline.metric_nodes.len()
-        || metrics.output_timers.len() != pipeline.output_timers.len()
-    {
-        bail!("pipeline '{pipeline_name}' metric binding shape mismatch");
-    }
+    let metrics = execution.metrics();
 
     let mut trace = trace;
     if let Some(trace) = trace.as_mut() {
@@ -449,7 +440,7 @@ pub(crate) fn run_pipeline_blueprint_resolved_at(
     let arena = EventArena::new(bump);
     let bevent = event.view_in(&arena);
     let process_registry = IrProcessRegistry {
-        blueprint: &bound.blueprint,
+        blueprint: execution.blueprint(),
         pipeline,
         metrics,
         funcs,
