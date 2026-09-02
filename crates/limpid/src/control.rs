@@ -972,9 +972,21 @@ async fn handle_connection(
 
 /// Build JSON listing of pipelines with their tap points in flow order.
 fn build_list_json(blueprint: &RuntimeBlueprint) -> String {
-    let mut pipelines = Vec::new();
+    let pipeline_defs = blueprint
+        .pipelines()
+        .map(|(_, pipeline)| pipeline)
+        .collect();
 
-    for (_, pipeline) in blueprint.pipelines() {
+    build_list_json_from_pipelines(pipeline_defs)
+}
+
+fn build_list_json_from_pipelines(
+    mut pipeline_defs: Vec<&crate::pipeline::PipelineBlueprint>,
+) -> String {
+    let mut pipelines = Vec::new();
+    pipeline_defs.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+
+    for pipeline in pipeline_defs {
         let mut inputs = pipeline.flow.inputs.clone();
 
         let mut p = Map::new();
@@ -1631,6 +1643,41 @@ def pipeline p {
             build_list_json(&routing_blueprint),
             build_list_json_legacy(&routing_split),
             "recursive control input union must remain byte-exact while routing stays top-level-first"
+        );
+    }
+
+    #[test]
+    fn sealed_blueprint_list_json_preserves_lexical_pipeline_order() {
+        let config = CompiledConfig::from_config(
+            crate::dsl::parser::parse_config(
+                r#"
+def input one { type syslog_udp bind "127.0.0.1:0" }
+def output omega { type stdout }
+def pipeline zeta { input one; output omega }
+def pipeline alpha { input one; output omega }
+"#,
+            )
+            .expect("parse lexical-order fixture"),
+        )
+        .expect("compile lexical-order fixture");
+        let blueprint = crate::pipeline::compile_runtime_blueprint(&config)
+            .expect("compile lexical-order blueprint");
+        let legacy = build_list_json_legacy(&config);
+        let mut reversed_pipelines: Vec<_> = blueprint
+            .pipelines()
+            .map(|(_, pipeline)| pipeline)
+            .collect();
+        reversed_pipelines.reverse();
+
+        assert_eq!(
+            legacy,
+            r#"{"pipelines":[{"name":"alpha","input":"one","processes":[],"outputs":["omega"]},{"name":"zeta","input":"one","processes":[],"outputs":["omega"]}]}"#,
+            "legacy control list JSON must remain lexical by pipeline name"
+        );
+        assert_eq!(
+            build_list_json_from_pipelines(reversed_pipelines),
+            legacy,
+            "control list serialization must enforce lexical order at its own boundary"
         );
     }
 
