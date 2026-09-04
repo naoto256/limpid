@@ -100,7 +100,7 @@ before customising it; package upgrades replace files under
   saved JSONL replayed offline.
 
 See the [pack
-README](../../../packaging/snippets/README.md#slot-registry--composed-layer)
+README](https://github.com/naoto256/limpid/blob/release/0.8.1/packaging/snippets/README.md#slot-registry--composed-layer)
 for the full composed / shed slot registries and the LSIS layer
 contracts. The same README defines the authoring schema: each file declares a
 `Facade`, and every listed process or function has an adjacent contract block.
@@ -212,7 +212,7 @@ def pipeline mixed_in {
 The LSIS namespace convention (three layers: parsed / shed /
 composed) that ties parsers and composers together is documented in
 the [pack
-README](../../../packaging/snippets/README.md#lsis--the-limpid-snippet-intermediate-schema).
+README](https://github.com/naoto256/limpid/blob/release/0.8.1/packaging/snippets/README.md#lsis--the-limpid-snippet-intermediate-schema).
 Snippets and pipelines below follow the same three-layer contract.
 
 The other contract worth calling out here is the loud-fail-fast
@@ -299,7 +299,7 @@ conventions are:
   native KV are different wire shapes; OpenSSH is one file because
   sshd's wire is one shape across syslog and journald.
 - **Canonical file header** follows the per-kind schema documented in the
-  [pack README](../../../packaging/snippets/README.md#authoring-conventions):
+  [pack README](https://github.com/naoto256/limpid/blob/release/0.8.1/packaging/snippets/README.md#authoring-conventions):
   parser files declare `Summary`, `Reads`, `Writes`, `Category`, and
   `Test corpus`; composers and shared functions use their corresponding
   schemas. The header is the source for generated inventory. Keep sample

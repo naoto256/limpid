@@ -91,7 +91,7 @@ The optional `defaults` argument is a hash literal whose keys fill in any field 
 
 This function does **not** rewrite `egress` — it only populates the workspace. The wire payload is whatever the next hop expects to receive, which is almost always still a syslog line; rewrites to `egress` are usually surgical (e.g. `syslog.set_pri(egress, 16, 6)` to renormalise the PRI byte), not wholesale replacements.
 
-If you only need the PRI value (e.g. to route on transport priority without tokenising the rest of the header), reach for the lighter [`syslog.extract_pri`](#syslog-extract_pri-text) instead. PRI is not an LSIS canonical event severity source.
+If you only need the PRI value (e.g. to route on transport priority without tokenising the rest of the header), reach for the lighter [`syslog.extract_pri`](#syslogextract_pritext) instead. PRI is not an LSIS canonical event severity source.
 
 ### syslog.strip_pri(text)
 
