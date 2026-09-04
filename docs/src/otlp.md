@@ -13,7 +13,7 @@ The reference docs for *how to use* OTLP in limpid are elsewhere:
 - [`otlp_http`](./inputs/otlp-http.md) and
   [`otlp_grpc`](./inputs/otlp-grpc.md) — input transports
 - [`otlp_http` output](./outputs/otlp_http.md) / [`otlp_grpc` output](./outputs/otlp_grpc.md) — HTTP and gRPC senders
-- [`otlp.*` functions](./functions/expression-functions.md#otlp---opentelemetry-protocol-logs-signal) —
+- [`otlp.*` functions](./functions/expression-functions.md#otlp--opentelemetry-protocol-logs-signal) —
   encode / decode primitives
 
 The general design philosophy of limpid (the five principles) lives in
@@ -383,7 +383,7 @@ their headers document the exact default and accepted values.
 This is also why the `Event.timestamp` → `Event.received_at` rename
 that landed in v0.5.0 was made: a forwarder must not silently conflate
 wall-clock and source-clock semantics. See the breaking change entry in
-[CHANGELOG.md](../../CHANGELOG.md).
+[CHANGELOG.md](https://github.com/naoto256/limpid/blob/release/0.8.1/CHANGELOG.md).
 
 ### 5.4 Resource attributes are source-adapter-owned
 
@@ -573,7 +573,7 @@ Because the event time is what the source claimed, not what the
 forwarder observed. The two are not the same thing, and conflating
 them motivated the `Event.timestamp` → `Event.received_at` rename
 that landed in v0.5.0. See §5.3 and the
-[CHANGELOG entry](../../CHANGELOG.md) for v0.5.0.
+[CHANGELOG entry](https://github.com/naoto256/limpid/blob/release/0.8.1/CHANGELOG.md) for v0.5.0.
 
 ### *"Can I send Resource attributes from the input layer?"*
 
@@ -601,6 +601,6 @@ section reference and the wire trace.
 | Question | Source |
 |---|---|
 | How do I configure the input / output? | [otlp_http](./inputs/otlp-http.md), [otlp_grpc](./inputs/otlp-grpc.md), [otlp_http output](./outputs/otlp_http.md), [otlp_grpc output](./outputs/otlp_grpc.md) |
-| What primitives are in the `otlp.*` namespace? | [Built-in Functions](./functions/expression-functions.md#otlp---opentelemetry-protocol-logs-signal) |
+| What primitives are in the `otlp.*` namespace? | [Built-in Functions](./functions/expression-functions.md#otlp--opentelemetry-protocol-logs-signal) |
 | What are the design principles this builds on? | [Design Principles](./design-principles.md) |
-| What changed in v0.5.0 specifically? | [CHANGELOG](../../CHANGELOG.md) (covers the `Event.timestamp` → `Event.received_at` rename that landed in v0.5.0) |
+| What changed in v0.5.0 specifically? | [CHANGELOG](https://github.com/naoto256/limpid/blob/release/0.8.1/CHANGELOG.md) (covers the `Event.timestamp` → `Event.received_at` rename that landed in v0.5.0) |

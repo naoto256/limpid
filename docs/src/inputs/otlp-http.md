@@ -79,7 +79,7 @@ def process unpack_otlp {
 }
 ```
 
-See [`otlp.decode_resourcelog_protobuf`](../functions/expression-functions.md#otlpdecode_resourcelog_protobufbytes--object).
+See [`otlp.decode_resourcelog_protobuf`](../functions/expression-functions.md#otlpdecode_resourcelog_protobufbytes_or_string--object).
 
 ## Splitting policy
 
