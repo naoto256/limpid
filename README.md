@@ -135,11 +135,11 @@ See the [Getting Started guide](docs/src/getting-started.md) for installation, .
 
 ### Inputs
 
-`raw_udp` · `syslog_udp` · `syslog_tcp` (with optional TLS / mTLS) · `tail` · `journal`&nbsp;\* · `unix_socket` · `otlp_http` · `otlp_grpc`
+`raw_udp` · `syslog_udp` · `syslog_tcp` (with optional TLS / mTLS) · `tail` · `journal`&nbsp;\* · `unix_socket` · `otlp_http` · `otlp_grpc` · `ltp`
 
 ### Outputs
 
-`syslog_udp` · `syslog_tcp` (with optional per-peer TLS / mTLS) · `file` · `http` (with per-peer TLS / mTLS, round-robin across peers) · `kafka`&nbsp;\* (with optional TLS / mTLS / SASL) · `unix_socket` · `stdout` · `otlp_http` / `otlp_grpc` (with per-peer TLS / mTLS, round-robin across peers)
+`syslog_udp` · `syslog_tcp` (with optional per-peer TLS / mTLS) · `file` · `http` (with per-peer TLS / mTLS, round-robin across peers) · `kafka`&nbsp;\* (with optional TLS / mTLS / SASL) · `unix_socket` · `stdout` · `otlp_http` / `otlp_grpc` (with per-peer TLS / mTLS, round-robin across peers) · `ltp`
 
 \* `journal` and `kafka` are feature-gated — build with `--features journal` / `--features kafka` (see [Quick start](#quick-start)).
 
