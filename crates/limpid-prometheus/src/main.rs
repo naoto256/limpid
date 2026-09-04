@@ -831,7 +831,7 @@ mod tests {
                 "type": "gauge",
                 "help": "Build information for the running limpid node.",
                 "series": [{
-                    "labels": {"node_id": "edge-a", "version": "0.8.0"},
+                    "labels": {"node_id": "edge-a", "version": "0.8.1"},
                     "value": 1
                 }]
             }]
@@ -842,7 +842,7 @@ mod tests {
             concat!(
                 "# HELP limpid_build_info Build information for the running limpid node.\n",
                 "# TYPE limpid_build_info gauge\n",
-                "limpid_build_info{node_id=\"edge-a\",version=\"0.8.0\"} 1\n\n"
+                "limpid_build_info{node_id=\"edge-a\",version=\"0.8.1\"} 1\n\n"
             )
         );
     }
