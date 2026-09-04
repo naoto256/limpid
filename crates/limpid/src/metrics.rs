@@ -1699,7 +1699,7 @@ mod registry_tests {
     #[test]
     fn build_info_is_one_prepopulated_gauge_with_fixed_labels() {
         let registry = Registry::new();
-        super::register_build_info(&registry, "0.8.0", "node-a").expect("build info must register");
+        super::register_build_info(&registry, "0.8.1", "node-a").expect("build info must register");
 
         let snapshot = snapshot_json(&registry);
         let family = metric(&snapshot, "limpid_build_info");
@@ -1711,7 +1711,7 @@ mod registry_tests {
         assert_eq!(
             family["series"],
             serde_json::json!([{
-                "labels": {"node_id": "node-a", "version": "0.8.0"},
+                "labels": {"node_id": "node-a", "version": "0.8.1"},
                 "value": 1
             }])
         );

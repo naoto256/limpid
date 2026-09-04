@@ -1404,7 +1404,7 @@ def pipeline p { input i; output o }
             .build()
             .expect("test metric registration must succeed");
         received.inc();
-        crate::metrics::register_build_info(&metrics, "0.8.0", "control-node")
+        crate::metrics::register_build_info(&metrics, "0.8.1", "control-node")
             .expect("build info registration must succeed");
 
         let server = ControlServer::new(
@@ -1499,7 +1499,7 @@ def pipeline p { input i; output o }
         assert_eq!(
             build_info["series"],
             serde_json::json!([{
-                "labels": {"node_id": "control-node", "version": "0.8.0"},
+                "labels": {"node_id": "control-node", "version": "0.8.1"},
                 "value": 1
             }])
         );
