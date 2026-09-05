@@ -107,6 +107,10 @@ struct WriteObserver {
     backoff_count: std::sync::atomic::AtomicUsize,
     #[cfg(target_os = "macos")]
     backing_off: tokio::sync::Notify,
+    // Simulate one false writable notification without relying on a kernel
+    // to report readiness for a pipe that cannot accept the frame.
+    #[cfg(target_os = "macos")]
+    inject_would_block: std::sync::atomic::AtomicBool,
 }
 
 impl StdoutTransport {
@@ -306,8 +310,17 @@ impl StdoutTransport {
                     }
                 }
             };
-            match readiness.try_io(|inner| raw_write(inner.get_ref().as_raw_fd(), &frame[offset..]))
-            {
+            match readiness.try_io(|inner| {
+                #[cfg(all(test, target_os = "macos"))]
+                if self.observer.as_ref().is_some_and(|observer| {
+                    observer
+                        .inject_would_block
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                }) {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                raw_write(inner.get_ref().as_raw_fd(), &frame[offset..])
+            }) {
                 Ok(Ok(0)) => {
                     return Err(StdoutWriteError {
                         source: io::Error::new(
@@ -937,6 +950,23 @@ mod metrics_registration_tests {
         .unwrap()
     }
 
+    async fn wait_for_write_attempt(observer: &WriteObserver) {
+        // This counts entry into the readiness stage, not Poll::Pending.
+        // Callers separately assert a full pipe, no completed frame/ACK, and
+        // a pending writer before supplying shutdown or reader progress.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while observer
+                .waiting_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                observer.waiting.notified().await;
+            }
+        })
+        .await
+        .expect("writer must enter the readiness stage");
+    }
+
     fn assert_output_duplicate(error: &MetricsError, label_value: &str, diagnostic: &str) {
         let (name, labelset) = match error {
             MetricsError::DuplicateSeries { name, labelset } => (name, labelset),
@@ -965,6 +995,10 @@ mod metrics_registration_tests {
         let (read_fd, write_fd) = unix_pipe();
         let capacity = fill_pipe(write_fd.as_raw_fd());
         assert!(capacity > 0);
+        assert_eq!(
+            raw_write(write_fd.as_raw_fd(), b"x").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         let observer = Arc::new(WriteObserver::default());
         let transport = StdoutTransport::from_owned(write_fd, Some(Arc::clone(&observer))).unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -975,49 +1009,20 @@ mod metrics_registration_tests {
         );
         let (ack, mut ack_rx) = QueueAckHandle::for_test();
         let task_output = Arc::clone(&output);
-        let task = tokio::spawn(TEST_STDOUT_TRANSPORT.scope(transport, async move {
+        let mut task = tokio::spawn(TEST_STDOUT_TRANSPORT.scope(transport, async move {
             task_output.consume(&event, ack).await
         }));
 
-        #[cfg(target_os = "macos")]
-        while observer
-            .backoff_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 0
-        {
-            observer.backing_off.notified().await;
-        }
-        #[cfg(not(target_os = "macos"))]
-        while observer
-            .waiting_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 0
-        {
-            observer.waiting.notified().await;
-        }
-        let readiness_waits = observer
-            .waiting_count
-            .load(std::sync::atomic::Ordering::SeqCst);
-        #[cfg(target_os = "macos")]
+        wait_for_write_attempt(&observer).await;
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(2),
-                observer.waiting.notified()
-            )
-            .await
-            .is_err(),
-            "a full pipe must not immediately re-enter writable readiness"
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut task)
+                .await
+                .is_err()
         );
-        #[cfg(not(target_os = "macos"))]
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
+        assert!(!task.is_finished(), "the full pipe must hold the frame");
         assert_eq!(
-            observer
-                .waiting_count
-                .load(std::sync::atomic::Ordering::SeqCst),
-            readiness_waits,
-            "a full pipe must stay parked on readiness rather than busy-spin"
+            observer.written.load(std::sync::atomic::Ordering::SeqCst),
+            0
         );
         assert!(ack_rx.try_recv().is_err());
         shutdown_tx.send(true).unwrap();
@@ -1047,6 +1052,10 @@ mod metrics_registration_tests {
         let (read_fd, write_fd) = unix_pipe();
         let capacity = fill_pipe(write_fd.as_raw_fd());
         assert!(capacity > 0);
+        assert_eq!(
+            raw_write(write_fd.as_raw_fd(), b"x").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         let observer = Arc::new(WriteObserver::default());
         let transport = StdoutTransport::from_owned(write_fd, Some(Arc::clone(&observer))).unwrap();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1057,17 +1066,28 @@ mod metrics_registration_tests {
         );
         let (ack, mut ack_rx) = QueueAckHandle::for_test();
         let task_output = Arc::clone(&output);
-        let task = tokio::spawn(TEST_STDOUT_TRANSPORT.scope(transport, async move {
+        let mut task = tokio::spawn(TEST_STDOUT_TRANSPORT.scope(transport, async move {
             task_output.consume(&event, ack).await
         }));
 
-        while observer
-            .backoff_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 0
-        {
-            observer.backing_off.notified().await;
-        }
+        wait_for_write_attempt(&observer).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut task)
+                .await
+                .is_err()
+        );
+        assert!(
+            !task.is_finished(),
+            "the frame must wait for reader progress"
+        );
+        assert_eq!(
+            observer.written.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(matches!(
+            ack_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
 
         let read_fd = async_owned_fd(read_fd);
         let observed = tokio::time::timeout(
@@ -1078,7 +1098,11 @@ mod metrics_registration_tests {
         .expect("reader progress must make the pending frame writable");
         assert!(observed[..capacity].iter().all(|byte| *byte == b'x'));
         assert_eq!(&observed[capacity..], b"resumed\n");
-        task.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("draining the pipe must complete the writer")
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             ack_rx.recv().await,
             Some((_, crate::queue::AckDisposition::Delivered))
@@ -1125,6 +1149,78 @@ mod metrics_registration_tests {
             0,
             "a successful write must not pay the Darwin EAGAIN backoff"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(start_paused = true)]
+    async fn false_readiness_eagain_backs_off_before_retrying() {
+        for drain in [false, true] {
+            let (_read_fd, write_fd) = unix_pipe();
+            let observer = Arc::new(WriteObserver::default());
+            observer
+                .inject_would_block
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let transport =
+                StdoutTransport::from_owned(write_fd, Some(Arc::clone(&observer))).unwrap();
+            let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn(async move {
+                transport
+                    .write_frame_mode(b"backoff\n", &mut shutdown_rx, drain)
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while observer
+                    .backoff_count
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    observer.backing_off.notified().await;
+                }
+            })
+            .await
+            .expect("the injected false readiness must reach EAGAIN");
+            assert_eq!(
+                observer
+                    .waiting_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(
+                observer.written.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            tokio::time::advance(std::time::Duration::from_millis(9)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                observer
+                    .waiting_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "neither normal nor drain mode may retry before 10 ms"
+            );
+            assert!(!task.is_finished());
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                observer
+                    .waiting_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "the 10 ms backoff must release the next readiness attempt"
+            );
+            assert_eq!(
+                observer
+                    .backoff_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            // This test pins retry timing, not a second kernel readiness edge.
+            // Normal delivery and shutdown ACKs are covered by the real pipes.
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     #[tokio::test]
