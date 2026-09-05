@@ -12,58 +12,90 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 > Single execution IR, safer queues, and lower hot-path overhead.
 
-### Added
+0.8.1 unifies daemon and test execution around a single sealed pipeline IR,
+adds raw UDP input, hardens queue and shutdown edge cases, and removes hot-path
+allocation and lookup work while preserving existing configuration, control,
+and wire contracts.
 
-- Added the `raw_udp` input for byte-exact UDP datagrams that do not carry a
-  syslog PRI header. Each datagram, including an empty or non-UTF-8 payload,
-  becomes one event with its source peer preserved.
+### Added — raw UDP input
 
-### Changed
+Added the `raw_udp` input for byte-exact UDP datagrams that do not carry a
+syslog PRI header. Each datagram, including an empty or non-UTF-8 payload,
+becomes one event with its source peer preserved.
 
-- The daemon and `--test-pipeline` now execute the same sealed pipeline IR.
-  Pipeline metrics, control metadata, reload rollback, tap inventory, and
-  process-call identity are compiled once and rebound to fresh runtime
-  resources at each start. Configuration, control JSON, and event wire formats
-  are unchanged.
-- The configuration and operations reference now matches the current LTP,
-  shutdown, packaging, parser, and supported module surfaces.
+### Changed — daemon and test mode share one sealed execution IR
 
-### Fixed
+The daemon and `--test-pipeline` now execute the same sealed pipeline IR.
+Pipeline metrics, control metadata, reload rollback, tap inventory, and
+process-call identity are compiled once and rebound to fresh runtime resources
+at each start. Configuration, control JSON, and event wire formats are
+unchanged.
 
-- Batched outputs now enforce `batch_size` as a hard request limit in steady
-  state and during shutdown, while preserving order, retry, acknowledgement,
-  and dead-letter behavior.
-- UDP input waits are cancel-safe, so rate limiting and backpressure no longer
-  delay shutdown indefinitely. `raw_udp` records the receive timestamp before
-  an optional limiter wait.
-- macOS stdout output now backs off after a false-ready nonblocking pipe returns
-  `EAGAIN`, preventing a hot retry loop while keeping shutdown interruptible.
-- The analyzer now exposes literal `csv_parse` fields only when the real flat
-  builtin resolves with exact arity and no user-function shadow. Block-form
-  calls remain effect-free because the runtime rejects them.
-- Disk-backed queue readers now retain an active unterminated WAL tail at the
-  same offset until its concurrent append completes. Finalized partial tails
-  and complete invalid records continue through the existing corruption path,
-  preventing acknowledged data loss without accepting corrupt bytes.
-- `limpidctl list` preserves the established lexical pipeline order even though
-  the runtime blueprint retains declaration-independent pipeline identities.
+### Changed — references match current supported surfaces
 
-### Performance
+The configuration and operations reference now matches the current LTP,
+shutdown, packaging, parser, and supported module surfaces.
 
-- Events without LTP history no longer allocate an empty `Arc`; non-empty
-  history retains the same persistence, replay, tap, dead-letter, and fan-out
-  semantics. LTP outputs request one working stamp allocation sized exactly for
-  the retained prefix and any appended local hop.
-- Process dead-letter snapshots are now built only on error paths. Successful
-  process chains avoid the previous header snapshot and reference-count work.
-- Delivered acknowledgement metrics are aggregated in burst-local groups of up
-  to 64 before merging into the global histogram, while recovered and dropped
-  acknowledgements retain their existing behavior.
-- Pipeline execution descriptors and metric handles are resolved once at
-  startup and shared by workers, removing event-time name lookups and shape
-  checks. Version-level benchmarks measured 3.73% to 5.61% higher throughput
-  than 0.8.0 across the preregistered A-D workloads; results versus 0.7.15
-  remained within the ±2% safety band.
+### Fixed — batched outputs enforce the request limit
+
+Batched outputs now enforce `batch_size` as a hard request limit in steady
+state and during shutdown, while preserving order, retry, acknowledgement, and
+dead-letter behavior.
+
+### Fixed — UDP input waits are shutdown-safe
+
+UDP input waits are cancel-safe, so rate limiting and backpressure no longer
+delay shutdown indefinitely. `raw_udp` records the receive timestamp before an
+optional limiter wait.
+
+### Fixed — macOS stdout backs off after false readiness
+
+macOS stdout output now backs off after a false-ready nonblocking pipe returns
+`EAGAIN`, preventing a hot retry loop while keeping shutdown interruptible.
+
+### Fixed — analyzer field exposure follows builtin resolution
+
+The analyzer now exposes literal `csv_parse` fields only when the real flat
+builtin resolves with exact arity and no user-function shadow. Block-form calls
+remain effect-free because the runtime rejects them.
+
+### Fixed — active WAL tails remain retryable
+
+Disk-backed queue readers now retain an active unterminated WAL tail at the same
+offset until its concurrent append completes. Finalized partial tails and
+complete invalid records continue through the existing corruption path,
+preventing acknowledged data loss without accepting corrupt bytes.
+
+### Fixed — control output preserves lexical pipeline order
+
+`limpidctl list` preserves the established lexical pipeline order even though
+the runtime blueprint retains declaration-independent pipeline identities.
+
+### Performance — empty LTP history avoids allocation
+
+Events without LTP history no longer allocate an empty `Arc`; non-empty history
+retains the same persistence, replay, tap, dead-letter, and fan-out semantics.
+LTP outputs request one working stamp allocation sized exactly for the retained
+prefix and any appended local hop.
+
+### Performance — process dead-letter snapshots stay on error paths
+
+Process dead-letter snapshots are now built only on error paths. Successful
+process chains avoid the previous header snapshot and reference-count work.
+
+### Performance — delivery metrics merge in bounded bursts
+
+Delivered acknowledgement metrics are aggregated in burst-local groups of up
+to 64 before merging into the global histogram, while recovered and dropped
+acknowledgements retain their existing behavior.
+
+### Performance — pipeline execution descriptors bind at startup
+
+Pipeline execution descriptors and metric handles are resolved once at startup
+and shared by workers, removing event-time name lookups and shape checks.
+Version-level benchmarks measured 3.73% to 5.61% higher throughput than 0.8.0
+across the preregistered A-D workloads; results versus 0.7.15 remained within
+the ±2% safety band.
 
 ## [0.8.0] - 2026-08-27
 
