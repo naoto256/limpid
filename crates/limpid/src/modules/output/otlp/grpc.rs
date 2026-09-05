@@ -850,6 +850,7 @@ mod tests {
 
     struct RecordingLogs {
         received: Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
+        response_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     #[tonic::async_trait]
@@ -860,6 +861,9 @@ mod tests {
         ) -> std::result::Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status>
         {
             self.received.lock().await.push(request.into_inner());
+            if let Some(gate) = &self.response_gate {
+                gate.acquire().await.unwrap().forget();
+            }
             Ok(tonic::Response::new(ExportLogsServiceResponse {
                 partial_success: None,
             }))
@@ -875,8 +879,10 @@ mod tests {
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
         let received = Arc::new(Mutex::new(Vec::new()));
+        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
         let svc = RecordingLogs {
             received: Arc::clone(&received),
+            response_gate: Some(Arc::clone(&response_gate)),
         };
         let server = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
@@ -902,14 +908,35 @@ mod tests {
             .prepare(vec![payload.clone()])
             .unwrap()
             .encoded_len() as u64;
-        consume(&output, &event_with_egress(payload)).await.unwrap();
+        let mut acknowledgements = consume_with_handle(&output, &event_with_egress(payload))
+            .await
+            .unwrap();
 
         let probe = || {
             let g = received.try_lock().ok()?;
             if g.is_empty() { None } else { Some(g.clone()) }
         };
         let got = wait_for(probe).await;
+        // Capturing a request is not delivery: hold the response so this
+        // interleaving is deterministic, rather than relying on scheduler luck.
+        assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            acknowledgements.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        response_gate.add_permits(1);
+        let (_, disposition) =
+            tokio::time::timeout(Duration::from_secs(5), acknowledgements.recv())
+                .await
+                .expect("delivery acknowledgement timed out")
+                .expect("acknowledgement channel closed without resolution");
+        assert!(matches!(
+            disposition,
+            crate::queue::AckDisposition::Delivered
+        ));
+        output.shutdown(None).await.unwrap();
         server.abort();
+        let _ = server.await;
 
         assert_eq!(got.len(), 1);
         let lr = &got[0].resource_logs[0].scope_logs[0].log_records[0];
@@ -1194,6 +1221,7 @@ mod tests {
         let received = Arc::new(Mutex::new(Vec::new()));
         let svc = RecordingLogs {
             received: Arc::clone(&received),
+            response_gate: None,
         };
         let server = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
@@ -1396,6 +1424,7 @@ mod tests {
         let received = Arc::new(Mutex::new(Vec::new()));
         let svc = RecordingLogs {
             received: Arc::clone(&received),
+            response_gate: None,
         };
         let server = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
