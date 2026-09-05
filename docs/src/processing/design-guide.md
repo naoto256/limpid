@@ -65,7 +65,7 @@ Every process has an implicit contract with its neighbours in the pipeline: *wha
 The shipped snippet pack declares its public surface in the canonical header
 schema: a file-level `Facade` plus adjacent per-member `Summary`, `Reads`,
 `Writes`, or `Signature` contracts described
-in the [pack README](https://github.com/naoto256/limpid/blob/release/0.8.1/packaging/snippets/README.md#authoring-conventions).
+in the [pack README](https://github.com/naoto256/limpid/blob/main/packaging/snippets/README.md#authoring-conventions).
 Inside a large file, private leaf-local `@requires` / `@produces` comments may
 add useful detail, but they do not replace a facade member block and the
 analyzer does not consume them.
@@ -95,7 +95,7 @@ def process compose_ocsf_authentication {
     // the composer in the same file) moves the slot to `egress` when
     // the pipeline emits OCSF as its wire form. This is the egress
     // single-writer invariant — see the [pack
-    // README](https://github.com/naoto256/limpid/blob/release/0.8.1/packaging/snippets/README.md#slot-registry--composed-layer).
+    // README](https://github.com/naoto256/limpid/blob/main/packaging/snippets/README.md#slot-registry--composed-layer).
 
     process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
@@ -249,7 +249,7 @@ Do not pack multiple unrelated schemas into a single file.
 
 ### Use `workspace.lsis` as the canonical intermediate
 
-Pick one canonical intermediate shape and have every parser write into it; have every composer read from it. limpid's library uses the namespace `workspace.lsis` for this — the Limpid Snippet Intermediate Schema (LSIS), stratified into `parsed` / `shed` / `composed` layers. See the [pack README](https://github.com/naoto256/limpid/blob/release/0.8.1/packaging/snippets/README.md#lsis--the-limpid-snippet-intermediate-schema) for the layer contracts and slot registries; the summary that matters for this guide is the flow:
+Pick one canonical intermediate shape and have every parser write into it; have every composer read from it. limpid's library uses the namespace `workspace.lsis` for this — the Limpid Snippet Intermediate Schema (LSIS), stratified into `parsed` / `shed` / `composed` layers. See the [pack README](https://github.com/naoto256/limpid/blob/main/packaging/snippets/README.md#lsis--the-limpid-snippet-intermediate-schema) for the layer contracts and slot registries; the summary that matters for this guide is the flow:
 
 ```text
 ingress
