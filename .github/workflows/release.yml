@@ -22,6 +22,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # pin-audit:2026-05-21 29eef33 | stable
 
+      - name: Install Python for release preflight
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c  # v6.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Validate tag and extract release notes
+        id: notes
+        run: |
+          python3 .github/scripts/release_preflight.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --notes-output RELEASE_NOTES.md --github-output "$GITHUB_OUTPUT"
+
       - name: Install system dependencies
         # `libsystemd-dev` is required by the `journal` feature; the
         # remaining packages are `rdkafka-sys` (`libsasl2-dev`,
@@ -58,36 +70,6 @@ jobs:
           cargo deb -p limpid --no-build
           cargo deb -p limpid-prometheus --no-build
 
-      - name: Extract release notes from CHANGELOG
-        id: notes
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          # Body: everything between this version's heading and the next.
-          awk -v ver="$VERSION" '
-            $0 ~ "^## \\["ver"\\]" { found=1; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.md > RELEASE_NOTES.md
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "::warning::No CHANGELOG entry found for ${VERSION}; release body will be empty."
-          fi
-          # Tagline (optional): a `> ...` blockquote line immediately
-          # following the version heading. Used as the second clause of
-          # the GitHub Release name (`limpid X.Y.Z — TAGLINE`). Absent →
-          # falls back to plain `limpid X.Y.Z`.
-          TAGLINE=$(awk -v ver="$VERSION" '
-            $0 ~ "^## \\["ver"\\]" { in_section=1; next }
-            in_section && /^>/ { sub(/^> ?/, ""); print; exit }
-            in_section && /^##/ { exit }
-            in_section && /^###/ { exit }
-          ' CHANGELOG.md)
-          if [ -n "$TAGLINE" ]; then
-            NAME="limpid ${VERSION} — ${TAGLINE}"
-          else
-            NAME="limpid ${VERSION}"
-          fi
-          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
-
       - name: Generate checksums
         # SHA256SUMS lets consumers verify asset integrity offline
         # (`sha256sum -c SHA256SUMS`). Basenames (not paths) so the
@@ -106,7 +88,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           # Pass the release title through an env var rather than
           # interpolating `${{ ... }}` into `run:` — the value comes
-          # from CHANGELOG via awk, so it is repo-controlled rather
+          # from CHANGELOG via preflight, so it is repo-controlled rather
           # than attacker-controlled, but expression substitution into
           # a shell command would still be the wrong defense-in-depth
           # shape if a future change ever lets non-repo data flow into

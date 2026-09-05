@@ -4,5 +4,12 @@ description = "Log pipelines, limpid as intent."
 authors = ["Naoto Morishima"]
 language = "en"
 
+# Preserve README destinations used by the Markdown source. The index
+# preprocessor renames chapters without repairing these relative links.
+[build]
+use-default-preprocessors = false
+
+[preprocessor.links]
+
 [output.html]
 git-repository-url = "https://github.com/naoto256/limpid"
