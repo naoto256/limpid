@@ -1236,6 +1236,59 @@ mod tests {
         compiled.outputs[name].properties.clone()
     }
 
+    #[tokio::test]
+    async fn parser_spelled_hyphenated_headers_reach_http_receiver() {
+        use axum::{Router, extract::State, http::HeaderMap, routing::post};
+
+        async fn receive(
+            State(tx): State<tokio::sync::mpsc::Sender<HeaderMap>>,
+            headers: HeaderMap,
+        ) -> axum::http::StatusCode {
+            tx.send(headers).await.unwrap();
+            axum::http::StatusCode::ACCEPTED
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/", post(receive)).with_state(tx),
+            )
+            .await
+            .unwrap();
+        });
+        let props = parsed_output_props(
+            &format!(
+                r#"
+def output test {{
+    type http
+    peer {{ url "http://{addr}/" }}
+    batch_size 1
+    headers {{ DD-API-KEY "test-only-key" X-Custom-Header "exact-value" }}
+}}
+"#
+            ),
+            "test",
+        );
+        let output = HttpOutput::from_properties(
+            "test",
+            &props,
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        consume(&output, &event_with("hello")).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        output.shutdown(None).await.unwrap();
+        server.abort();
+        let _ = server.await;
+        let headers = received.unwrap().unwrap();
+        assert_eq!(headers["dd-api-key"], "test-only-key");
+        assert_eq!(headers["x-custom-header"], "exact-value");
+        assert!(!headers.contains_key("dd_api_key"));
+    }
+
     #[test]
     fn verify_false_with_client_identity_parses_ok() {
         // Even with `verify false`, a tls block carrying client
