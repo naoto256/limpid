@@ -23,6 +23,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  release-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # pin-audit:2026-06-03 de0fac2 | v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c  # v6.0.0
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # pin-audit:2026-05-21 29eef33 | stable
+      - name: Test release validation failures
+        run: python3 -m unittest discover -s .github/scripts -p 'test_release_preflight.py'
+      - name: Validate release metadata
+        run: python3 .github/scripts/release_preflight.py
+      - name: Install pinned mdBook
+        run: cargo install mdbook --version 0.5.4 --locked
+      - name: Build and validate documentation
+        # Network errors exit 2 (inconclusive), not a source-defect verdict.
+        # Both outcomes block the check; neither is silently waived.
+        run: |
+          mdbook build docs
+          python3 .github/scripts/release_preflight.py --book docs/book --check-remote
+
   check:
     runs-on: ubuntu-latest
     steps:
