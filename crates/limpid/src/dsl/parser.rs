@@ -1183,6 +1183,52 @@ def input fw_syslog {
     }
 
     #[test]
+    fn hyphenated_header_keys_preserve_names_and_values() {
+        let config = parse_config(
+            r#"
+def output logs {
+    type http
+    headers {
+        DD-API-KEY "test-only-key"
+        X-Custom-Header "value"
+        Authorization "Bearer placeholder"
+    }
+}
+"#,
+        )
+        .unwrap();
+        let Definition::Output(output) = &config.definitions[0] else {
+            panic!("expected output");
+        };
+        assert_eq!(
+            crate::dsl::props::get_string_map(output.properties.user_properties(), "headers"),
+            vec![
+                ("DD-API-KEY".into(), "test-only-key".into()),
+                ("X-Custom-Header".into(), "value".into()),
+                ("Authorization".into(), "Bearer placeholder".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn header_key_support_does_not_change_expression_identifiers() {
+        let config = parse_config("def process p { workspace.result = left-right }").unwrap();
+        let Definition::Process(process) = &config.definitions[0] else {
+            panic!("expected process");
+        };
+        let ProcessStatement::Assign(_, expr) = &process.body[0] else {
+            panic!("expected assignment");
+        };
+        let ExprKind::BinOp(left, BinOp::Sub, right) = &expr.kind else {
+            panic!("expected subtraction");
+        };
+        assert!(matches!(&left.kind, ExprKind::Ident(parts) if parts == &["left"]));
+        assert!(matches!(&right.kind, ExprKind::Ident(parts) if parts == &["right"]));
+        assert!(parse_config("def process hyphen-name { drop }").is_err());
+        assert!(parse_config("def process p { let hyphen-name = 1 }").is_err());
+    }
+
+    #[test]
     fn test_parse_output_with_nested_block() {
         let input = r#"
 def output ama {
