@@ -63,7 +63,7 @@ pub enum PropertyValueKind {
     /// values must each be a nested block conforming to the given schema.
     /// `tls { profile_a { ca "..." } profile_b { ca "..." cert "..." key "..." } }`
     BlockMap(&'static [PropertySpec]),
-    /// Open block whose keys are user-defined identifiers (HTTP
+    /// Open block whose keys are identifiers or static quoted strings (HTTP
     /// header names, k8s-style labels, etc.) and whose values must
     /// each be string-shaped. The schema validator never flags an
     /// "unknown key" inside this block — it only checks that every
@@ -155,6 +155,8 @@ pub struct PropertySpec {
 /// versus what the parsed config carries.
 #[derive(Debug, Clone)]
 pub enum SchemaErrorKind {
+    /// Quoted keys belong only to arbitrary-key StringMap entries.
+    QuotedKeyOutsideStringMap,
     /// Property key isn't declared in the schema.
     UnknownKey,
     /// Schema marks `required: true` and the key is absent.
@@ -205,6 +207,7 @@ impl SchemaError {
     pub fn primary_span(&self) -> Option<Span> {
         use SchemaErrorKind::*;
         match self.kind {
+            QuotedKeyOutsideStringMap => self.key_span.or(self.value_span),
             UnknownKey
             | MissingRequired
             | DuplicateKey
@@ -222,6 +225,10 @@ impl std::fmt::Display for SchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use SchemaErrorKind::*;
         match &self.kind {
+            QuotedKeyOutsideStringMap => write!(
+                f,
+                "quoted property keys are only allowed inside a StringMap"
+            ),
             UnknownKey => {
                 write!(f, "unknown property '{}'", self.key)?;
                 if let Some(s) = &self.did_you_mean {
@@ -278,6 +285,10 @@ pub fn validate(props: &[Property], spec: &[PropertySpec]) -> Vec<SchemaError> {
         std::collections::HashMap::new();
 
     for prop in props {
+        if let Some(error) = quoted_key_error(prop) {
+            errs.push(error);
+            continue;
+        }
         let (name, key_span) = match prop {
             Property::KeyValue { key, key_span, .. } => (key.as_str(), *key_span),
             Property::Block { key, key_span, .. } => (key.as_str(), *key_span),
@@ -488,6 +499,10 @@ fn check_one_of(
 fn validate_block_map(properties: &[Property], inner_spec: &[PropertySpec]) -> Vec<SchemaError> {
     let mut errs = Vec::new();
     for prop in properties {
+        if let Some(error) = quoted_key_error(prop) {
+            errs.push(error);
+            continue;
+        }
         match prop {
             Property::Block {
                 properties: inner_properties,
@@ -522,6 +537,7 @@ fn validate_string_map(properties: &[Property]) -> Vec<SchemaError> {
                 key_span,
                 value,
                 value_span,
+                ..
             } => match &value.kind {
                 ExprKind::StringLit(_)
                 | ExprKind::Template(_)
@@ -549,6 +565,30 @@ fn validate_string_map(properties: &[Property]) -> Vec<SchemaError> {
         }
     }
     errs
+}
+
+fn quoted_key_error(prop: &Property) -> Option<SchemaError> {
+    let (key, key_span, quoted) = match prop {
+        Property::KeyValue {
+            key,
+            key_span,
+            key_quoted,
+            ..
+        }
+        | Property::Block {
+            key,
+            key_span,
+            key_quoted,
+            ..
+        } => (key, key_span, key_quoted),
+    };
+    quoted.then(|| SchemaError {
+        kind: SchemaErrorKind::QuotedKeyOutsideStringMap,
+        key: key.clone(),
+        key_span: *key_span,
+        value_span: prop_value_span(prop),
+        did_you_mean: None,
+    })
 }
 
 fn prop_value_span(p: &Property) -> Option<Span> {
@@ -724,6 +764,7 @@ mod tests {
     fn kv(key: &str, kind: ExprKind) -> Property {
         Property::KeyValue {
             key: key.into(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(kind),
             value_span: None,
@@ -733,6 +774,7 @@ mod tests {
     fn block(key: &str, properties: Vec<Property>) -> Property {
         Property::Block {
             key: key.into(),
+            key_quoted: false,
             key_span: None,
             properties,
         }
@@ -1182,6 +1224,7 @@ mod tests {
         let errs = validate(
             &[Property::Block {
                 key: "tls".into(),
+                key_quoted: false,
                 key_span: None,
                 properties: vec![],
             }],
@@ -1227,9 +1270,11 @@ mod tests {
         let errs = validate(
             &[Property::Block {
                 key: "tls".into(),
+                key_quoted: false,
                 key_span: None,
                 properties: vec![Property::Block {
                     key: "cert".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![],
                 }],
@@ -1363,6 +1408,81 @@ mod tests {
         ];
         let errs = validate(&props, SIMPLE);
         assert_eq!(errs.len(), 4);
+    }
+
+    #[test]
+    fn quoted_keys_are_only_accepted_inside_string_maps() {
+        const S: &[PropertySpec] = &[
+            PropertySpec {
+                name: "headers",
+                required: false,
+                repeatable: false,
+                exclusive_group: None,
+                kind: PropertyValueKind::StringMap,
+            },
+            PropertySpec {
+                name: "peer",
+                required: false,
+                repeatable: false,
+                exclusive_group: None,
+                kind: PropertyValueKind::Block(&[]),
+            },
+        ];
+        for source in [
+            r#"def output logs { type http "headers" { Authorization "v" } }"#,
+            r#"def output logs { type http peer { "url" "v" } }"#,
+        ] {
+            let config = crate::dsl::parser::parse_config(source).unwrap();
+            let crate::dsl::ast::Definition::Output(output) = &config.definitions[0] else {
+                panic!("output")
+            };
+            let errors = validate(output.properties.user_properties(), S);
+            assert!(
+                errors.iter().any(|e| e.to_string().contains("quoted")),
+                "{errors:?}"
+            );
+        }
+        assert!(crate::dsl::parser::parse_config(r#"def output logs { "type" http }"#).is_err());
+    }
+
+    #[test]
+    fn quoted_string_map_empty_and_protocol_independent_keys() {
+        const MAP: &[PropertySpec] = &[PropertySpec {
+            name: "headers",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::StringMap,
+        }];
+        for source in [
+            r#"def output logs { type http headers {} }"#,
+            r#"def output logs { type http headers { "" "v" "not an HTTP key" "v" Authorization "v" } }"#,
+        ] {
+            let config = crate::dsl::parser::parse_config(source).unwrap();
+            let crate::dsl::ast::Definition::Output(output) = &config.definitions[0] else {
+                panic!("output")
+            };
+            assert!(validate(output.properties.user_properties(), MAP).is_empty());
+        }
+        const NAMED: &[PropertySpec] = &[PropertySpec {
+            name: "tls",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::BlockMap(&[]),
+        }];
+        let config = crate::dsl::parser::parse_config(
+            r#"def output logs { type http tls { "profile" {} } }"#,
+        )
+        .unwrap();
+        let crate::dsl::ast::Definition::Output(output) = &config.definitions[0] else {
+            panic!("output")
+        };
+        assert!(
+            validate(output.properties.user_properties(), NAMED)
+                .iter()
+                .any(|e| matches!(e.kind, SchemaErrorKind::QuotedKeyOutsideStringMap))
+        );
     }
 
     #[test]

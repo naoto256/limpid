@@ -69,7 +69,9 @@ pub struct OutputDef {
 
 /// A key-value property or nested block inside input/output definitions.
 ///
-/// `key_span` covers just the key identifier — used by the property
+/// `key_quoted` preserves the key's syntactic form after static decoding;
+/// schema validation permits it only for StringMap entries.
+/// `key_span` covers the key token (including quotes) — used by the property
 /// schema validator to point at the offending key when it is unknown
 /// or mistyped. `value_span` covers the whole value expression — the
 /// analyzer uses it to position a caret when a reference inside that
@@ -80,6 +82,7 @@ pub enum Property {
     /// `key value`  e.g. `type syslog_udp`, `bind "0.0.0.0:514"`
     KeyValue {
         key: String,
+        key_quoted: bool,
         key_span: Option<Span>,
         value: Expr,
         value_span: Option<Span>,
@@ -87,6 +90,7 @@ pub enum Property {
     /// `key { ... }` e.g. `tls { cert "..." }`, `queue { type disk }`
     Block {
         key: String,
+        key_quoted: bool,
         key_span: Option<Span>,
         properties: Vec<Property>,
     },
