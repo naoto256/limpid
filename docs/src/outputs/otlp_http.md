@@ -20,7 +20,7 @@ def output otlp_out {
             endpoint "https://collector-b.example.com:4318/v1/logs"
             tls {
                 ca   "/etc/limpid/ca.crt"
-                cert "/etc/limpid/client.crt"   # mTLS
+                cert "/etc/limpid/client.crt"   // mTLS
                 key  "/etc/limpid/client.key"
             }
         }
@@ -51,8 +51,8 @@ def output otlp_out {
 ## Properties
 
 Headers use the same [static string object syntax](http.md#headers-block)
-as HTTP output: `"X-Custom-Header": "value"`. Keys and values are literal strings;
-quoting does not bypass HTTP name restrictions.
+as HTTP output: `"X-Custom-Header": "value"`. Keys and values are literal strings.
+Quoting does not bypass HTTP name restrictions.
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|

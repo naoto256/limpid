@@ -2,7 +2,7 @@
 
 `def function` declares a **pure expression function** — given its arguments, it returns a value. No side effects, no Event access, no routing.
 
-```
+```limpid
 def function normalize_proto(num) {
     switch num {
         6  { "tcp" }
@@ -15,7 +15,7 @@ def function normalize_proto(num) {
 
 Use one anywhere an expression goes:
 
-```
+```limpid
 def process parse_fortigate_cef_traffic {
     workspace.lsis.parsed = {
         connection_info: {
@@ -83,7 +83,7 @@ For anything with side effects (writing to `workspace.*`, mutating `egress`, cal
 
 The body is **zero or more `let` bindings followed by a required trailing expression** that becomes the return value:
 
-```
+```limpid
 def function severity_number_from_label(s) {
     switch s {
         "Critical"      { 21 }
@@ -98,7 +98,7 @@ def function severity_number_from_label(s) {
 
 For non-trivial computations, factor intermediate values into `let` bindings:
 
-```
+```limpid
 def function normalize(s) {
     let trimmed = regex_replace(s, "^\\s+|\\s+$", "")
     let lowered = lower(trimmed)
@@ -108,7 +108,7 @@ def function normalize(s) {
 
 `let` is the **assignment form** for local-scope variables in limpid — not a separate "declaration" step. Re-assigning the same name is just another `let` line:
 
-```
+```limpid
 def function f(x) {
     let v = x
     let v = v * 3              // reassigns v in the same scope
@@ -118,7 +118,7 @@ def function f(x) {
 
 For branching, use the expression-form `switch` ([DSL Syntax → switch](../dsl-syntax.md#switch)) — every `switch` arm is itself an expression, so it composes inside `let` RHS, function arguments, or as the trailing return:
 
-```
+```limpid
 def function endpoint_label(host, port) {
     let scheme = switch port {
         443 { "https" }
@@ -143,7 +143,7 @@ The body **may not**:
 - **recurse**, directly or mutually. The analyzer detects cycles in the function-to-function call graph and rejects them at config-load time. Process call graphs are also required to be acyclic.
 - **call an unknown function** — every function call inside the body must resolve to either a built-in primitive, a user-defined `def function`, or (if a block-arg primitive's block) the block parameters. Calls to names that don't exist (typos, references to removed primitives) are rejected, with a near-match hint when available.
 
-```
+```limpid
 // Rejected at --check time:
 def function bad_event_ref() {
     workspace.foo + 1                          // ❌ reads workspace
@@ -169,7 +169,7 @@ All five are hard errors at `--check` time — the config fails to load and the 
 
 Functions can call other functions (and any built-in primitive):
 
-```
+```limpid
 def function vendor_severity_number(label) {
     severity_number_from_label(label)
 }
@@ -196,7 +196,7 @@ Rule of thumb: **if the result is a single value the caller wants to embed somew
 
 A typical vendor parser uses several small functions to canonicalise vendor-specific values into canonical LSIS shape:
 
-```
+```limpid
 // functions/severity_number_from_label.limpid
 def function severity_number_from_label(s) {
     switch s {

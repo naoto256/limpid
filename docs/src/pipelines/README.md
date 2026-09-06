@@ -4,7 +4,7 @@ Pipelines wire inputs, processes, and outputs together. They define the flow of 
 
 ## Basic structure
 
-```
+```limpid
 def pipeline main {
     input syslog        // where events come from
     process strip_pri   // transform — mutates egress (here: drop the <PRI> byte)
@@ -43,7 +43,7 @@ The inline anonymous form `process { ... }` is also available for one-off transf
 
 Multiple pipelines can share the same input. Each pipeline gets an independent copy of every event:
 
-```
+```limpid
 def pipeline archive {
     input syslog
     output file_archive
@@ -60,7 +60,7 @@ def pipeline forward {
 
 Symmetric to fan-out: a single pipeline can subscribe to multiple inputs. List them comma-separated on the `input` line. Events from every listed input are merged at the pipeline entrance and processed by the same body.
 
-```
+```limpid
 def pipeline syslog_ingest {
     input syslog_udp, syslog_tcp, syslog_tcp_tls    // three transports, one pipeline
     process normalize

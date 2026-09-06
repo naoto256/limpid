@@ -16,7 +16,7 @@ A pipeline body executes top-to-bottom for each event arriving on `input`. State
 
 ### Branch on workspace value
 
-```
+```limpid
 def pipeline main {
     input syslog
 
@@ -32,7 +32,7 @@ The `output alert` runs only when severity ≤ 3; `output siem` always runs (no 
 
 ### Switch on source
 
-```
+```limpid
 def pipeline archive {
     input syslog_udp
     process { egress = syslog.strip_pri(egress) }
@@ -52,7 +52,7 @@ def pipeline archive {
 
 ### Multi-output (non-terminal `output`)
 
-```
+```limpid
 def pipeline main {
     input syslog
 
