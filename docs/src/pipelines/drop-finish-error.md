@@ -6,7 +6,7 @@ limpid has three ways to explicitly terminate a pipeline for an event, plus an i
 
 Discards the event. Counted as `events_dropped` in metrics. Use for filtering.
 
-```
+```limpid
 def process filter_noise {
     if contains(ingress, "healthcheck") {
         drop
@@ -21,7 +21,7 @@ def process filter_noise {
 
 Explicitly terminates the pipeline. Counted as `events_finished` (or `events_discarded` if no output was reached).
 
-```
+```limpid
 def pipeline main {
     input syslog
     output archive
@@ -33,7 +33,7 @@ def pipeline main {
 
 Routes the event to the [error log](../operations/error-log.md) (DLQ) with an operator-readable reason. Counted as `events_errored` — same metric as runtime process failures, because both signal "this event could not be processed and the operator should know."
 
-```
+```limpid
 def process parse_fortigate_cef {
     // workspace.cef.* was populated by `parse_syslog | parse_cef` upstream
     switch workspace.cef.name {
@@ -46,7 +46,7 @@ def process parse_fortigate_cef {
 
 `error` takes an optional message expression. The expression is rendered (string interpolation, function calls, anything an `${...}` template can do) and stored in the error_log entry's `reason` field. Use it to capture **why** the event was rejected so the operator doesn't have to reverse-engineer it from the raw bytes:
 
-```
+```limpid
 def process expect_field {
     if workspace.user.id == null {
         error "missing required field user.id"
@@ -67,7 +67,7 @@ It's also distinct from a runtime process failure (regex compile error, type mis
 
 Reaching the end of a pipeline without `drop` or `finish` is an **implicit finish**. These are equivalent:
 
-```
+```limpid
 // Explicit
 def pipeline main {
     input syslog
@@ -115,7 +115,7 @@ In every case the event is *not* forwarded downstream — at the failure point t
 
 ## Example: filtering + routing
 
-```
+```limpid
 def pipeline archive {
     input syslog_udp
     process { egress = syslog.strip_pri(egress) } | filter_noise

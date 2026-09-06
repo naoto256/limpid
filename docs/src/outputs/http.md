@@ -18,7 +18,7 @@ def output es_cluster {
             url "https://es02.example.com:9200/_bulk"
             tls {
                 ca   "/etc/limpid/ca.crt"
-                cert "/etc/limpid/client.crt"   # mTLS
+                cert "/etc/limpid/client.crt"   // mTLS
                 key  "/etc/limpid/client.key"
             }
         }
@@ -74,12 +74,12 @@ On each send the rotation picks the next available peer (cooldown expired) and t
 
 ### headers block
 
-Headers are a static string object: separate keys and values with `:` and
-entries with `,`. Keys and values must be literal strings; `${...}` interpolation,
-variables, function calls, and non-string values are not accepted.
+From 0.8.4, headers use a static string object, for example
+`"DD-API-KEY": "your-api-key"`. Keys and values are literal strings;
+interpolation, variables, function calls, and non-string values are rejected.
 Literal escapes follow string-value decoding (`\"`,
 `\\`, `\n`, `\t`, and `\$`; unknown escapes retain the backslash).
-This configuration object syntax is supported for string maps such as `headers`,
+This object syntax is supported for string maps such as `headers`,
 not fixed configuration names such as `type` or `peer`. HTTP header-name
 restrictions still apply to the decoded name.
 

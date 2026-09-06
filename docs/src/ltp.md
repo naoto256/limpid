@@ -73,22 +73,22 @@ input counters, and pipeline delivery belong only to the selected input; the
 hello frame is not counted as an input payload.
 
 ```limpid
-def input ltp_jump01 {
+def input ltp_host01 {
     type ltp
     bind "0.0.0.0:7514"
-    peer { node_id "jump01" pubkey "<jump01 SPKI base64>" }
+    peer { node_id "host01" pubkey "<host01 SPKI base64>" }
     max_connections 1024
 }
 
-def input ltp_jump02 {
+def input ltp_host02 {
     type ltp
     bind "0.0.0.0:7514"
-    peer { node_id "jump02" pubkey "<jump02 SPKI base64>" }
+    peer { node_id "host02" pubkey "<host02 SPKI base64>" }
     max_connections 1024
 }
 
-def pipeline from_jump01 { input ltp_jump01; finish }
-def pipeline from_jump02 { input ltp_jump02; finish }
+def pipeline from_host01 { input ltp_host01; finish }
+def pipeline from_host02 { input ltp_host02; finish }
 ```
 
 Peer `node_id` and public keys must be unique across a shared-listener group.

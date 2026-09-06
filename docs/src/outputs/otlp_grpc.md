@@ -20,7 +20,7 @@ def output otlp_out {
             endpoint "https://collector-b.example.com:4317"
             tls {
                 ca   "/etc/limpid/ca.crt"
-                cert "/etc/limpid/client.crt"   # mTLS
+                cert "/etc/limpid/client.crt"   // mTLS
                 key  "/etc/limpid/client.key"
             }
         }

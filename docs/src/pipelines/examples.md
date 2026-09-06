@@ -6,7 +6,7 @@ Real-world configuration examples from production deployments.
 
 Receives syslog from multiple firewall vendors, strips PRI, and routes to per-device log files.
 
-```
+```limpid
 def input syslog_udp {
     type syslog_udp
     bind "0.0.0.0:514"
@@ -55,7 +55,7 @@ def pipeline archive {
 
 Receives CEF logs over TCP, filters Fortinet traffic, rewrites PRI for Azure Log Analytics facility routing, and forwards via disk-backed queue.
 
-```
+```limpid
 def input ama_tcp {
     type syslog_tcp
     bind "0.0.0.0:514"
@@ -97,7 +97,7 @@ def pipeline ama_forward {
 
 Parses CEF, enriches with GeoIP, serializes to JSON, and sends to Elasticsearch with batching.
 
-```
+```limpid
 def input fw {
     type syslog_udp
     bind "0.0.0.0:514"
