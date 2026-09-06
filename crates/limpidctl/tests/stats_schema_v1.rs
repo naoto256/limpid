@@ -944,7 +944,7 @@ fn build_info_is_generic_in_details_and_does_not_change_default_or_raw_json() {
         "type": "gauge",
         "help": "Build information for the running limpid node.",
         "series": [{
-            "labels": {"node_id": "edge-a", "version": "0.8.2"},
+            "labels": {"node_id": "edge-a", "version": "0.8.3"},
             "value": 1
         }]
     }));
@@ -962,14 +962,14 @@ fn build_info_is_generic_in_details_and_does_not_change_default_or_raw_json() {
     assert!(details.contains("gauge"));
     assert!(details.contains("Build information for the running limpid node."));
     assert!(details.contains("node_id: \"edge-a\""));
-    assert!(details.contains("version: \"0.8.2\""));
+    assert!(details.contains("version: \"0.8.3\""));
     assert!(details.contains("value: 1"));
 
     let raw_output = run_stats(&response, &["--raw"]);
     assert!(raw_output.status.success(), "{raw_output:?}");
     let raw = stdout(&raw_output);
     assert!(raw.contains("node_id=\"edge-a\""));
-    assert!(raw.contains("version=\"0.8.2\""));
+    assert!(raw.contains("version=\"0.8.3\""));
 
     let json_output = run_stats(&response, &["--json"]);
     assert!(json_output.status.success(), "{json_output:?}");

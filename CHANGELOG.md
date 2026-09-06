@@ -8,6 +8,24 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-06
+
+> Quoted header keys with explicit configuration boundaries.
+
+0.8.3 introduces static quoted keys for configuration string maps and restores ordinary identifier syntax for bare property keys. Header names containing hyphens now use quotes, while fixed configuration names and expression identifiers retain their existing syntax.
+
+### Added — static quoted keys in header maps
+
+The `headers` blocks of HTTP, OTLP HTTP, and OTLP gRPC outputs accept static quoted keys such as `"DD-API-KEY" "your-api-key"`. Ordinary names such as `Authorization` may remain bare. Quoted keys decode literal string escapes but do not allow interpolation; the destination protocol's header-name restrictions still apply.
+
+### Changed — migrate bare hyphenated keys to quoted strings
+
+The bare hyphenated property-key syntax introduced in 0.8.2 is withdrawn. Update `DD-API-KEY "your-api-key"` to `"DD-API-KEY" "your-api-key"`, and quote other hyphenated header names in the same way. Bare hyphenated keys now produce a diagnostic with migration guidance. Quoted keys are limited to string-map entries: fixed properties, module `type`, named block maps, and global configuration blocks reject them. Variable names, expression identifiers, and subtraction remain unchanged.
+
+### Changed — header documentation follows the new key syntax
+
+HTTP header examples now quote hyphenated names, and all three output references explain the shared static-key syntax and its boundaries. Regression tests exercise parsing through actual local HTTP and OTLP HTTP/gRPC receivers; the OTLP tests also wait for delivery acknowledgements.
+
 ## [0.8.2] - 2026-09-06
 
 > Hyphenated HTTP headers and more reliable validation.
@@ -2520,7 +2538,8 @@ See `docs/src/operations/upgrade-0.3.md` for end-to-end migration recipes includ
 
 Initial public release. Rust + tokio log pipeline daemon replacing rsyslog / syslog-ng / fluentd with a single readable DSL (`def input`, `def process`, `def output`, `def pipeline`). Includes syslog (UDP/TCP/ TLS) / tail / journal / unix socket inputs; file / HTTP / Kafka / TCP / UDP / unix socket / stdout outputs; in-DSL expression language with parsers (JSON / KV / CEF / syslog), regex, string templates, tables with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`); hot reload via `SIGHUP` with automatic rollback; per-output disk-backed queues.
 
-[Unreleased]: https://github.com/naoto256/limpid/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/naoto256/limpid/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/naoto256/limpid/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/naoto256/limpid/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/naoto256/limpid/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/naoto256/limpid/compare/v0.7.15...v0.8.0
