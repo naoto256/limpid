@@ -8,6 +8,20 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-06
+
+> Static string objects for explicit header configuration.
+
+0.8.4 represents configuration string maps as static objects. HTTP, OTLP HTTP, and OTLP gRPC headers share literal string keys and values without expression evaluation, while ordinary configuration blocks and general expression syntax remain unchanged.
+
+### Changed — static objects for configuration string maps
+
+Header maps use object entries such as `"Authorization": "Bearer your-token"`. Keys decode literal escapes, and values must be string literals; interpolation, variables, function calls, and non-string values are rejected. Nonempty legacy header blocks are no longer accepted, while empty maps remain valid. The change reuses existing hash-literal parsing without extending general expression object-key syntax or fixed configuration names.
+
+### Fixed — gRPC header normalization documentation
+
+The gRPC output reference now states that configured mixed-case header keys are accepted and normalized to lowercase before sending. Protocol metadata name and value restrictions still apply. HTTP and OTLP examples consistently use static header objects, with parser-to-receiver regression tests covering all three output paths.
+
 ## [0.8.3] - 2026-09-06
 
 > Quoted header keys with explicit configuration boundaries.
@@ -2538,7 +2552,8 @@ See `docs/src/operations/upgrade-0.3.md` for end-to-end migration recipes includ
 
 Initial public release. Rust + tokio log pipeline daemon replacing rsyslog / syslog-ng / fluentd with a single readable DSL (`def input`, `def process`, `def output`, `def pipeline`). Includes syslog (UDP/TCP/ TLS) / tail / journal / unix socket inputs; file / HTTP / Kafka / TCP / UDP / unix socket / stdout outputs; in-DSL expression language with parsers (JSON / KV / CEF / syslog), regex, string templates, tables with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`); hot reload via `SIGHUP` with automatic rollback; per-output disk-backed queues.
 
-[Unreleased]: https://github.com/naoto256/limpid/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/naoto256/limpid/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/naoto256/limpid/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/naoto256/limpid/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/naoto256/limpid/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/naoto256/limpid/compare/v0.8.0...v0.8.1
