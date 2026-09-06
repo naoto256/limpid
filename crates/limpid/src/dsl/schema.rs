@@ -63,12 +63,8 @@ pub enum PropertyValueKind {
     /// values must each be a nested block conforming to the given schema.
     /// `tls { profile_a { ca "..." } profile_b { ca "..." cert "..." key "..." } }`
     BlockMap(&'static [PropertySpec]),
-    /// Open block whose keys are identifiers or static quoted strings (HTTP
-    /// header names, k8s-style labels, etc.) and whose values must
-    /// each be string-shaped. The schema validator never flags an
-    /// "unknown key" inside this block — it only checks that every
-    /// entry is a key-value (not a nested sub-block) with a
-    /// string-shaped value.
+    /// Object with arbitrary literal keys and StringLit values only.
+    /// No expression evaluation, template reconstruction, or value coercion.
     StringMap,
     /// Value can be one of multiple shapes. Used for keys that accept
     /// either an inline block or a reference identifier.
@@ -85,9 +81,7 @@ impl PropertyValueKind {
     fn expects_block_outer_shape(self) -> bool {
         matches!(
             self,
-            PropertyValueKind::Block(_)
-                | PropertyValueKind::BlockMap(_)
-                | PropertyValueKind::StringMap
+            PropertyValueKind::Block(_) | PropertyValueKind::BlockMap(_)
         )
     }
 
@@ -385,12 +379,18 @@ fn check_property(
             }],
         },
         PropertyValueKind::StringMap => match prop {
-            Property::Block { properties, .. } => validate_string_map(properties),
-            Property::KeyValue { value_span, .. } => vec![SchemaError {
-                kind: SchemaErrorKind::ExpectedBlock,
+            // `{}` is syntactically shared with empty ordinary blocks.
+            Property::Block { properties, .. } if properties.is_empty() => Vec::new(),
+            Property::KeyValue {
+                value, value_span, ..
+            } => validate_string_map(key, value, key_span, *value_span),
+            Property::Block { .. } => vec![SchemaError {
+                kind: SchemaErrorKind::TypeMismatch {
+                    expected: "a static string object",
+                },
                 key: key.to_string(),
                 key_span,
-                value_span: *value_span,
+                value_span: None,
                 did_you_mean: None,
             }],
         },
@@ -447,7 +447,7 @@ fn check_one_of(
     // wrote a Block and the real problem is one missing inner key.
     //
     // Structural match is decided by comparing the variant's expected
-    // outer shape (`Block` / `BlockMap` / `StringMap` → block-shaped;
+    // outer shape (`Block` / `BlockMap` → block-shaped;
     // everything else → scalar-shaped) against the actual `Property`
     // variant. Earlier this filter walked the per-variant error list
     // looking for `ExpectedBlock` / `ExpectedValue` kinds, which
@@ -525,46 +525,37 @@ fn validate_block_map(properties: &[Property], inner_spec: &[PropertySpec]) -> V
     errs
 }
 
-/// Validate a `StringMap`-kind block: every entry must be a key-value
-/// with a string-shaped value. The key set is open, so there is no
-/// unknown-key check.
-fn validate_string_map(properties: &[Property]) -> Vec<SchemaError> {
-    let mut errs = Vec::new();
-    for prop in properties {
-        match prop {
-            Property::KeyValue {
-                key,
-                key_span,
-                value,
-                value_span,
-                ..
-            } => match &value.kind {
-                ExprKind::StringLit(_)
-                | ExprKind::Template(_)
-                | ExprKind::Ident(_)
-                | ExprKind::IntLit(_) => {}
-                _ => errs.push(SchemaError {
-                    kind: SchemaErrorKind::TypeMismatch {
-                        expected: "a string",
-                    },
-                    key: key.clone(),
-                    key_span: *key_span,
-                    value_span: *value_span,
-                    did_you_mean: None,
-                }),
+/// The parser stores literal keys in HashLit; values must remain literal too.
+fn validate_string_map(
+    key: &str,
+    value: &Expr,
+    key_span: Option<Span>,
+    value_span: Option<Span>,
+) -> Vec<SchemaError> {
+    let ExprKind::HashLit(entries) = &value.kind else {
+        return vec![SchemaError {
+            kind: SchemaErrorKind::TypeMismatch {
+                expected: "a static string object",
             },
-            Property::Block { key, key_span, .. } => {
-                errs.push(SchemaError {
-                    kind: SchemaErrorKind::ExpectedValue,
-                    key: key.clone(),
-                    key_span: *key_span,
-                    value_span: None,
-                    did_you_mean: None,
-                });
-            }
-        }
-    }
-    errs
+            key: key.to_string(),
+            key_span,
+            value_span,
+            did_you_mean: None,
+        }];
+    };
+    entries
+        .iter()
+        .filter(|(_, value)| !matches!(value.kind, ExprKind::StringLit(_)))
+        .map(|(name, value)| SchemaError {
+            kind: SchemaErrorKind::TypeMismatch {
+                expected: "a static string",
+            },
+            key: name.clone(),
+            key_span,
+            value_span: Some(value.span),
+            did_you_mean: None,
+        })
+        .collect()
 }
 
 fn quoted_key_error(prop: &Property) -> Option<SchemaError> {
@@ -1411,6 +1402,124 @@ mod tests {
     }
 
     #[test]
+    fn static_header_objects_parse_validate_and_extract() {
+        const MAP: &[PropertySpec] = &[PropertySpec {
+            name: "headers",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::StringMap,
+        }];
+        for (body, expected) in [
+            (r#"{}"#, vec![]),
+            (
+                r#"{ "DD-API-KEY": "test-only", "Authorization": "Bearer literal" }"#,
+                vec![
+                    ("DD-API-KEY".to_string(), "test-only".to_string()),
+                    ("Authorization".to_string(), "Bearer literal".to_string()),
+                ],
+            ),
+            (
+                r#"{ "X-\"Key": "line\nvalue" }"#,
+                vec![("X-\"Key".to_string(), "line\nvalue".to_string())],
+            ),
+        ] {
+            let config = crate::dsl::parser::parse_config(&format!(
+                "def output logs {{ type http headers {body} }}"
+            ))
+            .unwrap();
+            let crate::dsl::ast::Definition::Output(output) = &config.definitions[0] else {
+                panic!("output")
+            };
+            let props = output.properties.user_properties();
+            assert!(validate(props, MAP).is_empty(), "{body}");
+            assert_eq!(
+                crate::dsl::props::get_string_map(props, "headers"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn static_header_objects_reject_dynamic_values_and_old_blocks() {
+        const MAP: &[PropertySpec] = &[PropertySpec {
+            name: "headers",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::StringMap,
+        }];
+        for body in [
+            r#"{ "Authorization" "v" }"#,
+            r#"{ Authorization "v" }"#,
+            r#"{ "x": "${env.TOKEN}" }"#,
+            r#"{ "x": token }"#,
+            r#"{ "x": to_json(workspace) }"#,
+            r#"{ "x": 1 }"#,
+            r#"{ "x": true }"#,
+            r#"{ "x": null }"#,
+            r#"{ "x": [] }"#,
+            r#"{ "x": { inner: "v" } }"#,
+            r#"{ "${env.KEY}": "v" }"#,
+        ] {
+            if let Ok(config) = crate::dsl::parser::parse_config(&format!(
+                "def output logs {{ type http headers {body} }}"
+            )) {
+                let crate::dsl::ast::Definition::Output(output) = &config.definitions[0] else {
+                    panic!("output")
+                };
+                assert!(
+                    !validate(output.properties.user_properties(), MAP).is_empty(),
+                    "accepted {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn static_objects_do_not_replace_ordinary_blocks() {
+        const S: &[PropertySpec] = &[
+            PropertySpec {
+                name: "peer",
+                required: false,
+                repeatable: false,
+                exclusive_group: None,
+                kind: PropertyValueKind::Block(&[]),
+            },
+            PropertySpec {
+                name: "tls",
+                required: false,
+                repeatable: false,
+                exclusive_group: None,
+                kind: PropertyValueKind::BlockMap(&[]),
+            },
+        ];
+        for body in [
+            r#"peer { "url": "v" }"#,
+            r#"tls { "profile": "v" }"#,
+            r#""peer" {}"#,
+        ] {
+            let config = crate::dsl::parser::parse_config(&format!(
+                "def output logs {{ type http {body} }}"
+            ))
+            .unwrap();
+            let crate::dsl::ast::Definition::Output(output) = &config.definitions[0] else {
+                panic!("output")
+            };
+            assert!(
+                !validate(output.properties.user_properties(), S).is_empty(),
+                "accepted {body}"
+            );
+        }
+        let config =
+            crate::dsl::parser::parse_config("def output logs { type http peer {} }").unwrap();
+        let crate::dsl::ast::Definition::Output(output) = &config.definitions[0] else {
+            panic!("output")
+        };
+        assert!(validate(output.properties.user_properties(), S).is_empty());
+    }
+
+    #[test]
     fn quoted_keys_are_only_accepted_inside_string_maps() {
         const S: &[PropertySpec] = &[
             PropertySpec {
@@ -1456,7 +1565,7 @@ mod tests {
         }];
         for source in [
             r#"def output logs { type http headers {} }"#,
-            r#"def output logs { type http headers { "" "v" "not an HTTP key" "v" Authorization "v" } }"#,
+            r#"def output logs { type http headers { "": "v", "not an HTTP key": "v", "Authorization": "v" } }"#,
         ] {
             let config = crate::dsl::parser::parse_config(source).unwrap();
             let crate::dsl::ast::Definition::Output(output) = &config.definitions[0] else {
@@ -1494,12 +1603,18 @@ mod tests {
             exclusive_group: None,
             kind: PropertyValueKind::StringMap,
         }];
-        let props = vec![block(
+        let props = vec![kv(
             "headers",
-            vec![
-                kv("Authorization", ExprKind::StringLit("Bearer xxx".into())),
-                kv("X-Tenant", ExprKind::Ident(vec!["acme".into()])),
-            ],
+            ExprKind::HashLit(vec![
+                (
+                    "Authorization".into(),
+                    Expr::new(ExprKind::StringLit("Bearer xxx".into()), Span::dummy()),
+                ),
+                (
+                    "X-Tenant".into(),
+                    Expr::new(ExprKind::StringLit("acme".into()), Span::dummy()),
+                ),
+            ]),
         )];
         assert!(validate(&props, S).is_empty());
     }

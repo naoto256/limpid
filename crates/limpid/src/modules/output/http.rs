@@ -23,7 +23,7 @@
 //!     }
 //!     method POST
 //!     content_type "application/json"
-//!     headers { Authorization "Bearer xxx" }
+//!     headers { "Authorization": "Bearer xxx" }
 //! }
 //! ```
 //!
@@ -1283,7 +1283,7 @@ def output test {{
     type http
     peer {{ url "http://{addr}/" }}
     batch_size 1
-    headers {{ "DD-API-KEY" "test-only-key" "X-Custom-Header" "exact-value" }}
+    headers {{ "DD-API-KEY": "test-only-key", "X-Custom-Header": "exact-value" }}
 }}
 "#
             ),

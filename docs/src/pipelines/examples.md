@@ -115,7 +115,7 @@ def output elasticsearch {
     batch_size 100
     batch_timeout "5s"
     headers {
-        Authorization "Basic <base64(user:password)>"
+        "Authorization": "Basic <base64(user:password)>"
     }
 }
 

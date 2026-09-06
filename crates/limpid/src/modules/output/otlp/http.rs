@@ -23,7 +23,7 @@
 //!     batch_size 512
 //!     batch_timeout "5s"
 //!     headers {
-//!         Authorization "Bearer ${env.OTLP_TOKEN}"
+//!         "Authorization": "Bearer your-token"
 //!     }
 //! }
 //! ```
@@ -1189,7 +1189,7 @@ def output test {{
     type otlp_http
     peer {{ endpoint "http://{addr}/v1/logs" }}
     batch_size 1
-    headers {{ "X-Custom-Header" "exact-value" Authorization "placeholder" }}
+    headers {{ "X-Custom-Header": "exact-value", "Authorization": "placeholder" }}
 }}
 "#
         ))

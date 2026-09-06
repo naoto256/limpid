@@ -197,16 +197,10 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
     let key_pair = first_inner(key_pair)?;
     let key_quoted = key_pair.as_rule() == Rule::quoted_property_key;
     if key_pair.as_rule() == Rule::invalid_hyphenated_property_key {
-        bail!(
-            "hyphenated property key: quote the key inside a StringMap (for example, headers {{ \"DD-API-KEY\" \"...\" }})"
-        );
+        bail!("invalid hyphenated property key");
     }
     let key = if key_quoted {
-        let raw = key_pair.as_str();
-        let mut decoded = String::new();
-        // The key grammar excludes interpolation. Decode only literal escapes.
-        process_plain_into(&mut decoded, &raw[1..raw.len() - 1]);
-        decoded
+        decode_literal_key(key_pair.as_str())
     } else {
         key_pair.as_str().to_string()
     };
@@ -237,7 +231,11 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
         _ => {
             // key-value: key expr
             let value_span = Some(span_of(&second, file_id));
-            let value = parse_expr_from_pair(second, file_id)?;
+            let value = if second.as_rule() == Rule::configuration_object {
+                parse_hash_lit(second, file_id)?
+            } else {
+                parse_expr_from_pair(second, file_id)?
+            };
             Ok(Property::KeyValue {
                 key,
                 key_quoted,
@@ -1014,17 +1012,25 @@ fn parse_func_args(pair: Pair<Rule>, file_id: u32) -> Result<Vec<Expr>> {
         .collect()
 }
 
+fn decode_literal_key(raw: &str) -> String {
+    let mut decoded = String::new();
+    // The literal-key grammar excludes interpolation; share value escape decoding.
+    process_plain_into(&mut decoded, &raw[1..raw.len() - 1]);
+    decoded
+}
+
 fn parse_hash_lit(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
     let span = span_of(&pair, file_id);
     let entries = pair
         .into_inner()
         .map(|entry| {
             let mut inner = entry.into_inner();
-            let key = inner
-                .next()
-                .expect("pest grammar invariant")
-                .as_str()
-                .to_string();
+            let key = inner.next().expect("pest grammar invariant");
+            let key = if key.as_rule() == Rule::quoted_property_key {
+                decode_literal_key(key.as_str())
+            } else {
+                key.as_str().to_string()
+            };
             let value =
                 parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
             Ok((key, value))
@@ -1233,9 +1239,9 @@ def input fw_syslog {
 def output logs {
     type http
     headers {
-        "DD-API-KEY" "test-only-key"
-        "X-Custom-Header" "value"
-        Authorization "Bearer placeholder"
+        "DD-API-KEY": "test-only-key",
+        "X-Custom-Header": "value",
+        "Authorization": "Bearer placeholder"
     }
 }
 "#,
@@ -1255,17 +1261,17 @@ def output logs {
     }
 
     #[test]
-    fn quoted_key_migration_rejects_bare_hyphen_with_guidance() {
+    fn property_key_rejects_bare_hyphen() {
         let error =
             parse_config(r#"def output logs { type http headers { DD-API-KEY "placeholder" } }"#)
                 .unwrap_err();
-        assert!(format!("{error:#}").contains("quote"), "{error:#}");
+        assert!(format!("{error:#}").contains("invalid"), "{error:#}");
     }
 
     #[test]
     fn quoted_keys_are_static_and_decode_literal_escapes() {
         let config = parse_config(
-            r#"def output logs { type http headers { "x-\"quoted\"\\name" "v" "\${literal}" "v" } }"#,
+            r#"def output logs { type http headers { "x-\"quoted\"\\name": "v", "\${literal}": "v" } }"#,
         ).unwrap();
         let Definition::Output(output) = &config.definitions[0] else {
             panic!("output")
