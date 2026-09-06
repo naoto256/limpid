@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="42.5" height="37" viewBox="0 0 85 74">
+  <title>limpid mark</title>
+  <!-- l outline: PT Serif Caption Italic, Copyright (c) 2010 ParaType Ltd.
+       SIL Open Font License 1.1: fonts/OFL.txt. No embedded font dependency.
+       Outline weight and placement approved from the side-by-side logo comparison. -->
+  <path fill="#172329" d="M0 0h85v74H0z"/>
+  <path fill="#fff" stroke="#fff" stroke-width="39.1304" stroke-linejoin="round" transform="translate(20.38 51.7) scale(.046 -.046)" d="M175 696H102V750H283L161 169Q156 147 155 133Q154 119 154 106Q154 78 164 67.5Q174 57 189 57Q215 57 238 73Q261 89 281 106L304 71Q293 57 276 43Q259 29 238 17Q217 5 193 -2.5Q169 -10 145 -10Q96 -10 73 14Q50 38 50 75Q50 91 52.5 108.5Q55 126 59 145Z"/>
+  <path fill="#fff" d="M58 16h6L47 54h-6z"/>
+</svg>
