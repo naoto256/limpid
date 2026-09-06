@@ -125,21 +125,11 @@ export function pages() {
         : readFileSync(
             new URL("../src/firewall-log-archival.md", import.meta.url),
             "utf8",
-          ).replace(
-            "<!-- archival-configuration -->",
-            "```limpid\n" +
-              section
-                .match(/```limpid\n([\s\S]*?)```/)[1]
-                .replace(
-                  "process strip_headers | filter_noise",
-                  "process filter_noise | strip_headers",
-                ) +
-              "```",
           );
     const title =
       index === 1
         ? "Route CEF and Syslog to Log Analytics via AMA"
-        : "Keep the firewall logs you need, in per-device files";
+        : "Archive firewall logs in per-device files";
     return {
       kind: "recipe",
       number: index === 1 ? 6 : 1,
@@ -148,7 +138,7 @@ export function pages() {
         index === 0
           ? "Strip syslog PRI and route firewall logs into per-device archives."
           : "Separate CEF and non-CEF facilities for AMA collection rules, with disk-backed forwarding.",
-      route: `pipelines/${index === 0 ? "firewall-log-archival" : "ama-forwarding"}/index.html`,
+      route: `recipes/${index === 0 ? "firewall-log-archival" : "ama-forwarding"}/index.html`,
       content: markdown(recipeSource, "pipelines/examples.md"),
       siteRecipe: true,
     };
@@ -159,7 +149,7 @@ export function pages() {
     number: 7,
     description:
       "Put CEF fields into OTLP attributes that AMP can map to CommonSecurityLog columns—not just a message body.",
-    route: "pipelines/cef-to-amp/index.html",
+    route: "recipes/cef-to-amp/index.html",
     content: markdown(
       readFileSync(new URL("../src/cef-to-amp.md", import.meta.url), "utf8"),
       "pipelines/examples.md",
@@ -171,7 +161,7 @@ export function pages() {
     title: "Send syslog to Loki with JSON or OTLP",
     description:
       "Choose native JSON or OTLP, control label placement, and preserve the original log line.",
-    route: "pipelines/loki-http-json/index.html",
+    route: "recipes/loki-http-json/index.html",
     content: markdown(
       readFileSync(
         new URL("../src/loki-http-json.md", import.meta.url),
@@ -186,7 +176,7 @@ export function pages() {
     title: "Send syslog to Elasticsearch with Bulk or OTLP",
     description:
       "Build searchable JSON documents, or let Elasticsearch ingest OTLP logs directly.",
-    route: "pipelines/elasticsearch/index.html",
+    route: "recipes/elasticsearch/index.html",
     content: markdown(
       readFileSync(new URL("../src/elasticsearch.md", import.meta.url), "utf8"),
       "pipelines/examples.md",
@@ -198,7 +188,7 @@ export function pages() {
     title: "Send syslog directly to Datadog",
     description:
       "Preserve the original line, add searchable context, and send JSON to Datadog's HTTPS intake.",
-    route: "pipelines/datadog/index.html",
+    route: "recipes/datadog/index.html",
     content: markdown(
       readFileSync(new URL("../src/datadog.md", import.meta.url), "utf8"),
       "pipelines/examples.md",
@@ -211,12 +201,30 @@ export function pages() {
     title: "Send syslog to Amazon CloudWatch Logs with JSON or OTLP",
     description:
       "Choose JSON fields or OTLP attributes, with direct HTTPS ingestion into an AWS log group.",
-    route: "pipelines/cloudwatch/index.html",
+    route: "recipes/cloudwatch/index.html",
     content: markdown(
       readFileSync(new URL("../src/cloudwatch.md", import.meta.url), "utf8"),
       "pipelines/examples.md",
     ),
     siteRecipe: true,
+  });
+  recipes.splice(1, 0, {
+    kind: "recipe",
+    title: "Drop unwanted logs, or keep the first occurrence",
+    description:
+      "Discard selected noise, or use a table to suppress repeated attack logs without losing the first occurrence.",
+    route: "recipes/filter-and-thin/index.html",
+    content: markdown(
+      readFileSync(
+        new URL("../src/filter-and-thin.md", import.meta.url),
+        "utf8",
+      ),
+      "pipelines/examples.md",
+    ),
+    siteRecipe: true,
+  });
+  recipes.forEach((recipe, index) => {
+    recipe.number = index + 1;
   });
   const readme = read("README.md");
   const code = readme.match(/```limpid\n([\s\S]*?)```/)[1].trimEnd();
@@ -230,8 +238,8 @@ export function pages() {
     { kind: "index", title: "Documentation", route: "docs/index.html", nav },
     {
       kind: "recipes",
-      title: "Pipelines",
-      route: "pipelines/index.html",
+      title: "Recipes",
+      route: "recipes/index.html",
       recipes,
     },
     ...chapters,
