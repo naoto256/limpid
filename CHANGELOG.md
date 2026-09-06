@@ -8,6 +8,39 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-06
+
+> Hyphenated HTTP headers and more reliable validation.
+
+0.8.2 accepts hyphenated configuration property keys for HTTP headers,
+makes output regression tests wait for explicit progress, and adds automated
+release metadata and documentation checks.
+
+### Fixed — hyphenated HTTP header names
+
+HTTP output header maps now accept names such as `DD-API-KEY` and
+`X-Custom-Header`. The change is limited to property keys: expression
+identifiers and subtraction syntax remain unchanged. Header delivery was
+checked through a local HTTP receiver and Datadog log intake.
+
+### Fixed — output tests synchronize with delivery and readiness
+
+OTLP tests now wait for the delivery acknowledgement before shutdown.
+Full-pipe stdout tests distinguish pending readiness from an actual
+`EAGAIN` backoff, preserving shutdown, byte-exact drain, and acknowledgement
+assertions. The macOS retry timing test waits for observed progress instead
+of a fixed number of scheduler yields and checks the 10 ms boundary.
+These changes affect tests, not production output behavior.
+
+### Changed — release metadata and documentation preflight
+
+CI and the release workflow now check product versions, workspace dependencies,
+lockfile versions, release notes and titles, and rendered documentation links
+and anchors. Remote link checks distinguish missing destinations from transient
+network failures. The pinned mdBook configuration preserves README page targets
+alongside the book entry page. Both workflows use the existing audited
+`actions/setup-python` v6.2.0 pin.
+
 ## [0.8.1] - 2026-09-02
 
 > Single execution IR, safer queues, and lower hot-path overhead.
@@ -2487,7 +2520,8 @@ See `docs/src/operations/upgrade-0.3.md` for end-to-end migration recipes includ
 
 Initial public release. Rust + tokio log pipeline daemon replacing rsyslog / syslog-ng / fluentd with a single readable DSL (`def input`, `def process`, `def output`, `def pipeline`). Includes syslog (UDP/TCP/ TLS) / tail / journal / unix socket inputs; file / HTTP / Kafka / TCP / UDP / unix socket / stdout outputs; in-DSL expression language with parsers (JSON / KV / CEF / syslog), regex, string templates, tables with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`); hot reload via `SIGHUP` with automatic rollback; per-output disk-backed queues.
 
-[Unreleased]: https://github.com/naoto256/limpid/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/naoto256/limpid/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/naoto256/limpid/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/naoto256/limpid/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/naoto256/limpid/compare/v0.7.15...v0.8.0
 [0.7.15]: https://github.com/naoto256/limpid/compare/v0.7.14...v0.7.15
