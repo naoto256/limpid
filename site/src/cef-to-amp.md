@@ -1,4 +1,4 @@
-# Map CEF fields to Log Analytics columns via AMP
+# Send CEF to Log Analytics via AMP
 
 A CEF event can reach the receiver and still leave the columns you need empty. Sending a message is not the same as making its fields available to the destination's mapping.
 
@@ -23,6 +23,7 @@ This is an AMP exporter mapping—not the facility filtering in the AMA recipe. 
 The packaged `parse_cef` and `cef_to_otlp` processes handle generic CEF. The small process between the adapter and `compose_otlp` adds the destination-specific column projection. Vendor-specific interpretation belongs in a vendor parser/adapter, not in the generic composer.
 
 ```limpid
+include "/usr/share/limpid/snippets/parsers/parse_syslog.limpid"
 include "/usr/share/limpid/snippets/parsers/parse_cef.limpid"
 include "/usr/share/limpid/snippets/composers/compose_otlp.limpid"
 
@@ -65,7 +66,7 @@ def process project_common_security_log {
 
 def pipeline cef_to_log_analytics {
     input cef_tcp
-    process { workspace.syslog = syslog.parse(ingress) }
+    process parse_syslog
     if not starts_with(workspace.syslog.msg, "CEF:") { drop }
     process parse_cef | cef_to_otlp | project_common_security_log
           | compose_otlp | otlp_to_egress

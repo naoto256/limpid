@@ -6,6 +6,45 @@ import MarkdownIt from "markdown-it";
 import PageTemplate from "../src/pages.11ty.js";
 import { url, origin } from "../lib/config.js";
 
+test("branching recipe preserves earlier output copies and AMP uses the syslog snippet", () => {
+  const source = readFileSync("src/branch-and-forward.md", "utf8");
+  const entry = pages().find(
+    (p) => p.route === "recipes/branch-and-forward/index.html",
+  );
+  assert.equal(entry.number, 3);
+  const fence = source.match(/```limpid\n([\s\S]*?)```/)[1];
+  assert.match(fence, /output archive\s+process parse_syslog/);
+  assert.match(fence, /severity <= 4/);
+  assert.match(fence, /severity <= 3/);
+  assert.match(fence, /process urgent_document\s+output urgent/);
+  const rendered = entry.content
+    .match(/<pre><code[^>]*>([\s\S]*?)<\/code>/)[1]
+    .replace(/<span class="[^"]+">|<\/span>/g, "");
+  assert.equal(rendered, new MarkdownIt().utils.escapeHtml(fence));
+  const amp = readFileSync("src/cef-to-amp.md", "utf8");
+  assert.match(
+    amp,
+    /include "\/usr\/share\/limpid\/snippets\/parsers\/parse_syslog.limpid"/,
+  );
+  assert.match(amp, /process parse_syslog\n/);
+  assert.ok(!amp.includes("syslog.parse(ingress)"));
+});
+
+test("header stays outside the keyboard-accessible content scroller", () => {
+  const renderer = new PageTemplate();
+  for (const entry of pages()) {
+    const html = renderer.render({ entry });
+    assert.match(
+      html,
+      /<\/header><div class="page-scroll" tabindex="0" role="region" aria-label="Page content"><main /,
+    );
+    assert.match(html, /<\/footer><\/div><\/body>/);
+    assert.equal((html.match(/class="page-scroll"/g) || []).length, 1);
+    assert.match(html, /href="#main"/);
+    assert.match(html, /<main id="main"/);
+  }
+});
+
 test("shared head includes exactly one static Search Console verification tag", () => {
   const tag =
     '<meta name="google-site-verification" content="S-EqEKp48UJAW41lZX5p1lCX1WOcv23Zq_XZxVzEsNk" />';
@@ -61,17 +100,18 @@ test("filtering is second and archival never drops messages", () => {
   assert.match(archive, /default \{ output other \}/);
 });
 
-test("Datadog is fifth and preserves its header and JSON payload", () => {
+test("Datadog is sixth and documents JSON and direct OTLP with literal payloads", () => {
   const recipes = pages().filter((page) => page.kind === "recipe");
-  assert.equal(recipes[4].route, "recipes/datadog/index.html");
-  assert.equal(recipes[5].route, "recipes/cloudwatch/index.html");
-  assert.equal(recipes[5].number, 6);
+  assert.equal(recipes[5].route, "recipes/datadog/index.html");
+  assert.equal(recipes[6].route, "recipes/better-stack/index.html");
+  assert.equal(recipes[7].route, "recipes/cloudwatch/index.html");
+  assert.equal(recipes[7].number, 8);
   assert.deepEqual(
     recipes.map((recipe, index) => recipe.number ?? index + 1),
-    [1, 2, 3, 4, 5, 6, 7, 8],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
   );
-  assert.equal(recipes[6].route, "recipes/ama-forwarding/index.html");
-  assert.equal(recipes[7].route, "recipes/cef-to-amp/index.html");
+  assert.equal(recipes[8].route, "recipes/ama-forwarding/index.html");
+  assert.equal(recipes[9].route, "recipes/cef-to-amp/index.html");
   const source = readFileSync("src/datadog.md", "utf8");
   for (const text of [
     '"DD-API-KEY":',
@@ -79,15 +119,149 @@ test("Datadog is fifth and preserves its header and JSON payload", () => {
     "/api/v2/logs",
     "batch_size 1",
     "message: ingress",
-    "0.8.4",
+    "## Option A: choose the JSON fields",
+    "## Option B: preserve OTLP structure",
+    '"dd-api-key": "<DATADOG_API_KEY>"',
+    'endpoint "https://otlp.ap1.datadoghq.com/v1/logs"',
+    "protocol http_protobuf",
+    "body = { string_value: ingress }",
+    "compose_otlp | otlp_to_egress",
     "Log Explorer",
   ])
     assert.ok(source.includes(text), text);
-  const payload = source.match(/```limpid\n([\s\S]*?)```/)[1];
-  const rendered = recipes[4].content
-    .match(/<pre><code[^>]*>([\s\S]*?)<\/code>/)[1]
-    .replace(/<span class="[^"]+">|<\/span>/g, "");
-  assert.equal(rendered, new MarkdownIt().utils.escapeHtml(payload));
+  const payloads = [...source.matchAll(/```limpid\n([\s\S]*?)```/g)].map(
+    (m) => m[1],
+  );
+  const rendered = [
+    ...recipes[5].content.matchAll(
+      /<pre><code class="language-limpid">([\s\S]*?)<\/code>/g,
+    ),
+  ].map((m) => m[1].replace(/<span class="[^"]+">|<\/span>/g, ""));
+  assert.equal(payloads.length, 4);
+  assert.deepEqual(
+    rendered,
+    payloads.map((p) => new MarkdownIt().utils.escapeHtml(p)),
+  );
+});
+
+test("FortiGate variations distinguish raw JSON and parsed OTLP on three destinations", () => {
+  let sample;
+  for (const name of ["datadog", "better-stack", "loki-http-json"]) {
+    const source = readFileSync(`src/${name}.md`, "utf8");
+    const event = JSON.parse(source.match(/```json\n([\s\S]*?)```/)[1]);
+    if (sample) assert.deepEqual(event, sample);
+    sample = event;
+    const fences = [...source.matchAll(/```limpid\n([\s\S]*?)```/g)].map(
+      (m) => m[1],
+    );
+    assert.equal(fences.length, 4);
+    assert.match(
+      fences[1],
+      /parse_syslog \| parse_cef \| fortigate_timezone \| parse_fortigate_cef \| fortigate_document/,
+    );
+    assert.match(
+      fences[1],
+      /event_time_unix_nano: workspace\.lsis\.parsed\.time/,
+    );
+    assert.match(fences[1], /message: ingress/);
+    assert.match(
+      fences[3],
+      /fortigate_cef_to_otlp \| compose_otlp \| otlp_to_egress/,
+    );
+    assert.doesNotMatch(
+      fences[3],
+      /process (?:datadog_log|betterstack_log|syslog_for_loki)/,
+    );
+    assert.match(fences[3], /workspace\.fortigate_cef\.timezone = "UTC"/);
+    assert.match(
+      fences[3],
+      /process parse_syslog \| parse_cef \| fortigate_timezone \| parse_fortigate_cef/,
+    );
+    assert.ok(source.includes("not the sender of the UDP packet"));
+    assert.ok(source.includes("does not invent `service.name`"));
+    const entry = pages().find((p) => p.route === `recipes/${name}/index.html`);
+    const rendered = [
+      ...entry.content.matchAll(
+        /<pre><code class="language-limpid">([\s\S]*?)<\/code>/g,
+      ),
+    ].map((m) => m[1].replace(/<span class="[^"]+">|<\/span>/g, ""));
+    assert.deepEqual(
+      rendered,
+      fences.map((p) => new MarkdownIt().utils.escapeHtml(p)),
+    );
+    if (name === "loki-http-json") {
+      assert.match(fences[2], /protocol http_protobuf/);
+      assert.ok(source.includes('observer_type="firewall"'));
+      assert.ok(source.includes("add `observer.type` beside `service.name`"));
+    }
+  }
+});
+
+test("destination titles agree across index, page title, and source heading", () => {
+  const entries = pages();
+  const indexHtml = new PageTemplate().render({
+    entry: entries.find((p) => p.kind === "recipes"),
+  });
+  const titles = {
+    "loki-http-json": "Send syslog to Loki",
+    elasticsearch: "Send syslog to Elasticsearch",
+    datadog: "Send syslog to Datadog",
+    "better-stack": "Send syslog to Better Stack",
+    cloudwatch: "Send syslog to Amazon CloudWatch Logs",
+    "ama-forwarding": "Route CEF and Syslog to Log Analytics via AMA",
+    "cef-to-amp": "Send CEF to Log Analytics via AMP",
+  };
+  for (const [name, title] of Object.entries(titles)) {
+    const entry = entries.find((p) => p.route === `recipes/${name}/index.html`);
+    const html = new PageTemplate().render({ entry });
+    assert.equal(entry.title, title);
+    assert.equal(
+      readFileSync(`src/${name}.md`, "utf8").split("\n")[0],
+      `# ${title}`,
+    );
+    assert.ok(indexHtml.includes(title));
+    assert.ok(html.includes(`<title>${title} — limpid</title>`));
+    assert.equal(html.match(/<h1\b[^>]*>(.*?)<\/h1>/s)?.[1], title);
+  }
+});
+
+test("Better Stack documents both transports with literal public placeholders", () => {
+  const source = readFileSync("src/better-stack.md", "utf8");
+  const entry = pages().find(
+    (page) => page.route === "recipes/better-stack/index.html",
+  );
+  assert.equal(entry.number, 7);
+  for (const text of [
+    '"Authorization": "Bearer <SOURCE_TOKEN>"',
+    'url "https://ingesting-host.example/"',
+    'endpoint "https://ingesting-host.example/v1/logs"',
+    "protocol http_protobuf",
+    "message: ingress",
+    "body = { string_value: ingress }",
+    "compose_otlp | otlp_to_egress",
+    "Live Tail",
+    "management API token",
+    "## Option A: choose the JSON fields",
+    "## Option B: preserve OTLP structure",
+  ])
+    assert.ok(source.includes(text), text);
+  assert.doesNotMatch(
+    source,
+    /s2740307|LIMPID_BETTERSTACK_V084|\/tmp\/bs\.txt/,
+  );
+  const payloads = [...source.matchAll(/```limpid\n([\s\S]*?)```/g)].map(
+    (match) => match[1],
+  );
+  const rendered = [
+    ...entry.content.matchAll(
+      /<pre><code class="language-limpid">([\s\S]*?)<\/code>/g,
+    ),
+  ].map((match) => match[1].replace(/<span class="[^"]+">|<\/span>/g, ""));
+  assert.equal(payloads.length, 4);
+  assert.deepEqual(
+    rendered,
+    payloads.map((payload) => new MarkdownIt().utils.escapeHtml(payload)),
+  );
 });
 
 test("archival and filtering recipes preserve every authored fence payload", () => {
@@ -132,9 +306,9 @@ test("AMA recipe pairs PRI rewriting with distinct connector DCRs", () => {
   assert.ok(!html.includes("Imported from the existing pipeline examples"));
 });
 
-test("Loki is third and distinguishes native JSON from OTLP", () => {
+test("Loki is fourth and distinguishes native JSON from OTLP", () => {
   const recipes = pages().filter((p) => p.kind === "recipe");
-  assert.equal(recipes[2].route, "recipes/loki-http-json/index.html");
+  assert.equal(recipes[3].route, "recipes/loki-http-json/index.html");
   const source = readFileSync("src/loki-http-json.md", "utf8");
   for (const text of [
     "batch_size 1",
@@ -148,7 +322,7 @@ test("Loki is third and distinguishes native JSON from OTLP", () => {
   for (const text of [
     "/otlp/v1/logs",
     "type otlp_http",
-    'protocol "http_protobuf"',
+    "protocol http_protobuf",
     'key: "service.name"',
     'key: "source.ip"',
     "allow_structured_metadata: true",
@@ -159,9 +333,9 @@ test("Loki is third and distinguishes native JSON from OTLP", () => {
     assert.ok(source.includes(text), text);
 });
 
-test("Elastic is fourth and documents both ingestion paths and acknowledgement limits", () => {
+test("Elastic is fifth and documents both ingestion paths and acknowledgement limits", () => {
   const recipes = pages().filter((p) => p.kind === "recipe");
-  assert.equal(recipes[3].route, "recipes/elasticsearch/index.html");
+  assert.equal(recipes[4].route, "recipes/elasticsearch/index.html");
   const source = readFileSync("src/elasticsearch.md", "utf8");
   for (const text of [
     "application/x-ndjson",
@@ -183,12 +357,60 @@ test("Elastic is fourth and documents both ingestion paths and acknowledgement l
   );
 });
 
+test("Elasticsearch structured variants bind explicit Bulk mappings and native OTLP query paths", () => {
+  const source = readFileSync("src/elasticsearch.md", "utf8");
+  const sample = JSON.parse(source.match(/```json\n([\s\S]*?)```/)[1]);
+  assert.deepEqual(
+    sample,
+    JSON.parse(
+      readFileSync("src/datadog.md", "utf8").match(/```json\n([\s\S]*?)```/)[1],
+    ),
+  );
+  const requests = [...source.matchAll(/```http\n[^\n]+\n([\s\S]*?)```/g)].map(
+    (m) => JSON.parse(m[1]),
+  );
+  assert.equal(requests.length, 3);
+  const properties = requests[0].mappings.properties;
+  assert.equal(properties.source.properties.ip.type, "ip");
+  assert.equal(properties.destination.properties.port.type, "integer");
+  assert.equal(properties.event_time.format, "epoch_millis");
+  assert.equal(properties.rule.properties.name.type, "keyword");
+  assert.equal(requests[1].aggs.rules.terms.field, "rule.name");
+  assert.equal(requests[2].aggs.rules.terms.field, "attributes.rule.name");
+  const fences = [...source.matchAll(/```limpid\n([\s\S]*?)```/g)].map(
+    (m) => m[1],
+  );
+  assert.equal(fences.length, 4);
+  for (const index of [1, 3])
+    assert.ok(
+      fences[index].includes(
+        "parse_syslog | parse_cef | fortigate_timezone | parse_fortigate_cef",
+      ),
+    );
+  assert.ok(fences[1].includes("to_int(workspace.lsis.parsed.time / 1000000)"));
+  assert.ok(
+    fences[3].includes("fortigate_cef_to_otlp | compose_otlp | otlp_to_egress"),
+  );
+  const entry = pages().find(
+    (p) => p.route === "recipes/elasticsearch/index.html",
+  );
+  const rendered = [
+    ...entry.content.matchAll(
+      /<pre><code class="language-limpid">([\s\S]*?)<\/code>/g,
+    ),
+  ].map((m) => m[1].replace(/<span class="[^"]+">|<\/span>/g, ""));
+  assert.deepEqual(
+    rendered,
+    fences.map((p) => new MarkdownIt().utils.escapeHtml(p)),
+  );
+});
+
 test("AMP recipe pairs OTLP attributes with Log Analytics record mappings", () => {
   const entry = pages().find(
     (page) => page.route === "recipes/cef-to-amp/index.html",
   );
   assert.ok(entry);
-  assert.equal(entry.title, "Map CEF fields to Log Analytics columns via AMP");
+  assert.equal(entry.title, "Send CEF to Log Analytics via AMP");
   const source = readFileSync("src/cef-to-amp.md", "utf8");
   const mapping = JSON.parse(source.match(/```json\n([\s\S]*?)```/)[1]);
   for (const { from, to } of mapping.recordMap) {
