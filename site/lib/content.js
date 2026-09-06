@@ -244,5 +244,18 @@ export function pages() {
     },
     ...chapters,
     ...recipes,
+    {
+      kind: "example",
+      title: "Run the homepage example: FortiGate CEF to OCSF",
+      route: "recipes/fortigate-cef-to-ocsf/index.html",
+      content: markdown(
+        readFileSync(
+          new URL("../src/fortigate-cef-to-ocsf.md", import.meta.url),
+          "utf8",
+        ),
+        "pipelines/examples.md",
+      ),
+      siteRecipe: true,
+    },
   ];
 }
