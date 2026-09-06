@@ -1199,10 +1199,22 @@ mod metrics_registration_tests {
                 "neither normal nor drain mode may retry before 10 ms"
             );
             assert!(!task.is_finished());
+            let retry_at = tokio::time::Instant::now() + std::time::Duration::from_millis(1);
             tokio::time::advance(std::time::Duration::from_millis(1)).await;
-            for _ in 0..32 {
-                tokio::task::yield_now().await;
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                // The counter retains progress if notification preceded this
+                // wait; current_thread cannot interleave the load and await.
+                while observer
+                    .waiting_count
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    < 2
+                {
+                    observer.waiting.notified().await;
+                }
+            })
+            .await
+            .expect("the next readiness attempt must be observed");
+            assert_eq!(tokio::time::Instant::now(), retry_at);
             assert_eq!(
                 observer
                     .waiting_count
