@@ -40,9 +40,10 @@ version requires an explicit content review and a version update in `lib/config.
 The four-package version assertion catches version mismatches, not semantic
 unreleased-feature drift; review the exact content before publication. There is no next site.
 
-The seven recipe sources live in `src/`: archive, Loki, Elasticsearch, Datadog,
-CloudWatch, AMA, and CEF to AMP. The archive recipe incorporates the existing
-pipeline example with the approved filter-first adaptation. Other recipes are
+The Recipes index and detail pages use `/recipes/`; `/docs/pipelines/` remains
+the DSL pipeline reference. The eight recipe sources live in `src/`: archive, filtering and thinning, Loki, Elasticsearch, Datadog,
+CloudWatch, AMA, and CEF to AMP. Archival routes every sender to a file; filtering
+and table-based suppression are separate examples in Recipe 02. Recipes are
 authored configurations with receiver prerequisites; changes must preserve their
 actual validation boundaries. Rendering is not an integration test.
 The home-page DSL is the existing README pipeline fragment.

@@ -6,6 +6,20 @@ import MarkdownIt from "markdown-it";
 import PageTemplate from "../src/pages.11ty.js";
 import { url, origin } from "../lib/config.js";
 
+test("Recipes navigation and routes stay separate from the Pipeline reference", () => {
+  const entries = pages();
+  const renderer = new PageTemplate();
+  const index = entries.find((page) => page.route === "recipes/index.html");
+  assert.equal(index.title, "Recipes");
+  const html = renderer.render({ entry: index });
+  assert.ok(html.includes(`href="${url("recipes/")}">Recipes</a>`));
+  assert.ok(html.includes(`href="${url("docs/pipelines/index.html")}"`));
+  for (const entry of entries) {
+    assert.ok(!entry.route.startsWith("pipelines/"));
+    if (entry.kind === "recipe") assert.ok(entry.route.startsWith("recipes/"));
+  }
+});
+
 test("every page has an indexable canonical URL and docs link to the content commit", () => {
   const renderer = new PageTemplate();
   for (const entry of pages()) {
@@ -21,17 +35,28 @@ test("every page has an indexable canonical URL and docs link to the content com
   }
 });
 
-test("Datadog is fourth and preserves its header and JSON payload", () => {
+test("filtering is second and archival never drops messages", () => {
   const recipes = pages().filter((page) => page.kind === "recipe");
-  assert.equal(recipes[3].route, "pipelines/datadog/index.html");
-  assert.equal(recipes[4].route, "pipelines/cloudwatch/index.html");
-  assert.equal(recipes[4].number, 5);
+  assert.equal(recipes[1].route, "recipes/filter-and-thin/index.html");
+  const archive = readFileSync("src/firewall-log-archival.md", "utf8");
+  assert.doesNotMatch(
+    archive.match(/```limpid\n([\s\S]*?)```/)[1],
+    /\bdrop\b|filter_noise/,
+  );
+  assert.match(archive, /default \{ output other \}/);
+});
+
+test("Datadog is fifth and preserves its header and JSON payload", () => {
+  const recipes = pages().filter((page) => page.kind === "recipe");
+  assert.equal(recipes[4].route, "recipes/datadog/index.html");
+  assert.equal(recipes[5].route, "recipes/cloudwatch/index.html");
+  assert.equal(recipes[5].number, 6);
   assert.deepEqual(
     recipes.map((recipe, index) => recipe.number ?? index + 1),
-    [1, 2, 3, 4, 5, 6, 7],
+    [1, 2, 3, 4, 5, 6, 7, 8],
   );
-  assert.equal(recipes[5].route, "pipelines/ama-forwarding/index.html");
-  assert.equal(recipes[6].route, "pipelines/cef-to-amp/index.html");
+  assert.equal(recipes[6].route, "recipes/ama-forwarding/index.html");
+  assert.equal(recipes[7].route, "recipes/cef-to-amp/index.html");
   const source = readFileSync("src/datadog.md", "utf8");
   for (const text of [
     '"DD-API-KEY":',
@@ -44,39 +69,34 @@ test("Datadog is fourth and preserves its header and JSON payload", () => {
   ])
     assert.ok(source.includes(text), text);
   const payload = source.match(/```limpid\n([\s\S]*?)```/)[1];
-  const rendered = recipes[3].content
+  const rendered = recipes[4].content
     .match(/<pre><code[^>]*>([\s\S]*?)<\/code>/)[1]
     .replace(/<span class="[^"]+">|<\/span>/g, "");
   assert.equal(rendered, new MarkdownIt().utils.escapeHtml(payload));
 });
 
-test("archival recipe changes only process order in the original configuration", () => {
-  const entry = pages().find(
-    (page) => page.route === "pipelines/firewall-log-archival/index.html",
-  );
-  const original = readFileSync(
-    "../docs/src/pipelines/examples.md",
-    "utf8",
-  ).match(/```limpid\n([\s\S]*?)```/)[1];
-  const code = entry.content
-    .match(/<pre><code[^>]*>([\s\S]*?)<\/code>/)[1]
-    .replace(/<span class="[^"]+">|<\/span>/g, "");
-  assert.equal(
-    code,
-    new MarkdownIt().utils.escapeHtml(
-      original.replace(
-        "process strip_headers | filter_noise",
-        "process filter_noise | strip_headers",
-      ),
-    ),
-  );
-  assert.ok(entry.content.includes("Any other sender"));
-  assert.ok(entry.content.includes("not a lossless collection guarantee"));
+test("archival and filtering recipes preserve every authored fence payload", () => {
+  for (const name of ["firewall-log-archival", "filter-and-thin"]) {
+    const entry = pages().find(
+      (page) => page.route === `recipes/${name}/index.html`,
+    );
+    const source = readFileSync(`src/${name}.md`, "utf8");
+    const payloads = [...source.matchAll(/```limpid\n([\s\S]*?)```/g)].map(
+      (m) => m[1],
+    );
+    const rendered = [
+      ...entry.content.matchAll(/<pre><code[^>]*>([\s\S]*?)<\/code>/g),
+    ].map((m) => m[1].replace(/<span class="[^"]+">|<\/span>/g, ""));
+    assert.deepEqual(
+      rendered,
+      payloads.map((p) => new MarkdownIt().utils.escapeHtml(p)),
+    );
+  }
 });
 
 test("AMA recipe pairs PRI rewriting with distinct connector DCRs", () => {
   const entry = pages().find(
-    (page) => page.route === "pipelines/ama-forwarding/index.html",
+    (page) => page.route === "recipes/ama-forwarding/index.html",
   );
   const html = new PageTemplate().render({ entry });
   assert.equal(entry.title, "Route CEF and Syslog to Log Analytics via AMA");
@@ -97,9 +117,9 @@ test("AMA recipe pairs PRI rewriting with distinct connector DCRs", () => {
   assert.ok(!html.includes("Imported from the existing pipeline examples"));
 });
 
-test("Loki is second and distinguishes native JSON from OTLP", () => {
+test("Loki is third and distinguishes native JSON from OTLP", () => {
   const recipes = pages().filter((p) => p.kind === "recipe");
-  assert.equal(recipes[1].route, "pipelines/loki-http-json/index.html");
+  assert.equal(recipes[2].route, "recipes/loki-http-json/index.html");
   const source = readFileSync("src/loki-http-json.md", "utf8");
   for (const text of [
     "batch_size 1",
@@ -124,9 +144,9 @@ test("Loki is second and distinguishes native JSON from OTLP", () => {
     assert.ok(source.includes(text), text);
 });
 
-test("Elastic is third and documents both ingestion paths and acknowledgement limits", () => {
+test("Elastic is fourth and documents both ingestion paths and acknowledgement limits", () => {
   const recipes = pages().filter((p) => p.kind === "recipe");
-  assert.equal(recipes[2].route, "pipelines/elasticsearch/index.html");
+  assert.equal(recipes[3].route, "recipes/elasticsearch/index.html");
   const source = readFileSync("src/elasticsearch.md", "utf8");
   for (const text of [
     "application/x-ndjson",
@@ -150,7 +170,7 @@ test("Elastic is third and documents both ingestion paths and acknowledgement li
 
 test("AMP recipe pairs OTLP attributes with Log Analytics record mappings", () => {
   const entry = pages().find(
-    (page) => page.route === "pipelines/cef-to-amp/index.html",
+    (page) => page.route === "recipes/cef-to-amp/index.html",
   );
   assert.ok(entry);
   assert.equal(entry.title, "Map CEF fields to Log Analytics columns via AMP");
