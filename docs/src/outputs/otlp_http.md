@@ -29,7 +29,7 @@ def output otlp_out {
     batch_size 512
     batch_timeout "5s"
     headers {
-        Authorization "Bearer ${env.OTLP_TOKEN}"
+        "Authorization": "Bearer your-token"
     }
 }
 ```
@@ -50,9 +50,9 @@ def output otlp_out {
 
 ## Properties
 
-Header keys use the same [static quoted-key syntax](http.md#headers-block)
-as HTTP output. Use `"X-Custom-Header" "value"` for hyphenated names;
-`Authorization` may remain bare. Quoting does not bypass HTTP name restrictions.
+Headers use the same [static string object syntax](http.md#headers-block)
+as HTTP output: `"X-Custom-Header": "value"`. Keys and values are literal strings;
+quoting does not bypass HTTP name restrictions.
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|

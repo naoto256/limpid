@@ -28,7 +28,7 @@ def output es_cluster {
     batch_timeout "5s"
     compress gzip
     headers {
-        Authorization "Basic <base64(user:password)>"
+        "Authorization": "Basic <base64(user:password)>"
     }
 }
 ```
@@ -74,19 +74,19 @@ On each send the rotation picks the next available peer (cooldown expired) and t
 
 ### headers block
 
-From 0.8.3, header names containing hyphens must be quoted, for example
-`"DD-API-KEY" "your-api-key"`. Ordinary identifiers such as `Authorization`
-may remain bare. Quoted keys are static strings: `${...}` interpolation is
-not allowed in keys. Literal escapes follow string-value decoding (`\"`,
+Headers are a static string object: separate keys and values with `:` and
+entries with `,`. Keys and values must be literal strings; `${...}` interpolation,
+variables, function calls, and non-string values are not accepted.
+Literal escapes follow string-value decoding (`\"`,
 `\\`, `\n`, `\t`, and `\$`; unknown escapes retain the backslash).
-Quoting is supported only for entries inside string maps such as `headers`,
+This configuration object syntax is supported for string maps such as `headers`,
 not fixed configuration names such as `type` or `peer`. HTTP header-name
 restrictions still apply to the decoded name.
 
 ```limpid
 headers {
-    Authorization "Bearer your-token"
-    "X-Custom-Header" "value"
+    "Authorization": "Bearer your-token",
+    "X-Custom-Header": "value"
 }
 ```
 
@@ -144,7 +144,7 @@ def output splunk {
     type http
     peer { url "https://splunk:8088/services/collector/event" }
     headers {
-        Authorization "Splunk your-hec-token"
+        "Authorization": "Splunk your-hec-token"
     }
 }
 ```
@@ -158,7 +158,7 @@ def output datadog {
     batch_size 50
     compress gzip
     headers {
-        "DD-API-KEY" "your-api-key"
+        "DD-API-KEY": "your-api-key"
     }
 }
 ```
