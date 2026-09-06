@@ -49,6 +49,11 @@ def output otlp_out {
 
 ## Properties
 
+Header keys use the same [static quoted-key syntax](http.md#headers-block)
+as HTTP output. Use `"X-Custom-Header" "value"` for hyphenated names;
+`Authorization` may remain bare. Names are lower-cased for gRPC metadata;
+quoting does not bypass the protocol's name restrictions.
+
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `peer { endpoint tls{...} }` or `peers { peer { ... } ... }` | yes (one of) | — | One or more peer blocks. See [§ peers](#peers) below. |

@@ -74,10 +74,19 @@ On each send the rotation picks the next available peer (cooldown expired) and t
 
 ### headers block
 
+From 0.8.3, header names containing hyphens must be quoted, for example
+`"DD-API-KEY" "your-api-key"`. Ordinary identifiers such as `Authorization`
+may remain bare. Quoted keys are static strings: `${...}` interpolation is
+not allowed in keys. Literal escapes follow string-value decoding (`\"`,
+`\\`, `\n`, `\t`, and `\$`; unknown escapes retain the backslash).
+Quoting is supported only for entries inside string maps such as `headers`,
+not fixed configuration names such as `type` or `peer`. HTTP header-name
+restrictions still apply to the decoded name.
+
 ```limpid
 headers {
     Authorization "Bearer your-token"
-    X-Custom-Header "value"
+    "X-Custom-Header" "value"
 }
 ```
 
@@ -149,7 +158,7 @@ def output datadog {
     batch_size 50
     compress gzip
     headers {
-        DD-API-KEY "your-api-key"
+        "DD-API-KEY" "your-api-key"
     }
 }
 ```

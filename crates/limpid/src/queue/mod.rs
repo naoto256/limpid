@@ -3941,6 +3941,7 @@ mod schema_splice_tests {
     fn kv(key: &str, kind: ExprKind) -> Property {
         Property::KeyValue {
             key: key.into(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(kind),
             value_span: None,
@@ -3950,6 +3951,7 @@ mod schema_splice_tests {
     fn block(key: &str, properties: Vec<Property>) -> Property {
         Property::Block {
             key: key.into(),
+            key_quoted: false,
             key_span: None,
             properties,
         }

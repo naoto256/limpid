@@ -1128,6 +1128,7 @@ mod tests {
     fn string_property(key: &str, value: &str) -> Property {
         Property::KeyValue {
             key: key.to_owned(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::StringLit(value.to_owned())),
             value_span: None,
@@ -1137,6 +1138,7 @@ mod tests {
     fn int_property(key: &str, value: i64) -> Property {
         Property::KeyValue {
             key: key.to_owned(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::IntLit(value)),
             value_span: None,
@@ -1146,6 +1148,7 @@ mod tests {
     fn peer_property(node_id: &str, pubkey: &str) -> Property {
         Property::Block {
             key: "peer".to_owned(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 string_property("node_id", node_id),
