@@ -60,7 +60,7 @@ quoting does not bypass the protocol's name restrictions.
 | `batch_size` | no | `1` | Flush after this many Events. `1` ships every Event immediately. |
 | `batch_timeout` | no | `5s` | Flush deferred Events after this duration. |
 | `batch_level` | no | `none` | One of `none` / `resource` / `scope`. See [§ batch_level](#batch_level). |
-| `headers` | no | — | gRPC metadata added to every batch. Keys are lower-cased per HTTP/2 / gRPC convention; tonic rejects mixed-case (e.g. `Authorization`). |
+| `headers` | no | — | gRPC metadata added to every batch. Configured mixed-case keys (e.g. `Authorization`) are accepted and normalized to lowercase before sending; metadata name and value restrictions still apply. |
 | `retry { max_attempts initial_wait max_wait backoff }` | no | shared default (5 attempts, 1s → 60s exponential) | Per-flush retry budget. Inside one budget the rotation transparently picks the next available peer; the budget caps total attempts across all peers for a single batch. |
 
 ### peers
