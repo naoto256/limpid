@@ -1,12 +1,14 @@
-# Send syslog to Datadog
+# Send syslog to Better Stack
 
-Keep the original syslog line and add searchable context before sending it directly to Datadog. Choose JSON fields and Datadog tags, or an OpenTelemetry log body with resource and log attributes. Neither route needs a Datadog Agent or an intermediate collector.
+Send the original syslog line directly to Better Stack over HTTPS. Use JSON for a message with a few searchable fields, or OTLP for an OpenTelemetry log body, resource, and attributes. Neither route needs an intermediate collector.
 
-## Configure the Datadog destination
+## Configure the Better Stack source
 
-Use an API key from the Datadog organization that should receive the logs. Both examples use **AP1**; choose the endpoint for your organization's Datadog site, not the web application's URL. JSON and OTLP have different intake hosts. See the [Send logs API](https://docs.datadoghq.com/api/latest/logs/#send-logs) and [OTLP logs intake](https://docs.datadoghq.com/opentelemetry/setup/otlp_ingest/logs/) for the corresponding endpoints and payload requirements.
+In Better Stack, open **Sources** and choose **Connect source**. Give the source a name and select the platform matching the data you will send: HTTP for the JSON route, or follow the OpenTelemetry setup for OTLP. Platform selection controls automatic parsing; do not select a device-specific format merely because a syslog line is carried inside the message. See [source setup](https://betterstack.com/docs/logs/logging-start/) and [OpenTelemetry ingestion](https://betterstack.com/docs/logs/open-telemetry/).
 
-Use the static header objects shown below. `DD_API_KEY` is not the same header as `DD-API-KEY`; the lowercase `dd-api-key` spelling in the OTLP example is equivalent because HTTP header names are case-insensitive.
+Copy the source's **Ingesting host** and **Source token** from its configuration. Both examples use `ingesting-host.example` as a placeholder: replace it with that exact host, not the dashboard URL or a host copied from another source. Authenticate with `Authorization: Bearer <SOURCE_TOKEN>`. This is the source's ingestion token, not a management API token; the display name and numeric source ID are not needed in the request.
+
+Replace the token only in a private configuration readable by the service account. Header values are literal strings, not environment-variable templates. Keep the real token out of Git, shell history, and shared diagnostics, and leave TLS certificate verification enabled.
 
 ## Choose raw forwarding or parsed fields
 
@@ -26,44 +28,40 @@ Save it as `event.json`. For the parsed variations, keep the [snippet library](h
 
 ## Option A: choose the JSON fields
 
+The [HTTP ingestion endpoint](https://betterstack.com/docs/logs/ingesting-data/http/logs/) accepts a JSON object at `/`. Put the original line in `message` and add fields you want to search by.
+
 ```limpid
 def input syslog_local {
     type syslog_udp
     bind "127.0.0.1:5514"
 }
 
-def output datadog {
+def output betterstack {
     type http
-    peer { url "https://http-intake.logs.ap1.datadoghq.com/api/v2/logs" }
+    peer { url "https://ingesting-host.example/" }
     content_type "application/json"
     batch_size 1
     headers {
-        "DD-API-KEY": "<DATADOG_API_KEY>"
+        "Authorization": "Bearer <SOURCE_TOKEN>"
     }
 }
 
-def process datadog_document {
+def process betterstack_document {
     egress = to_json({
         message: ingress,
         service: "syslog-forwarder",
-        ddsource: "syslog",
-        hostname: "host01",
-        ddtags: "env:production,route:syslog"
+        route: "json"
     })
 }
 
-def pipeline syslog_to_datadog {
+def pipeline syslog_to_betterstack {
     input syslog_local
-    process datadog_document
-    output datadog
+    process betterstack_document
+    output betterstack
 }
 ```
 
-Replace the API-key placeholder only in a private configuration readable by the service account. Do not commit the real key, paste it into command history, or include it in shared diagnostics. Keep HTTPS certificate verification enabled.
-
-`message: ingress` sends the complete received line, including its syslog header. `to_json` handles quotes, backslashes, and non-ASCII text; do not construct JSON by concatenating unescaped log text. Each event is one JSON object, so keep `batch_size 1` for this configuration rather than joining objects into an invalid JSON document.
-
-`service`, `ddsource`, and `ddtags` provide searchable context. The fixed `hostname` is illustrative: replace it with the appropriate host identity for your logs. A collector receiving multiple devices should derive that value from validated event data rather than assigning every sender the collector's identity.
+`message: ingress` preserves the whole received line, including its syslog header. `to_json` escapes quotes, backslashes, and non-ASCII text. Keep `batch_size 1` here: this process produces one JSON object per event, not a JSON array for a multi-event batch. Without a `dt` field, Better Stack uses reception time for the event timestamp.
 
 ### Parse FortiGate fields before sending JSON
 
@@ -85,15 +83,14 @@ def process fortigate_document {
         severity_number: workspace.lsis.parsed.severity_number,
         source: { ip: workspace.lsis.parsed.src_endpoint.ip, port: workspace.lsis.parsed.src_endpoint.port },
         destination: { ip: workspace.lsis.parsed.dst_endpoint.ip, port: workspace.lsis.parsed.dst_endpoint.port },
-        rule: { name: workspace.lsis.parsed.finding_info.title },
-        ddsource: "fortigate"
+        rule: { name: workspace.lsis.parsed.finding_info.title }
     })
 }
 
-def pipeline syslog_to_datadog {
+def pipeline syslog_to_betterstack {
     input syslog_local
     process parse_syslog | parse_cef | fortigate_timezone | parse_fortigate_cef | fortigate_document
-    output datadog
+    output betterstack
 }
 ```
 
@@ -103,7 +100,7 @@ Expand the received JSON event and inspect its nested `source`, `destination`, a
 
 ## Option B: preserve OTLP structure
 
-Use this configuration instead of Option A. Place the matching [compose_otlp.limpid snippet](https://github.com/naoto256/limpid/blob/v0.8.4/packaging/snippets/composers/compose_otlp.limpid) beside the configuration file. Datadog's direct OTLP logs intake accepts HTTP Protobuf at `/v1/logs`.
+Use this configuration instead of the JSON configuration. Place the matching [compose_otlp.limpid snippet](https://github.com/naoto256/limpid/blob/v0.8.4/packaging/snippets/composers/compose_otlp.limpid) beside your configuration file. The endpoint is `/v1/logs` on the source's ingesting host, with the same Bearer authentication.
 
 ```limpid
 include "compose_otlp.limpid"
@@ -113,17 +110,17 @@ def input syslog_local {
     bind "127.0.0.1:5514"
 }
 
-def output datadog {
+def output betterstack {
     type otlp_http
     protocol http_protobuf
-    peer { endpoint "https://otlp.ap1.datadoghq.com/v1/logs" }
+    peer { endpoint "https://ingesting-host.example/v1/logs" }
     batch_size 1
     headers {
-        "dd-api-key": "<DATADOG_API_KEY>"
+        "Authorization": "Bearer <SOURCE_TOKEN>"
     }
 }
 
-def process datadog_log {
+def process betterstack_log {
     workspace.lsis.shed.otlp.resource.attributes = [
         { key: "service.name", value: { string_value: "syslog-forwarder" } }
     ]
@@ -134,14 +131,14 @@ def process datadog_log {
     ]
 }
 
-def pipeline syslog_to_datadog {
+def pipeline syslog_to_betterstack {
     input syslog_local
-    process datadog_log | compose_otlp | otlp_to_egress
-    output datadog
+    process betterstack_log | compose_otlp | otlp_to_egress
+    output betterstack
 }
 ```
 
-The original line goes into the OTLP body. `service.name` identifies the service on the resource, while `route` is a log attribute. `compose_otlp` builds the protobuf payload and `otlp_to_egress` passes it to the output. The timestamp is limpid's receive time; this example does not parse the timestamp inside the syslog text. Header values are static strings, so replace the API-key placeholder in the private configuration rather than using an environment-variable template.
+The adapter supplies the original line as the log body, identifies the service on the resource, and adds `route` as a log attribute. `compose_otlp` builds the protobuf payload; `otlp_to_egress` passes it to the output. This example uses limpid's receive time rather than parsing a timestamp from the syslog text. See the [OTLP/HTTP output reference](../outputs/otlp_http.md) for transport and partial-rejection handling.
 
 ### Parse FortiGate fields before composing OTLP
 
@@ -156,11 +153,11 @@ def process fortigate_timezone {
     workspace.fortigate_cef.timezone = "UTC"
 }
 
-def pipeline syslog_to_datadog {
+def pipeline syslog_to_betterstack {
     input syslog_local
     process parse_syslog | parse_cef | fortigate_timezone | parse_fortigate_cef
           | fortigate_cef_to_otlp | compose_otlp | otlp_to_egress
-    output datadog
+    output betterstack
 }
 ```
 
@@ -176,7 +173,7 @@ The parser extracts device facts; its bundled `fortigate_cef_to_otlp` adapter ch
 
 This adapter does not invent `service.name` or an instrumentation scope. Here, `source.ip` means the endpoint inside the firewall event, not the sender of the UDP packet. If you also need the full wire line in the OTLP body, set `workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }` in a separate process **after** the adapter and before the composer.
 
-In Log Explorer, locate `Example.Signature` in the body, then expand resource and log attributes. Do not reuse the raw example's service/route filters: the FortiGate adapter does not set them. Receiver pipelines may normalize field names or remap severity and timestamps; inspect the stored event before making saved searches.
+In Live Tail, locate `Example.Signature` in the body, then expand resource and log attributes. Do not reuse the raw example's service/route filters: the FortiGate adapter does not set them. Receiver pipelines may normalize field names or remap severity and timestamps; inspect the stored event before making saved searches.
 
 ### Inspect the parsed variation locally
 
@@ -184,13 +181,13 @@ Save one assembled variation as `fortigate.conf` and use the sample `event.json`
 
 ```sh
 limpid --check --config fortigate.conf
-limpid --test-pipeline syslog_to_datadog --config fortigate.conf --input "$(cat event.json)"
+limpid --test-pipeline syslog_to_betterstack --config fortigate.conf --input "$(cat event.json)"
 ```
 
 Test mode processes the event without starting the listener or sending to the destination. JSON egress can be read directly; OTLP egress is protobuf bytes, not a readable JSON trace. To inspect it locally, temporarily append a process with `egress = to_json(otlp.decode_resourcelog_protobuf(egress))` after `otlp_to_egress`, run test mode, then remove that inspection process before sending to an OTLP output. Confirm the destination's stored fields separately when you enable delivery. A different FortiGate category can populate different fields or be rejected by the parser.
 
-## Find the logs in Datadog
+## Inspect the received logs
 
-Open **Log Explorer** in the same Datadog site and organization, select a recent time range, and filter by `service:syslog-forwarder`. For Option A, you can also use `source:syslog`; Option B does not set that Datadog source tag. Find a distinctive string from your input and expand the event to inspect the original line and context. Intake acceptance and a searchable log are separate observations; an onboarding screen still waiting for logs does not by itself establish that delivery failed.
+Open the source's Live Tail, select a recent time range, and find a distinctive string from your log. Expand the event to inspect the full JSON `message` or OTLP body, service context, and `route`. Check quotes, backslashes, and non-ASCII text in the event itself, not just the abbreviated list display or an AI explanation.
 
-Check the organization's ingestion pipelines, exclusion filters, and index routing if accepted logs do not appear in the expected search. Request retries are not an exactly-once guarantee. This example does not establish outage recovery, throughput, or retention guarantees.
+If the displayed fields differ from your payload, check the source platform's parser and any configured transformations. An accepted request and the final stored event are different checkpoints. For missing JSON events, check the host/token pair, ingestion pause state, and quota; HTTP `403` indicates an invalid source token and `402` indicates a quota or spending limit. For OTLP, also check partial rejection rather than treating every HTTP success as acceptance of every record. Retries can create duplicates after an ambiguous response.

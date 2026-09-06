@@ -53,12 +53,12 @@ function content(page) {
       .join("")}</div></main>`;
   if (page.kind === "recipes")
     return `<main id="main" class="landing"><div class="eyebrow">RECIPES / STABLE ${release}</div><h1>Start with<br>a concrete problem.</h1><p class="lede">Configuration recipes for concrete logging problems. Read the assumptions, then adapt the inputs and destinations to your environment.</p><div class="recipe-list"><a href="${url("recipes/fortigate-cef-to-ocsf/")}"><span class="number">00</span><div><span class="eyebrow">DOCUMENTED CONFIGURATION</span><h2>Run the homepage example: FortiGate CEF to OCSF</h2><p>Parse a FortiGate CEF event, compose an OCSF record, and inspect the result locally.</p></div><span>→</span></a></div>${[
-      ["Processing", page.recipes.slice(0, 2)],
-      ["Destinations", page.recipes.slice(2)],
+      ["Processing", page.recipes.slice(0, 3)],
+      ["Destinations", page.recipes.slice(3)],
     ]
       .map(
         ([title, recipes]) =>
-          `<section><h2>${title}</h2><div class="recipe-list">${recipes.map((r) => `<a href="${url(r.route)}"><span class="number">0${r.number}</span><div><span class="eyebrow">DOCUMENTED CONFIGURATION</span><h2>${escape(r.title)}</h2><p>${escape(r.description)}</p></div><span>→</span></a>`).join("")}</div></section>`,
+          `<section><h2>${title}</h2><div class="recipe-list">${recipes.map((r) => `<a href="${url(r.route)}"><span class="number">${String(r.number).padStart(2, "0")}</span><div><span class="eyebrow">DOCUMENTED CONFIGURATION</span><h2>${escape(r.title)}</h2><p>${escape(r.description)}</p></div><span>→</span></a>`).join("")}</div></section>`,
       )
       .join(
         "",
@@ -76,6 +76,6 @@ export default class {
     };
   }
   render({ entry }) {
-    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="google-site-verification" content="S-EqEKp48UJAW41lZX5p1lCX1WOcv23Zq_XZxVzEsNk" /><title>${escape(entry.title)} — limpid</title><link rel="canonical" href="${escape(canonical(entry.route))}"><meta name="description" content="Readable log pipelines. Documentation and practical configurations for limpid ${release}."><link rel="stylesheet" href="${url("style.css")}"><link rel="icon" type="image/svg+xml" href="${url("mark.svg")}"><script type="module" src="${url("copy-code.js")}"></script></head><body><a class="skip" href="#main">Skip to content</a><header><a class="brand" href="${url()}"><img class="brand-mark" src="${url("mark.svg")}" width="42.5" height="37" alt="">limpid<span class="version">v${release}</span></a><nav aria-label="Main"><a href="${url("docs/")}">Docs</a><a href="${url("recipes/")}">Recipes</a><a class="github" href="${repository}">GitHub ↗</a></nav></header>${content(entry)}<footer><a class="brand" href="${url()}">limpid</a><p>Log pipelines, limpid as intent.</p><a href="${repository}/releases/tag/v${release}">Stable ${release} ↗</a><span>MIT / Apache-2.0</span></footer></body></html>`;
+    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="google-site-verification" content="S-EqEKp48UJAW41lZX5p1lCX1WOcv23Zq_XZxVzEsNk" /><title>${escape(entry.title)} — limpid</title><link rel="canonical" href="${escape(canonical(entry.route))}"><meta name="description" content="Readable log pipelines. Documentation and practical configurations for limpid ${release}."><link rel="stylesheet" href="${url("style.css")}"><link rel="icon" type="image/svg+xml" href="${url("mark.svg")}"><script type="module" src="${url("copy-code.js")}"></script></head><body><a class="skip" href="#main">Skip to content</a><header><a class="brand" href="${url()}"><img class="brand-mark" src="${url("mark.svg")}" width="42.5" height="37" alt="">limpid<span class="version">v${release}</span></a><nav aria-label="Main"><a href="${url("docs/")}">Docs</a><a href="${url("recipes/")}">Recipes</a><a class="github" href="${repository}">GitHub ↗</a></nav></header><div class="page-scroll" tabindex="0" role="region" aria-label="Page content">${content(entry)}<footer><a class="brand" href="${url()}">limpid</a><p>Log pipelines, limpid as intent.</p><a href="${repository}/releases/tag/v${release}">Stable ${release} ↗</a><span>MIT / Apache-2.0</span></footer></div></body></html>`;
   }
 }

@@ -145,7 +145,7 @@ export function pages() {
   });
   recipes.push({
     kind: "recipe",
-    title: "Map CEF fields to Log Analytics columns via AMP",
+    title: "Send CEF to Log Analytics via AMP",
     number: 7,
     description:
       "Put CEF fields into OTLP attributes that AMP can map to CommonSecurityLog columns—not just a message body.",
@@ -158,7 +158,7 @@ export function pages() {
   });
   recipes.splice(1, 0, {
     kind: "recipe",
-    title: "Send syslog to Loki with JSON or OTLP",
+    title: "Send syslog to Loki",
     description:
       "Choose native JSON or OTLP, control label placement, and preserve the original log line.",
     route: "recipes/loki-http-json/index.html",
@@ -173,7 +173,7 @@ export function pages() {
   });
   recipes.splice(2, 0, {
     kind: "recipe",
-    title: "Send syslog to Elasticsearch with Bulk or OTLP",
+    title: "Send syslog to Elasticsearch",
     description:
       "Build searchable JSON documents, or let Elasticsearch ingest OTLP logs directly.",
     route: "recipes/elasticsearch/index.html",
@@ -185,9 +185,9 @@ export function pages() {
   });
   recipes.splice(3, 0, {
     kind: "recipe",
-    title: "Send syslog directly to Datadog",
+    title: "Send syslog to Datadog",
     description:
-      "Preserve the original line, add searchable context, and send JSON to Datadog's HTTPS intake.",
+      "Preserve the original line and send searchable context to Datadog with JSON or OTLP.",
     route: "recipes/datadog/index.html",
     content: markdown(
       readFileSync(new URL("../src/datadog.md", import.meta.url), "utf8"),
@@ -198,7 +198,7 @@ export function pages() {
   recipes.splice(4, 0, {
     kind: "recipe",
     number: 5,
-    title: "Send syslog to Amazon CloudWatch Logs with JSON or OTLP",
+    title: "Send syslog to Amazon CloudWatch Logs",
     description:
       "Choose JSON fields or OTLP attributes, with direct HTTPS ingestion into an AWS log group.",
     route: "recipes/cloudwatch/index.html",
@@ -217,6 +217,33 @@ export function pages() {
     content: markdown(
       readFileSync(
         new URL("../src/filter-and-thin.md", import.meta.url),
+        "utf8",
+      ),
+      "pipelines/examples.md",
+    ),
+    siteRecipe: true,
+  });
+  recipes.splice(5, 0, {
+    kind: "recipe",
+    title: "Send syslog to Better Stack",
+    description:
+      "Keep the original log line and add searchable fields with JSON or OpenTelemetry over HTTPS.",
+    route: "recipes/better-stack/index.html",
+    content: markdown(
+      readFileSync(new URL("../src/better-stack.md", import.meta.url), "utf8"),
+      "pipelines/examples.md",
+    ),
+    siteRecipe: true,
+  });
+  recipes.splice(2, 0, {
+    kind: "recipe",
+    title: "Archive every log and forward selected events",
+    description:
+      "Archive every line, forward selected severities, and create a separate structured copy for urgent events.",
+    route: "recipes/branch-and-forward/index.html",
+    content: markdown(
+      readFileSync(
+        new URL("../src/branch-and-forward.md", import.meta.url),
         "utf8",
       ),
       "pipelines/examples.md",

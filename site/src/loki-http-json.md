@@ -1,4 +1,4 @@
-# Send syslog to Loki with JSON or OTLP
+# Send syslog to Loki
 
 Send syslog to Loki in either of two ways: build its native JSON push payload, or send an OTLP log record and let Loki map the attributes. Both keep the original log line; the difference is who defines the stream labels and metadata.
 
@@ -11,6 +11,22 @@ Send syslog to Loki in either of two ways: build its native JSON push payload, o
 | Additional fields | In the line, or optional structured metadata | OTLP attributes mapped to structured metadata |
 
 Choose one route for a given event unless duplicate ingestion is intentional. The examples below are alternatives, not two outputs to enable together.
+
+## Choose raw forwarding or parsed fields
+
+Each option starts by forwarding the original line without parsing it. Its FortiGate variation then extracts fields from a CEF-formatted IPS event. Use the same sample for both:
+
+```json
+{
+  "ingress": "<134>Sep  6 10:00:00 fw01 CEF:0|Fortinet|Fortigate|v7.4.11|16384|utm:ips signature|7|deviceExternalId=FG-EXAMPLE cat=utm:ips FTNTFGTsubtype=ips FTNTFGTseverity=high src=192.0.2.10 spt=36208 dst=198.51.100.5 dpt=9100 proto=6 act=detected FTNTFGTattack=Example.Signature FTNTFGTattackid=12345 msg=Example attack detected",
+  "source": {
+    "ip": "192.0.2.1",
+    "port": 514
+  }
+}
+```
+
+Save it as `event.json`. For the parsed variations, keep the [snippet library](https://github.com/naoto256/limpid/tree/v0.8.4/packaging/snippets) from the same release as your binary under `packaging/snippets/` beside the configuration. Keep its directory structure for helper includes. The example declares the device timezone as `UTC`; replace that with the device's actual IANA timezone or fixed offset. RFC 3164 has no year, so the parser supplies the runtime year. This sample is FortiGate **CEF**, not FortiGate's other syslog formats.
 
 ## Option A: build Loki's JSON payload
 
@@ -78,6 +94,47 @@ Send a valid syslog message carrying a distinct test marker, then query only tha
 
 Compare the complete stored line, including punctuation and non-ASCII characters. A successful HTTP request is useful evidence, but querying the record confirms that it is available to readers. Also inspect output failures and the error log; delivery retries are not an exactly-once guarantee.
 
+### Parse FortiGate fields before sending JSON
+
+Keep Option A's input and output definitions. Replace its pipeline with the following includes, processes, and pipeline; do not run both pipelines on the same input. The original forwarding process may remain unused.
+
+```limpid
+include "packaging/snippets/parsers/parse_syslog.limpid"
+include "packaging/snippets/parsers/parse_cef.limpid"
+include "packaging/snippets/parsers/parse_fortigate_cef.limpid"
+
+def process fortigate_timezone {
+    workspace.fortigate_cef.timezone = "UTC"
+}
+
+def process fortigate_document {
+    let document = {
+        message: ingress,
+        event_time_unix_nano: workspace.lsis.parsed.time,
+        severity_number: workspace.lsis.parsed.severity_number,
+        source: { ip: workspace.lsis.parsed.src_endpoint.ip, port: workspace.lsis.parsed.src_endpoint.port },
+        destination: { ip: workspace.lsis.parsed.dst_endpoint.ip, port: workspace.lsis.parsed.dst_endpoint.port },
+        rule: { name: workspace.lsis.parsed.finding_info.title }
+    }
+    egress = to_json({
+        streams: [{
+            stream: { job: "fortigate" },
+            values: [["${workspace.lsis.parsed.time}", to_json(document)]]
+        }]
+    })
+}
+
+def pipeline syslog_to_loki {
+    input syslog_local
+    process parse_syslog | parse_cef | fortigate_timezone | parse_fortigate_cef | fortigate_document
+    output loki
+}
+```
+
+The sample produces `source.ip = 192.0.2.10`, `destination.port = 9100`, `rule.name = Example.Signature`, and `severity_number = 19`. This severity comes from the FortiGate CEF priority, not the outer syslog PRI. `message` still contains the complete original line. `event_time_unix_nano` is a numeric field containing the parsed device time, also used as Loki's string nanosecond timestamp.
+
+The log line is now a JSON document. Query `{job="fortigate"} | json | source_ip="192.0.2.10"`. These fields are parsed from the line at query time, not stored as stream labels. This JSON variation adds no high-cardinality address labels and does not use structured metadata.
+
 ## Option B: send OTLP and map attributes in Loki
 
 Use Loki's native OTLP/HTTP endpoint, with the full `/otlp/v1/logs` path: limpid does not append `/v1/logs`. This is not Loki's JSON push API, even though both use HTTP. The example selects protobuf transport explicitly.
@@ -97,7 +154,7 @@ def input syslog_local {
 def output loki_otlp {
     type otlp_http
     peer { endpoint "http://127.0.0.1:3100/otlp/v1/logs" }
-    protocol "http_protobuf"
+    protocol http_protobuf
     batch_size 1
 }
 
@@ -159,3 +216,49 @@ Loki normalizes dots in attribute names to underscores. Select the stream with t
 The address above is a documentation placeholder. Keeping sender addresses out of index labels avoids creating a new stream for every address. Resource attributes and log attributes are different locations: putting `service.name` in log attributes will not satisfy the resource-attribute indexing rule above.
 
 See Grafana's [native OTLP ingestion and mapping guide](https://grafana.com/docs/loki/latest/send-data/otel/) and [structured metadata requirements](https://grafana.com/docs/loki/latest/get-started/labels/structured-metadata/). The same HTTPS, gateway authentication, and tenant-selection considerations described for Option A apply here. Do not disable verification or authentication to make this example work remotely.
+
+### Parse FortiGate fields before composing OTLP
+
+Keep Option B's input, output, and composer include. Replace its pipeline with this fragment. Do not call the original body-only process: it would overwrite the parsed event time or adapter fields.
+
+```limpid
+include "packaging/snippets/parsers/parse_syslog.limpid"
+include "packaging/snippets/parsers/parse_cef.limpid"
+include "packaging/snippets/parsers/parse_fortigate_cef.limpid"
+
+def process fortigate_timezone {
+    workspace.fortigate_cef.timezone = "UTC"
+}
+
+def pipeline syslog_to_loki {
+    input syslog_local
+    process parse_syslog | parse_cef | fortigate_timezone | parse_fortigate_cef
+          | fortigate_cef_to_otlp | compose_otlp | otlp_to_egress
+    output loki_otlp
+}
+```
+
+The parser extracts device facts; its bundled `fortigate_cef_to_otlp` adapter chooses their OTLP locations. The shared composer supplies the wire format. For this sample:
+
+| Location                   | Result                                                                                                                                                      |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Resource attributes        | `observer.vendor=Fortinet`, `observer.product=Fortigate`, `observer.type=firewall`                                                                          |
+| Log attributes             | `source.ip=192.0.2.10`, `source.port=36208`, `destination.ip=198.51.100.5`, `destination.port=9100`, `rule.name=Example.Signature`, `event.action=detected` |
+| Body                       | CEF message beginning `CEF:0\|Fortinet\|Fortigate\|`, without the syslog wrapper                                                                            |
+| Event time / observed time | Parsed device time / limpid receipt time                                                                                                                    |
+| SeverityNumber             | `19`, from CEF priority `7`                                                                                                                                 |
+
+This adapter does not invent `service.name` or an instrumentation scope. Here, `source.ip` means the endpoint inside the firewall event, not the sender of the UDP packet. If you also need the full wire line in the OTLP body, set `workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }` in a separate process **after** the adapter and before the composer.
+
+For this variation, add `observer.type` beside `service.name` in the receiver fragment above, under the `index_label` attributes list. Otherwise the raw example's service-only policy selects no label from this resource. Query `{observer_type="firewall"} | source_ip="192.0.2.10"`; event attributes become structured metadata, including `rule_name` and `destination_port`, not index labels. Keep the same schema and structured-metadata prerequisites.
+
+### Inspect the parsed variation locally
+
+Save one assembled variation as `fortigate.conf` and use the sample `event.json` above:
+
+```sh
+limpid --check --config fortigate.conf
+limpid --test-pipeline syslog_to_loki --config fortigate.conf --input "$(cat event.json)"
+```
+
+Test mode processes the event without starting the listener or sending to the destination. JSON egress can be read directly; OTLP egress is protobuf bytes, not a readable JSON trace. To inspect it locally, temporarily append a process with `egress = to_json(otlp.decode_resourcelog_protobuf(egress))` after `otlp_to_egress`, run test mode, then remove that inspection process before sending to an OTLP output. Confirm the destination's stored fields separately when you enable delivery. A different FortiGate category can populate different fields or be rejected by the parser.

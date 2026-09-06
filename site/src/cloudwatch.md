@@ -1,4 +1,4 @@
-# Send syslog to Amazon CloudWatch Logs with JSON or OTLP
+# Send syslog to Amazon CloudWatch Logs
 
 Send logs directly to CloudWatch Logs over HTTPS. Choose a JSON document when you want to define the stored fields, or OTLP when you want to preserve resource and log-record attributes.
 
@@ -19,7 +19,7 @@ This route uses a bearer token, not an AWS access-key ID and secret. AWS recomme
 
 Both examples use Tokyo (`ap-northeast-1`). Change the endpoint region, log group, and log stream together to match your destination. Replace `<CLOUDWATCH_LOGS_TOKEN>` only in a private configuration readable by the service account. Never commit the token or place it in a shared URL or diagnostic output. Keep TLS certificate verification enabled.
 
-Use **limpid 0.8.4 or later** and the static header objects shown below.
+Use the static header objects shown below.
 
 ## Option A: choose the JSON fields
 
