@@ -1,6 +1,6 @@
 [package]
 name = "limpid-prometheus"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 description = "Prometheus exporter for limpid — converts control socket JSON to Prometheus text format"
 license.workspace = true
