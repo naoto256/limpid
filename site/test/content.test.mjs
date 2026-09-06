@@ -6,6 +6,21 @@ import MarkdownIt from "markdown-it";
 import PageTemplate from "../src/pages.11ty.js";
 import { url, origin } from "../lib/config.js";
 
+test("shared head includes exactly one static Search Console verification tag", () => {
+  const tag =
+    '<meta name="google-site-verification" content="S-EqEKp48UJAW41lZX5p1lCX1WOcv23Zq_XZxVzEsNk" />';
+  const renderer = new PageTemplate();
+  for (const entry of pages()) {
+    const html = renderer.render({ entry });
+    const head = html.match(/<head>([\s\S]*?)<\/head>/)[1];
+    assert.equal(
+      (html.match(/name="google-site-verification"/g) || []).length,
+      1,
+    );
+    assert.ok(head.includes(tag), entry.route);
+  }
+});
+
 test("Recipes navigation and routes stay separate from the Pipeline reference", () => {
   const entries = pages();
   const renderer = new PageTemplate();
