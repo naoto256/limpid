@@ -127,8 +127,15 @@ invalid_hyphenated_property_key = @{ ident ~ ("-" ~ (ASCII_ALPHANUMERIC | "_")+)
 
 property = {
     property_key ~ "{" ~ property* ~ "}" // nested block: `tls { ... }`
+  | property_key ~ configuration_object
   | property_key ~ expr                   // key-value: `type syslog_udp`, `bind "0.0.0.0:514"`
 }
+
+// Configuration string maps reuse HashLit without broadening expression keys.
+configuration_object = {
+    "{" ~ (configuration_entry ~ ("," ~ configuration_entry)* ~ ","?)? ~ "}"
+}
+configuration_entry = { quoted_property_key ~ ":" ~ expr }
 
 // -- Process definition ------------------------------------------------------
 
