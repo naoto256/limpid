@@ -728,6 +728,7 @@ mod tests {
     fn string_property(key: &str, value: &str) -> Property {
         Property::KeyValue {
             key: key.to_owned(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::StringLit(value.to_owned())),
             value_span: None,
@@ -737,6 +738,7 @@ mod tests {
     fn peer_property(node_id: &str, pubkey: &str, endpoint: &str) -> Property {
         Property::Block {
             key: "peer".to_owned(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 string_property("node_id", node_id),
@@ -749,9 +751,11 @@ mod tests {
     fn retry_once_property() -> Property {
         Property::Block {
             key: "retry".to_owned(),
+            key_quoted: false,
             key_span: None,
             properties: vec![Property::KeyValue {
                 key: "max_attempts".to_owned(),
+                key_quoted: false,
                 key_span: None,
                 value: Expr::spanless(ExprKind::IntLit(1)),
                 value_span: None,
@@ -1051,6 +1055,7 @@ mod tests {
         ] {
             let properties = vec![Property::Block {
                 key: "peer".to_owned(),
+                key_quoted: false,
                 key_span: None,
                 properties: vec![
                     (key != "node_id").then(|| string_property("node_id", "peer-a")),

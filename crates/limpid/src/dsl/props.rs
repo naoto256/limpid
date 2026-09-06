@@ -305,6 +305,7 @@ mod tests {
     fn kv(key: &str, kind: ExprKind) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(kind),
             value_span: None,

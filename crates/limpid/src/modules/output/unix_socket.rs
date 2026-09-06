@@ -752,6 +752,7 @@ mod tests {
             vec![
                 Property::KeyValue {
                     key: "path".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::StringLit(
                         socket_path.to_str().unwrap().to_string(),
@@ -760,9 +761,11 @@ mod tests {
                 },
                 Property::Block {
                     key: "retry".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![Property::KeyValue {
                         key: "max_attempts".into(),
+                        key_quoted: false,
                         key_span: None,
                         value: Expr::spanless(ExprKind::IntLit(1)),
                         value_span: None,
@@ -842,6 +845,7 @@ mod tests {
             "unix_socket",
             vec![Property::KeyValue {
                 key: "path".into(),
+                key_quoted: false,
                 key_span: None,
                 value: Expr::spanless(ExprKind::StringLit("/tmp/never.sock".into())),
                 value_span: None,
@@ -905,12 +909,14 @@ mod tests {
             vec![
                 Property::KeyValue {
                     key: "path".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::StringLit("/tmp/never.sock".into())),
                     value_span: None,
                 },
                 Property::KeyValue {
                     key: "expected_peer_uid".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::StringLit(user_name.clone())),
                     value_span: None,
@@ -942,12 +948,14 @@ mod tests {
             vec![
                 Property::KeyValue {
                     key: "path".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::StringLit("/tmp/never.sock".into())),
                     value_span: None,
                 },
                 Property::KeyValue {
                     key: "expected_peer_uid".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::StringLit(
                         "definitely_not_a_real_user_xyzzy".into(),
@@ -1013,6 +1021,7 @@ mod tests {
             "unix_socket",
             vec![Property::KeyValue {
                 key: "path".into(),
+                key_quoted: false,
                 key_span: None,
                 value: Expr::spanless(ExprKind::StringLit(
                     socket_path.to_str().unwrap().to_string(),
@@ -1032,6 +1041,7 @@ mod tests {
             vec![
                 Property::KeyValue {
                     key: "path".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::StringLit(
                         socket_path.to_str().unwrap().to_string(),
@@ -1040,22 +1050,26 @@ mod tests {
                 },
                 Property::Block {
                     key: "retry".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![
                         Property::KeyValue {
                             key: "max_attempts".into(),
+                            key_quoted: false,
                             key_span: None,
                             value: Expr::spanless(ExprKind::IntLit(3)),
                             value_span: None,
                         },
                         Property::KeyValue {
                             key: "initial_wait".into(),
+                            key_quoted: false,
                             key_span: None,
                             value: Expr::spanless(ExprKind::StringLit("20ms".into())),
                             value_span: None,
                         },
                         Property::KeyValue {
                             key: "max_wait".into(),
+                            key_quoted: false,
                             key_span: None,
                             value: Expr::spanless(ExprKind::StringLit("20ms".into())),
                             value_span: None,

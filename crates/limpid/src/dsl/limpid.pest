@@ -120,7 +120,10 @@ def_output = {
 
 // Header maps use names such as `DD-API-KEY`. Keep this separate from
 // expression identifiers so `left-right` remains subtraction.
-property_key = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+property_key = { quoted_property_key | invalid_hyphenated_property_key | ident }
+quoted_property_key = @{ "\"" ~ (escape_seq | string_plain_char)* ~ "\"" }
+// Retain a diagnostic-only token so the parser can explain the migration.
+invalid_hyphenated_property_key = @{ ident ~ ("-" ~ (ASCII_ALPHANUMERIC | "_")+)+ }
 
 property = {
     property_key ~ "{" ~ property* ~ "}" // nested block: `tls { ... }`

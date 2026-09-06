@@ -616,6 +616,7 @@ mod tests {
     fn prop_str(key: &str, val: &str) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::StringLit(val.to_string())),
             value_span: None,
@@ -625,6 +626,7 @@ mod tests {
     fn prop_int(key: &str, val: i64) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::IntLit(val)),
             value_span: None,
@@ -634,6 +636,7 @@ mod tests {
     fn prop_bool(key: &str, val: bool) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::BoolLit(val)),
             value_span: None,
@@ -643,6 +646,7 @@ mod tests {
     fn peer_block(url: &str) -> Property {
         Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![prop_str("url", url)],
         }
@@ -651,6 +655,7 @@ mod tests {
     fn ident_prop(key: &str, val: &str) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::Ident(vec![val.to_string()])),
             value_span: None,
@@ -660,6 +665,7 @@ mod tests {
     fn peers_block_with(peers: Vec<Property>) -> Property {
         Property::Block {
             key: "peers".into(),
+            key_quoted: false,
             key_span: None,
             properties: peers,
         }
@@ -674,6 +680,7 @@ mod tests {
     fn fast_retry_block() -> Property {
         Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 1),
@@ -681,6 +688,7 @@ mod tests {
                 prop_str("max_wait", "1ms"),
                 Property::KeyValue {
                     key: "backoff".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
                     value_span: None,
@@ -708,6 +716,7 @@ mod tests {
     fn peer_requires_url() {
         let props = vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![],
         }];
@@ -762,11 +771,13 @@ mod tests {
         // and `output otlp_grpc`.
         let props = vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_str("url", "http://x:8080/"),
                 Property::Block {
                     key: "tls".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![prop_str("ca", "/etc/ca.pem")],
                 },
@@ -793,11 +804,13 @@ mod tests {
         // so no on-disk file is required for the round-trip.
         let props = vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_str("url", "https://x:8443/"),
                 Property::Block {
                     key: "tls".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![],
                 },
@@ -816,11 +829,13 @@ mod tests {
     fn rejects_tls_with_cert_but_no_key() {
         let props = vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_str("url", "https://x:8443/"),
                 Property::Block {
                     key: "tls".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![prop_str("cert", "/c.pem")],
                 },
@@ -1147,6 +1162,7 @@ mod tests {
         let (healthy_addr, received, server) = run_echo_collector().await;
         let retry = Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 2),
@@ -1154,6 +1170,7 @@ mod tests {
                 prop_str("max_wait", "1ms"),
                 Property::KeyValue {
                     key: "backoff".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
                     value_span: None,
@@ -1266,7 +1283,7 @@ def output test {{
     type http
     peer {{ url "http://{addr}/" }}
     batch_size 1
-    headers {{ DD-API-KEY "test-only-key" X-Custom-Header "exact-value" }}
+    headers {{ "DD-API-KEY" "test-only-key" "X-Custom-Header" "exact-value" }}
 }}
 "#
             ),
@@ -2150,6 +2167,7 @@ def output o {{
         let url = format!("http://{}/", addr);
         let retry = Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 3),
@@ -2157,6 +2175,7 @@ def output o {{
                 prop_str("max_wait", "1ms"),
                 Property::KeyValue {
                     key: "backoff".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
                     value_span: None,
@@ -2223,6 +2242,7 @@ def output o {{
         // in about a second even without the wake bug.
         let slow_retry = Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 2),
@@ -2230,6 +2250,7 @@ def output o {{
                 prop_str("max_wait", "400ms"),
                 Property::KeyValue {
                     key: "backoff".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
                     value_span: None,
@@ -2330,6 +2351,7 @@ def output o {{
         // elapsing on its own.
         let slow_retry = Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 5),
@@ -2337,6 +2359,7 @@ def output o {{
                 prop_str("max_wait", "5s"),
                 Property::KeyValue {
                     key: "backoff".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
                     value_span: None,
@@ -2405,6 +2428,7 @@ def output o {{
         };
         let retry = Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 5),
@@ -2412,6 +2436,7 @@ def output o {{
                 prop_str("max_wait", "200ms"),
                 Property::KeyValue {
                     key: "backoff".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
                     value_span: None,
@@ -2673,6 +2698,7 @@ def output o {{
         // exceed SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT (3s).
         let retry = Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 5),
@@ -2680,6 +2706,7 @@ def output o {{
                 prop_str("max_wait", "5s"),
                 Property::KeyValue {
                     key: "backoff".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
                     value_span: None,
@@ -3061,6 +3088,7 @@ def output o {{
         // churning through the retry budget and freeing the permit.
         let long_retry = Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 100),
@@ -3068,6 +3096,7 @@ def output o {{
                 prop_str("max_wait", "5s"),
                 Property::KeyValue {
                     key: "backoff".into(),
+                    key_quoted: false,
                     key_span: None,
                     value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
                     value_span: None,

@@ -505,6 +505,7 @@ mod tests {
     fn prop_str(key: &str, val: &str) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::StringLit(val.to_string())),
             value_span: None,
@@ -514,6 +515,7 @@ mod tests {
     fn prop_int(key: &str, val: i64) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::IntLit(val)),
             value_span: None,
@@ -523,6 +525,7 @@ mod tests {
     fn peer_block(endpoint: &str) -> Property {
         Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![prop_str("endpoint", endpoint)],
         }
@@ -531,6 +534,7 @@ mod tests {
     fn peers_block_with(peers: Vec<Property>) -> Property {
         Property::Block {
             key: "peers".into(),
+            key_quoted: false,
             key_span: None,
             properties: peers,
         }
@@ -559,6 +563,7 @@ mod tests {
     async fn accepts_single_peer_shorthand() {
         let props = vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![prop_str("endpoint", "http://x:4317")],
         }];
@@ -606,11 +611,13 @@ mod tests {
         // in `output otlp_http`.
         let props = vec![peers_block_with(vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_str("endpoint", "http://collector.example.com:4317"),
                 Property::Block {
                     key: "tls".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![prop_str("ca", "/etc/ca.pem")],
                 },
@@ -637,11 +644,13 @@ mod tests {
         // block keeps the test off-disk; the scheme check runs first.
         let props = vec![peers_block_with(vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_str("endpoint", "https://collector.example.com:4317"),
                 Property::Block {
                     key: "tls".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![],
                 },
@@ -687,11 +696,13 @@ mod tests {
     fn rejects_tls_with_key_but_no_cert() {
         let props = vec![peers_block_with(vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_str("endpoint", "https://x:4317"),
                 Property::Block {
                     key: "tls".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![prop_str("key", "/k.pem")],
                 },
@@ -737,6 +748,7 @@ mod tests {
         let mut props = one_peer_props("http://x");
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 2),
@@ -868,6 +880,72 @@ mod tests {
                 partial_success: None,
             }))
         }
+    }
+
+    #[tokio::test]
+    async fn quoted_headers_reach_otlp_grpc_receiver() {
+        struct HeaderReceiver(tokio::sync::mpsc::Sender<tonic::metadata::MetadataMap>);
+        #[tonic::async_trait]
+        impl LogsService for HeaderReceiver {
+            async fn export(
+                &self,
+                request: tonic::Request<ExportLogsServiceRequest>,
+            ) -> std::result::Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status>
+            {
+                self.0.send(request.metadata().clone()).await.unwrap();
+                Ok(tonic::Response::new(ExportLogsServiceResponse {
+                    partial_success: None,
+                }))
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(LogsServiceServer::new(HeaderReceiver(tx)))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let cfg = crate::dsl::parser::parse_config(&format!(
+            r#"
+def output test {{
+    type otlp_grpc
+    peer {{ endpoint "http://{addr}" }}
+    batch_size 1
+    headers {{ "X-Custom-Header" "exact-value" Authorization "placeholder" }}
+}}
+"#
+        ))
+        .unwrap();
+        let compiled = crate::pipeline::CompiledConfig::from_config(cfg).unwrap();
+        let output = OtlpGrpcOutput::from_properties(
+            "test",
+            &compiled.outputs["test"].properties,
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        let (ack, mut acknowledgements) = QueueAckHandle::for_test();
+        output
+            .consume(
+                &event_with_egress(singleton_bytes(1_700_000_000_000_000_000)),
+                ack,
+            )
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(5), acknowledgements.recv()).await;
+        output.shutdown(None).await.unwrap();
+        server.abort();
+        let _ = server.await;
+        let headers = received.unwrap().unwrap();
+        assert_eq!(headers.get("x-custom-header").unwrap(), "exact-value");
+        assert_eq!(headers.get("authorization").unwrap(), "placeholder");
+        assert!(matches!(
+            delivered.unwrap().unwrap().1,
+            crate::queue::AckDisposition::Delivered
+        ));
     }
 
     #[tokio::test]
@@ -1119,6 +1197,7 @@ mod tests {
         props.push(prop_int("batch_size", 1));
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 1),
@@ -1291,6 +1370,7 @@ mod tests {
         props.push(prop_str("batch_timeout", "30s"));
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 1),
@@ -1339,6 +1419,7 @@ mod tests {
         // an unreachable peer completes quickly.
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 1),

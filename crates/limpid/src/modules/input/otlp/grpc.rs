@@ -352,6 +352,7 @@ mod tests {
     fn rate_limit_property_round_trip() {
         let prop = Property::KeyValue {
             key: "rate_limit".into(),
+            key_quoted: false,
             key_span: None,
             value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::IntLit(2500)),
             value_span: None,
@@ -369,6 +370,7 @@ mod tests {
         let mut props = vec![
             Property::KeyValue {
                 key: "cert".into(),
+                key_quoted: false,
                 key_span: None,
                 value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::StringLit(
                     cert.into(),
@@ -377,6 +379,7 @@ mod tests {
             },
             Property::KeyValue {
                 key: "key".into(),
+                key_quoted: false,
                 key_span: None,
                 value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::StringLit(
                     key.into(),
@@ -387,6 +390,7 @@ mod tests {
         if let Some(c) = ca {
             props.push(Property::KeyValue {
                 key: "ca".into(),
+                key_quoted: false,
                 key_span: None,
                 value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::StringLit(
                     c.into(),
@@ -396,6 +400,7 @@ mod tests {
         }
         Property::Block {
             key: "tls".into(),
+            key_quoted: false,
             key_span: None,
             properties: props,
         }
@@ -433,9 +438,11 @@ mod tests {
     fn tls_block_without_cert_is_rejected() {
         let props = vec![Property::Block {
             key: "tls".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![Property::KeyValue {
                 key: "key".into(),
+                key_quoted: false,
                 key_span: None,
                 value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::StringLit(
                     "/k.pem".into(),

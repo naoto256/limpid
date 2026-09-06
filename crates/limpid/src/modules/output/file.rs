@@ -2118,6 +2118,7 @@ mod tests {
     fn prop_str(key: &str, val: &str) -> crate::dsl::ast::Property {
         crate::dsl::ast::Property::KeyValue {
             key: key.to_string(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::StringLit(val.to_string())),
             value_span: None,

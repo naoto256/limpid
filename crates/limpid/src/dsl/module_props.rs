@@ -55,6 +55,7 @@ pub struct ModuleProperties {
 /// same sense as an unclosed brace.
 #[derive(Debug, Clone)]
 pub enum ModulePropertyError {
+    QuotedType,
     /// No `type` key was present in the property list.
     Missing,
     /// The `type` key exists but its value is not a bare identifier (e.g.
@@ -80,6 +81,10 @@ pub enum ModulePropertyError {
 impl std::fmt::Display for ModulePropertyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::QuotedType => write!(
+                f,
+                "quoted property keys are only allowed inside a StringMap; use bare type"
+            ),
             Self::Missing => write!(f, "missing required property 'type'"),
             Self::NonIdent { .. } => {
                 write!(
@@ -109,6 +114,18 @@ impl ModuleProperties {
             if key != "type" {
                 user.push(prop);
                 continue;
+            }
+            if matches!(
+                &prop,
+                Property::KeyValue {
+                    key_quoted: true,
+                    ..
+                } | Property::Block {
+                    key_quoted: true,
+                    ..
+                }
+            ) {
+                return Err(ModulePropertyError::QuotedType);
             }
             match &prop {
                 Property::KeyValue {
@@ -193,6 +210,7 @@ mod tests {
     fn kv(key: &str, kind: ExprKind) -> Property {
         Property::KeyValue {
             key: key.into(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(kind),
             value_span: None,
@@ -202,6 +220,7 @@ mod tests {
     fn block(key: &str) -> Property {
         Property::Block {
             key: key.into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![],
         }

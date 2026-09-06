@@ -630,6 +630,7 @@ mod tests {
     fn prop_str(key: &str, val: &str) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::StringLit(val.to_string())),
             value_span: None,
@@ -639,6 +640,7 @@ mod tests {
     fn prop_int(key: &str, val: i64) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_quoted: false,
             key_span: None,
             value: Expr::spanless(ExprKind::IntLit(val)),
             value_span: None,
@@ -648,6 +650,7 @@ mod tests {
     fn peer_block(endpoint: &str) -> Property {
         Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![prop_str("endpoint", endpoint)],
         }
@@ -656,6 +659,7 @@ mod tests {
     fn peers_block_with(peers: Vec<Property>) -> Property {
         Property::Block {
             key: "peers".into(),
+            key_quoted: false,
             key_span: None,
             properties: peers,
         }
@@ -794,6 +798,7 @@ def output o {{
     fn accepts_single_peer_shorthand() {
         let props = vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![prop_str("endpoint", "http://x:4318/v1/logs")],
         }];
@@ -827,6 +832,7 @@ def output o {{
     fn peer_requires_endpoint() {
         let props = vec![peers_block_with(vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![],
         }])];
@@ -915,11 +921,13 @@ def output o {{
     fn rejects_tls_with_cert_but_no_key() {
         let props = vec![peers_block_with(vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_str("endpoint", "https://x"),
                 Property::Block {
                     key: "tls".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![prop_str("cert", "/c.pem")],
                 },
@@ -940,6 +948,7 @@ def output o {{
         let mut props = one_peer_props("http://x");
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 2),
@@ -1152,6 +1161,69 @@ def output o {{
     }
 
     #[tokio::test]
+    async fn quoted_headers_reach_otlp_http_receiver() {
+        use axum::{Router, extract::State, http::HeaderMap, routing::post};
+        async fn receive(
+            State(tx): State<tokio::sync::mpsc::Sender<HeaderMap>>,
+            headers: HeaderMap,
+        ) -> &'static str {
+            tx.send(headers).await.unwrap();
+            ""
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/logs", post(receive))
+                    .with_state(tx),
+            )
+            .await
+            .unwrap();
+        });
+        let cfg = crate::dsl::parser::parse_config(&format!(
+            r#"
+def output test {{
+    type otlp_http
+    peer {{ endpoint "http://{addr}/v1/logs" }}
+    batch_size 1
+    headers {{ "X-Custom-Header" "exact-value" Authorization "placeholder" }}
+}}
+"#
+        ))
+        .unwrap();
+        let compiled = crate::pipeline::CompiledConfig::from_config(cfg).unwrap();
+        let output = OtlpHttpOutput::from_properties(
+            "test",
+            &compiled.outputs["test"].properties,
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        let (ack, mut acknowledgements) = QueueAckHandle::for_test();
+        output
+            .consume(
+                &event_with_egress(singleton_bytes(1_700_000_000_000_000_000)),
+                ack,
+            )
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(5), acknowledgements.recv()).await;
+        output.shutdown(None).await.unwrap();
+        server.abort();
+        let _ = server.await;
+        let headers = received.unwrap().unwrap();
+        assert_eq!(headers["x-custom-header"], "exact-value");
+        assert_eq!(headers["authorization"], "placeholder");
+        assert!(matches!(
+            delivered.unwrap().unwrap().1,
+            crate::queue::AckDisposition::Delivered
+        ));
+    }
+
+    #[tokio::test]
     async fn retries_until_success_single_peer() {
         use axum::{
             Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
@@ -1195,6 +1267,7 @@ def output o {{
         props.push(prop_int("batch_size", 1));
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 5),
@@ -1260,6 +1333,7 @@ def output o {{
             prop_int("batch_size", 1),
             Property::Block {
                 key: "retry".into(),
+                key_quoted: false,
                 key_span: None,
                 properties: vec![
                     prop_int("max_attempts", 3),
@@ -1312,6 +1386,7 @@ def output o {{
         props.push(prop_int("batch_size", 1));
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 3),
@@ -1372,6 +1447,7 @@ def output o {{
         props.push(prop_int("batch_size", 1));
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 1),
@@ -1416,6 +1492,7 @@ def output o {{
         props.push(prop_int("batch_size", 1));
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 1),
@@ -1698,6 +1775,7 @@ def output o {{
         props.push(prop_str("batch_timeout", "30s"));
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 1),
@@ -1815,11 +1893,13 @@ def output o {{
         // nothing. Fail fast at parse time.
         let props = vec![peers_block_with(vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_str("endpoint", "http://collector.example.com:4318/v1/logs"),
                 Property::Block {
                     key: "tls".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![prop_str("ca", "/etc/ca.pem")],
                 },
@@ -1873,6 +1953,7 @@ def output o {{
         props.push(prop_int("batch_size", 1));
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 1),
@@ -1935,11 +2016,13 @@ def output o {{
         // before the file read.
         let props = vec![peers_block_with(vec![Property::Block {
             key: "peer".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_str("endpoint", "https://collector.example.com:4318/v1/logs"),
                 Property::Block {
                     key: "tls".into(),
+                    key_quoted: false,
                     key_span: None,
                     properties: vec![],
                 },
@@ -1967,6 +2050,7 @@ def output o {{
         // peer fails quickly.
         props.push(Property::Block {
             key: "retry".into(),
+            key_quoted: false,
             key_span: None,
             properties: vec![
                 prop_int("max_attempts", 1),

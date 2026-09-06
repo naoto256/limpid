@@ -139,7 +139,27 @@ fn parse_global_block(pair: Pair<Rule>, file_id: u32) -> Result<GlobalBlock> {
     let properties = inner
         .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
+    // Globals have no StringMap surface. Reject before table/control consumers
+    // can extract keys without going through a module schema.
+    reject_quoted_global_keys(&properties)?;
     Ok(GlobalBlock { name, properties })
+}
+
+fn reject_quoted_global_keys(properties: &[Property]) -> Result<()> {
+    for property in properties {
+        let quoted = match property {
+            Property::KeyValue { key_quoted, .. } | Property::Block { key_quoted, .. } => {
+                *key_quoted
+            }
+        };
+        if quoted {
+            bail!("quoted property keys are only allowed inside a StringMap, not global blocks");
+        }
+        if let Property::Block { properties, .. } = property {
+            reject_quoted_global_keys(properties)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -174,9 +194,31 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
     let mut inner = pair.into_inner();
     let key_pair = inner.next().expect("pest grammar invariant");
     let key_span = Some(span_of(&key_pair, file_id));
-    let key = key_pair.as_str().to_string();
+    let key_pair = first_inner(key_pair)?;
+    let key_quoted = key_pair.as_rule() == Rule::quoted_property_key;
+    if key_pair.as_rule() == Rule::invalid_hyphenated_property_key {
+        bail!(
+            "hyphenated property key: quote the key inside a StringMap (for example, headers {{ \"DD-API-KEY\" \"...\" }})"
+        );
+    }
+    let key = if key_quoted {
+        let raw = key_pair.as_str();
+        let mut decoded = String::new();
+        // The key grammar excludes interpolation. Decode only literal escapes.
+        process_plain_into(&mut decoded, &raw[1..raw.len() - 1]);
+        decoded
+    } else {
+        key_pair.as_str().to_string()
+    };
 
-    let second = inner.next().expect("pest grammar invariant");
+    let Some(second) = inner.next() else {
+        return Ok(Property::Block {
+            key,
+            key_quoted,
+            key_span,
+            properties: Vec::new(),
+        });
+    };
     match second.as_rule() {
         Rule::property => {
             // nested block: key { property* }
@@ -187,6 +229,7 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
             }
             Ok(Property::Block {
                 key,
+                key_quoted,
                 key_span,
                 properties: props,
             })
@@ -197,6 +240,7 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
             let value = parse_expr_from_pair(second, file_id)?;
             Ok(Property::KeyValue {
                 key,
+                key_quoted,
                 key_span,
                 value,
                 value_span,
@@ -1183,14 +1227,14 @@ def input fw_syslog {
     }
 
     #[test]
-    fn hyphenated_header_keys_preserve_names_and_values() {
+    fn quoted_header_keys_preserve_names_and_values() {
         let config = parse_config(
             r#"
 def output logs {
     type http
     headers {
-        DD-API-KEY "test-only-key"
-        X-Custom-Header "value"
+        "DD-API-KEY" "test-only-key"
+        "X-Custom-Header" "value"
         Authorization "Bearer placeholder"
     }
 }
@@ -1208,6 +1252,44 @@ def output logs {
                 ("Authorization".into(), "Bearer placeholder".into()),
             ]
         );
+    }
+
+    #[test]
+    fn quoted_key_migration_rejects_bare_hyphen_with_guidance() {
+        let error =
+            parse_config(r#"def output logs { type http headers { DD-API-KEY "placeholder" } }"#)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("quote"), "{error:#}");
+    }
+
+    #[test]
+    fn quoted_keys_are_static_and_decode_literal_escapes() {
+        let config = parse_config(
+            r#"def output logs { type http headers { "x-\"quoted\"\\name" "v" "\${literal}" "v" } }"#,
+        ).unwrap();
+        let Definition::Output(output) = &config.definitions[0] else {
+            panic!("output")
+        };
+        let entries =
+            crate::dsl::props::get_string_map(output.properties.user_properties(), "headers");
+        assert_eq!(entries[0].0, "x-\"quoted\"\\name");
+        assert_eq!(entries[1].0, "${literal}");
+        assert!(
+            parse_config(r#"def output logs { type http headers { "${name}" "v" } }"#).is_err()
+        );
+    }
+
+    #[test]
+    fn quoted_global_keys_are_rejected_before_compilation() {
+        for source in [
+            r#"control { "error_log" "placeholder" }"#,
+            r#"table { "example" { type csv path "placeholder" } }"#,
+            r#"tls { "profile" { ca "placeholder" } }"#,
+            r#"table { example { "path" "placeholder" } }"#,
+        ] {
+            let error = parse_config(source).unwrap_err();
+            assert!(format!("{error:#}").contains("quoted"), "{error:#}");
+        }
     }
 
     #[test]
