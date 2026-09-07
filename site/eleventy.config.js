@@ -10,6 +10,7 @@ export default function (config) {
     "src/style.css": "style.css",
     "src/copy-code.js": "copy-code.js",
     "src/mark.svg": "mark.svg",
+    "src/og.png": "og.png",
     "src/fonts": "fonts",
     "../docs/src/assets": "docs/assets",
   });

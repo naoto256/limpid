@@ -3,8 +3,51 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { pages, markdown, navigation, route } from "../lib/content.js";
 import MarkdownIt from "markdown-it";
+import { createHash } from "node:crypto";
 import PageTemplate from "../src/pages.11ty.js";
 import { url, origin } from "../lib/config.js";
+
+test("social metadata uses each page title and canonical URL with the approved common image", () => {
+  const renderer = new PageTemplate();
+  for (const entry of pages()) {
+    const html = renderer.render({ entry });
+    const head = html.match(/<head>([\s\S]*?)<\/head>/)[1];
+    const tags = [
+      ...head.matchAll(
+        /<meta (?:property|name)="([^"]+)" content="([^"]*)"\s*\/?\s*>/g,
+      ),
+    ];
+    const values = Object.fromEntries(tags.map((m) => [m[1], m[2]]));
+    const expected = {
+      "og:title": head.match(/<title>(.*?)<\/title>/)[1],
+      "og:type": "website",
+      "og:url": head.match(/rel="canonical" href="([^"]+)"/)[1],
+      "og:description": values.description,
+      "og:site_name": "limpid",
+      "og:image": origin + url("og.png"),
+      "og:image:width": "1200",
+      "og:image:height": "630",
+      "og:image:type": "image/png",
+      "og:image:alt": "limpid — Log pipelines, limpid as intent.",
+      "twitter:card": "summary_large_image",
+    };
+    for (const field of ["title", "description", "image", "image:alt"])
+      expected[`twitter:${field}`] = expected[`og:${field}`];
+    for (const [key, value] of Object.entries(expected)) {
+      assert.equal(values[key], value, `${entry.route}: ${key}`);
+      assert.equal(tags.filter((m) => m[1] === key).length, 1);
+    }
+  }
+  const png = readFileSync("src/og.png");
+  assert.equal(png.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  assert.equal(png.toString("ascii", 12, 16), "IHDR");
+  assert.equal(png.readUInt32BE(16), 1200);
+  assert.equal(png.readUInt32BE(20), 630);
+  assert.equal(
+    createHash("sha256").update(png).digest("hex"),
+    "ee4e3a34d42b5d8423d9e6825c3f130efefceaabc98b91d7c4a49afe5232d724",
+  );
+});
 
 test("branching recipe preserves earlier output copies and AMP uses the syslog snippet", () => {
   const source = readFileSync("src/branch-and-forward.md", "utf8");
