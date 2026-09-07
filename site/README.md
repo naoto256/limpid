@@ -3,6 +3,13 @@
 This site builds static HTML for GitHub Pages at
 https://naoto256.github.io/limpid/. It does not publish through another hosting service.
 
+The shared social card is `src/og.png` (1200 × 630), copied unchanged into the build.
+`og-source.svg` is its editable source, not a build input or a served asset.
+The approved PNG was exported with CairoSVG using Helvetica Neue; rendering the
+SVG with different installed fonts can change its appearance. Keep the approved
+PNG unless a replacement is reviewed. No font or image-rendering dependency is
+needed to build the site. Social platforms may cache or crop the shared card.
+
 ```sh
 cd site
 # Use the exact Node version in .node-version.
