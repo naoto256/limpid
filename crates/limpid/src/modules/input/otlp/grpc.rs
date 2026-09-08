@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn manual_tcp_incoming_preserves_tonic_nodelay_default() {
-        let source = include_str!("grpc.rs");
+        let source = include_str!("grpc.rs").replace("\r\n", "\n");
         let test_module = ["#[cfg(", "test)]\nmod tests"].concat();
         let production = source
             .split_once(&test_module)

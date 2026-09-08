@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output};

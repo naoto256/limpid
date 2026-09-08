@@ -1196,6 +1196,11 @@ mod tests {
         dir
     }
 
+    #[cfg(windows)]
+    fn safe_dlq_tempdir() -> TempDir {
+        TempDir::new().unwrap()
+    }
+
     #[tokio::test]
     async fn validate_at_startup_passes_for_existing_parent() {
         let dir = safe_dlq_tempdir();

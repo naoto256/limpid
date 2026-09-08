@@ -702,6 +702,7 @@ impl Output for LtpOutput {
 mod tests {
     use super::*;
     use std::io;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::pin::Pin;
     use std::sync::atomic::AtomicBool;
@@ -784,12 +785,20 @@ mod tests {
         let spki = spki_for(&pair);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.pem");
-        std::fs::write(
-            &path,
-            pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8.as_ref())),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let encoded = pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8.as_ref()));
+        #[cfg(unix)]
+        {
+            std::fs::write(&path, &encoded).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use std::io::Write as _;
+            limpid_windows::security::create_private_key(&path)
+                .unwrap()
+                .write_all(encoded.as_bytes())
+                .unwrap();
+        }
         let mut context = crate::modules::BuildContext {
             ltp_node_id: Some(Arc::<str>::from(node_id)),
             ltp_node_key: Some(Arc::new(crate::ltp::load_node_key(&path).unwrap())),

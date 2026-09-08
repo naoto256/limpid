@@ -1,0 +1,14 @@
+// The installer expands @LIMPID_DATA@ to an absolute ProgramData path.
+def input system_events {
+    type windows_event_log
+    channel "System"
+    state_file "@LIMPID_DATA@/state/system.bookmark"
+}
+def output collected {
+    type file
+    path "@LIMPID_DATA@/log/events.jsonl"
+}
+def pipeline collect {
+    input system_events
+    output collected
+}

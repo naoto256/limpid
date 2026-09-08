@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/limpid-windows",
     "crates/limpid",
     "crates/limpidctl",
     "crates/limpid-metrics-schema",

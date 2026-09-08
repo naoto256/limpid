@@ -1052,7 +1052,7 @@ mod tests {
         let (ack, _ack_rx) = QueueAckHandle::for_test();
 
         tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            PEER_CONNECT_TIMEOUT + Duration::from_secs(2),
             output.consume(&event, ack),
         )
         .await
@@ -1100,7 +1100,7 @@ mod tests {
         let (ack, _ack_rx) = QueueAckHandle::for_test();
         let task_output = Arc::clone(&output);
         let task = tokio::spawn(async move { task_output.consume(&event, ack).await });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(PEER_CONNECT_TIMEOUT + Duration::from_secs(2), async {
             while output.metrics.retries.load(Ordering::Relaxed) != 1 {
                 tokio::task::yield_now().await;
             }

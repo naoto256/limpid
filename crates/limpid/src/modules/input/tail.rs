@@ -465,10 +465,15 @@ fn get_inode(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.ino())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn get_inode(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).ok().map(|m| m.ino())
+}
+
+#[cfg(windows)]
+fn get_inode(path: &Path) -> Option<super::tail_windows::FileIdentity> {
+    super::tail_windows::identity(path).ok()
 }
 
 #[cfg(test)]

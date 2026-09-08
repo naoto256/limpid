@@ -62,7 +62,6 @@ bumpalo = { version = "3", features = ["collections"] }
 # typical OCSF / syslog field values (`"INFO"`, `"sshd"`, IPv4
 # strings, …) sit comfortably under the inline budget.
 compact_str = { version = "0.9", features = ["serde"] }
-rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "sasl"], optional = true }
 
 # OTLP (OpenTelemetry Protocol). Pre-generated message types from the
 # official OpenTelemetry-rust ecosystem. `gen-tonic` pulls in tonic +
@@ -87,6 +86,18 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 # when this feature is enabled.
 journal = []
 kafka = ["dep:rdkafka"]
+
+[target.'cfg(unix)'.dependencies]
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "sasl"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+roxmltree = "0.21"
+limpid-windows = { path = "../limpid-windows" }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Console", "Win32_System_Services", "Win32_System_EventLog", "Win32_System_Threading", "Win32_System_Pipes", "Win32_Security"] }
+# `sasl` is rdkafka's alias for Cyrus/GSSAPI, which the public limpid DSL
+# does not expose. PLAIN is built in; SSL enables SCRAM. Keep all three
+# supported mechanisms and build OpenSSL without a machine-wide install.
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl-vendored"], optional = true }
 
 [build-dependencies]
 # Locates libsystemd (`libsystemd-dev`) via pkg-config when the

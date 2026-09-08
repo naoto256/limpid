@@ -1,0 +1,17 @@
+[package]
+name = "limpid-native-windows-stdout-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Pipes", "Win32_Security"] }
+
+[dev-dependencies]
+tempfile = "3"

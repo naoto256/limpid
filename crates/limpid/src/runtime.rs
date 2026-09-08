@@ -110,6 +110,7 @@ mod tests {
     use crate::queue::{QueueAckHandle, QueueType};
     use bytes::Bytes;
     use std::net::SocketAddr;
+    #[cfg(unix)]
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::str::FromStr;
     use std::sync::atomic::Ordering;
@@ -120,6 +121,7 @@ mod tests {
             .expect("test input queue timer must register")
     }
 
+    #[cfg(unix)]
     fn full_stdout_pipe() -> (OwnedFd, OwnedFd) {
         let mut fds = [-1; 2];
         // SAFETY: pipe initializes both integers on success.
@@ -567,6 +569,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn startup_rollback_with_full_stdout_pipe_resolves_current_ack() {
         let (read_fd, write_fd) = full_stdout_pipe();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -612,6 +615,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn normal_shutdown_with_full_stdout_pipe_resolves_current_ack() {
         let (read_fd, write_fd) = full_stdout_pipe();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -661,6 +665,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn full_pipe_queue_consumer_is_bounded_and_disposes_once_on_abort() {
         let (read_fd, write_fd) = full_stdout_pipe();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -730,7 +735,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[cfg(unix)]
     async fn disk_pipeline_wal_barrier_remains_must_join_past_ten_seconds() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -820,6 +827,7 @@ def output {name} {{
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn post_output_preactivation_error_shuts_real_batched_actor_once() {
         let output_name = "preactivation_error_batched";
         let observer = crate::modules::output::batched::observe_shutdown_for_testing(output_name);
@@ -864,6 +872,7 @@ def output {name} {{
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn post_output_preactivation_cancellation_completes_guard_and_batched_actor_cleanup() {
         let output_name = "preactivation_cancel_batched";
         let observer = crate::modules::output::batched::observe_shutdown_for_testing(output_name);
@@ -909,10 +918,12 @@ def output {name} {{
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     fn write_ltp_test_identity(path: &Path) -> String {
         use base64::Engine as _;
         use ring::rand::SystemRandom;
         use ring::signature::{Ed25519KeyPair, KeyPair as _};
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
@@ -950,7 +961,9 @@ def output {name} {{
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     async fn assert_late_failure_scenario() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1108,25 +1121,30 @@ def pipeline receive {{ input inbound; output delivered }}
 
     #[cfg(unix)]
     #[tokio::test]
+    #[cfg(unix)]
     async fn late_post_listener_failure_rolls_back_all_started_tasks() {
         assert_late_failure_scenario().await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
+    #[cfg(unix)]
     async fn failed_candidate_releases_same_port_before_old_restore() {
         assert_late_failure_scenario().await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
+    #[cfg(unix)]
     async fn startup_error_leaves_no_orphan_socket_or_task() {
         assert_late_failure_scenario().await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
+    #[cfg(unix)]
     async fn two_runtimes_deliver_one_event_over_mutual_rpk_ltp() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
         use tokio::io::AsyncWriteExt as _;
 
@@ -1241,6 +1259,7 @@ def pipeline relay {{ input source; output to_b }}
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn startup_preserves_metric_registration_errors_from_real_factories() {
         let dir = tempfile::tempdir().unwrap();
         #[cfg(unix)]
@@ -1284,7 +1303,9 @@ def pipeline relay {{ input source; output to_b }}
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn public_start_delegates_to_the_registry_wired_startup_path() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1327,7 +1348,9 @@ def pipeline p {{ input source; output sink }}
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn occupied_syslog_tcp_and_udp_fail_runtime_start_before_commit() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1360,7 +1383,9 @@ def pipeline p {{ input source; output sink }}
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn invalid_syslog_tls_and_unix_bind_fail_runtime_start_before_commit() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1397,7 +1422,9 @@ def pipeline p {{ input source; output sink }}
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn control_bind_failure_rolls_back_started_resources() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1412,7 +1439,9 @@ def pipeline p {{ input source; output sink }}
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn occupied_control_socket_rejects_start_and_preserves_active_owner() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1435,11 +1464,13 @@ def pipeline p {{ input source; output sink }}
         drop(rebound);
     }
 
+    #[cfg(unix)]
     async fn assert_startup_build_info(
         configured_node_id: Option<&str>,
         expected_node_id: &str,
         expected_resolver_calls: usize,
     ) {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1485,19 +1516,23 @@ def pipeline p {{ input source; output sink }}
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn startup_with_explicit_node_id_skips_hostname_and_registers_that_value() {
         assert_startup_build_info(Some("configured-node"), "configured-node", 0).await;
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn startup_without_node_id_resolves_hostname_once_and_registers_that_value() {
         assert_startup_build_info(None, "resolved-host-1", 1).await;
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn startup_preflights_a_declared_node_key_and_ignores_an_omitted_one() {
         use base64::Engine as _;
         use ring::signature::KeyPair as _;
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1550,7 +1585,9 @@ def pipeline p {{ input source; output sink }}
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn startup_fails_before_tasks_when_a_declared_node_key_is_unreadable() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
