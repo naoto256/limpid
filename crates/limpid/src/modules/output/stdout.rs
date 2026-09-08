@@ -1,12 +1,20 @@
 //! Stdout output: writes event messages to standard output (debugging/testing).
 
+#[cfg(unix)]
 use std::fmt;
 use std::io;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::os::fd::FromRawFd;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::OnceLock;
+
+#[cfg(windows)]
+pub(crate) use super::stdout_windows::stdout_is_regular_file;
+#[cfg(windows)]
+use super::stdout_windows::{Transport as StdoutTransport, WriteError as StdoutWriteError};
 
 use anyhow::Result;
 
@@ -16,6 +24,7 @@ use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
 
+#[cfg(unix)]
 async fn shutdown_change_is_terminal(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
     match shutdown.changed().await {
         Ok(()) => *shutdown.borrow(),
@@ -37,6 +46,7 @@ const DARWIN_PIPE_EAGAIN_BACKOFF: std::time::Duration = std::time::Duration::fro
 /// output shares this one Unix transport so frames from distinct output actors
 /// cannot interleave. It is deliberately module-local: this is not a generic
 /// writer abstraction and does not change the output trait.
+#[cfg(unix)]
 struct StdoutTransport {
     backend: StdoutBackend,
     serial: tokio::sync::Mutex<()>,
@@ -44,11 +54,13 @@ struct StdoutTransport {
     observer: Option<Arc<WriteObserver>>,
 }
 
+#[cfg(unix)]
 enum StdoutBackend {
     Async(tokio::io::unix::AsyncFd<StdoutFd>),
     Regular(StdoutFd),
 }
 
+#[cfg(unix)]
 struct StdoutFd {
     fd: RawFd,
     // Production borrows fd 1. Tests can give the transport an owned pipe or
@@ -56,6 +68,7 @@ struct StdoutFd {
     _owned: Option<OwnedFd>,
 }
 
+#[cfg(unix)]
 impl AsRawFd for StdoutFd {
     fn as_raw_fd(&self) -> RawFd {
         self.fd
@@ -63,11 +76,13 @@ impl AsRawFd for StdoutFd {
 }
 
 #[derive(Debug)]
+#[cfg(unix)]
 struct StdoutWriteError {
     source: io::Error,
     written: usize,
 }
 
+#[cfg(unix)]
 impl fmt::Display for StdoutWriteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.written == 0 {
@@ -82,21 +97,24 @@ impl fmt::Display for StdoutWriteError {
     }
 }
 
+#[cfg(unix)]
 impl std::error::Error for StdoutWriteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
 }
 
+#[cfg(unix)]
 static STDOUT_TRANSPORT: OnceLock<Arc<StdoutTransport>> = OnceLock::new();
+#[cfg(unix)]
 static STDOUT_TRANSPORT_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 tokio::task_local! {
     static TEST_STDOUT_TRANSPORT: Arc<StdoutTransport>;
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Default)]
 struct WriteObserver {
     written: std::sync::atomic::AtomicUsize,
@@ -113,6 +131,7 @@ struct WriteObserver {
     inject_would_block: std::sync::atomic::AtomicBool,
 }
 
+#[cfg(unix)]
 impl StdoutTransport {
     fn stdout() -> Result<Arc<Self>> {
         #[cfg(test)]
@@ -390,7 +409,7 @@ impl StdoutTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fd` is a live descriptor supplied by the process or owned by
     // the transport. fcntl does not access Rust memory.
@@ -407,6 +426,7 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn get_fd_flags(fd: RawFd) -> io::Result<i32> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags == -1 {
@@ -416,6 +436,7 @@ fn get_fd_flags(fd: RawFd) -> io::Result<i32> {
     }
 }
 
+#[cfg(unix)]
 fn set_fd_flags(fd: RawFd, flags: i32) -> io::Result<()> {
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } == -1 {
         Err(io::Error::last_os_error())
@@ -424,6 +445,7 @@ fn set_fd_flags(fd: RawFd, flags: i32) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn fd_is_regular_file(fd: RawFd) -> io::Result<bool> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == -1 {
@@ -433,10 +455,12 @@ fn fd_is_regular_file(fd: RawFd) -> io::Result<bool> {
     Ok(stat.st_mode & libc::S_IFMT == libc::S_IFREG)
 }
 
+#[cfg(unix)]
 pub(crate) fn stdout_is_regular_file() -> io::Result<bool> {
     fd_is_regular_file(1)
 }
 
+#[cfg(unix)]
 fn raw_write_all(fd: RawFd, bytes: &[u8]) -> std::result::Result<(), StdoutWriteError> {
     let mut written = 0;
     while written < bytes.len() {
@@ -454,6 +478,7 @@ fn raw_write_all(fd: RawFd, bytes: &[u8]) -> std::result::Result<(), StdoutWrite
     Ok(())
 }
 
+#[cfg(unix)]
 fn raw_write(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
     // SAFETY: `bytes` is valid for the duration of write(2); the descriptor is
     // held alive by `StdoutFd` (or is process fd 1).
@@ -465,7 +490,7 @@ fn raw_write(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) async fn with_test_stdout_fd<T>(
     fd: OwnedFd,
     future: impl std::future::Future<Output = T>,
@@ -736,7 +761,7 @@ impl Output for StdoutOutput {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod metrics_registration_tests {
     use super::*;
     use crate::dsl::module_props::ModuleProperties;
@@ -1557,7 +1582,11 @@ mod metrics_registration_tests {
     #[test]
     fn stdout_transport_mutant_sensitivity_pins_nonblocking_worker_path() {
         let source = include_str!("stdout.rs");
-        let test_module = ["#[cfg(", "test)]\nmod metrics_registration_tests"].concat();
+        let test_module = [
+            "#[cfg(",
+            "all(test, unix))]\nmod metrics_registration_tests",
+        ]
+        .concat();
         let production = source
             .split_once(&test_module)
             .expect("test module boundary must remain explicit")

@@ -3933,6 +3933,7 @@ mod schema_splice_tests {
     use crate::modules::output::stdout::StdoutOutput;
     use crate::modules::output::syslog_tcp::SyslogTcpOutput;
     use crate::modules::output::syslog_udp::SyslogUdpOutput;
+    #[cfg(unix)]
     use crate::modules::output::unix_socket::UnixSocketOutput;
 
     #[cfg(feature = "kafka")]
@@ -4002,6 +4003,7 @@ mod schema_splice_tests {
         assert_accepts(HttpOutput::property_schema().unwrap(), "http");
         assert_accepts(SyslogTcpOutput::property_schema().unwrap(), "syslog_tcp");
         assert_accepts(SyslogUdpOutput::property_schema().unwrap(), "syslog_udp");
+        #[cfg(unix)]
         assert_accepts(UnixSocketOutput::property_schema().unwrap(), "unix_socket");
         assert_accepts(OtlpGrpcOutput::property_schema().unwrap(), "otlp_grpc");
         assert_accepts(OtlpHttpOutput::property_schema().unwrap(), "otlp_http");
@@ -4024,6 +4026,7 @@ mod schema_splice_tests {
             (HttpOutput::property_schema().unwrap(), "http"),
             (SyslogTcpOutput::property_schema().unwrap(), "syslog_tcp"),
             (SyslogUdpOutput::property_schema().unwrap(), "syslog_udp"),
+            #[cfg(unix)]
             (UnixSocketOutput::property_schema().unwrap(), "unix_socket"),
             (OtlpGrpcOutput::property_schema().unwrap(), "otlp_grpc"),
             (OtlpHttpOutput::property_schema().unwrap(), "otlp_http"),

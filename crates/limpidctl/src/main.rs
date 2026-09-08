@@ -12,9 +12,12 @@
 //!
 //! Connects to limpid's control socket (default: /var/run/limpid/control.sock).
 
+#[cfg(windows)]
+use limpid_windows::pipe::Client as UnixStream;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -27,7 +30,10 @@ use limpid_metrics_schema::{
     MetricsSnapshot, PROCESS_PATH_ROOT,
 };
 
+#[cfg(unix)]
 const DEFAULT_SOCKET: &str = "/var/run/limpid/control.sock";
+#[cfg(windows)]
+const DEFAULT_SOCKET: &str = limpid_windows::pipe::DEFAULT_PATH;
 
 #[derive(Parser)]
 #[command(name = "limpidctl", about = "Control and debug CLI for limpid")]
@@ -344,6 +350,31 @@ fn generate_node_key(path: &std::path::Path) -> Result<String, String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(spki))
 }
 
+#[cfg(windows)]
+fn write_new_private_key(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".limpid-node-key.")
+        .make_in(parent, limpid_windows::security::create_private_key)
+        .map_err(|e| format!("cannot securely create node key: {e}"))?;
+    temporary
+        .as_file_mut()
+        .write_all(contents)
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|e| format!("cannot persist node key: {e}"))?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|e| format!("cannot publish node key '{}': {}", path.display(), e.error))?;
+    // Windows has no Unix directory-fsync equivalent. The key contents are
+    // flushed before same-directory, non-replacing publication; no power-loss
+    // durability guarantee beyond the platform's rename contract is claimed.
+    Ok(())
+}
+
+#[cfg(unix)]
 fn write_new_private_key(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
     write_new_private_key_with(
         path,
@@ -357,6 +388,7 @@ fn write_new_private_key(path: &std::path::Path, contents: &[u8]) -> Result<(), 
     )
 }
 
+#[cfg(unix)]
 fn write_new_private_key_with<W, B, S>(
     path: &std::path::Path,
     contents: &[u8],
@@ -1485,14 +1517,20 @@ mod tests {
     #[test]
     fn keygen_writes_a_signing_key_and_returns_matching_rfc8410_spki() {
         use ring::signature::KeyPair as _;
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.pem");
         let public_key = generate_node_key(&path).unwrap();
 
-        let metadata = std::fs::metadata(&path).unwrap();
-        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        #[cfg(windows)]
+        limpid_windows::security::open_private_key(&path).unwrap();
         let document = pem::parse(std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(document.tag(), "PRIVATE KEY");
         let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(document.contents()).unwrap();
@@ -1529,6 +1567,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn keygen_cleans_temporary_files_after_write_and_file_sync_failures() {
         let dir = tempfile::tempdir().unwrap();
         let private_material = b"DO-NOT-LEAK-PRIVATE-MATERIAL";
@@ -1565,6 +1604,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn keygen_publish_never_replaces_a_competing_final_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("competing.pem");
@@ -1589,6 +1629,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn keygen_parent_sync_failure_preserves_the_published_key() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1618,6 +1659,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn keygen_orders_file_sync_publish_and_parent_sync() {
         use std::cell::RefCell;
         use std::os::unix::fs::PermissionsExt;

@@ -21,3 +21,6 @@ tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+limpid-windows = { path = "../limpid-windows" }

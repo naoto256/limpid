@@ -555,7 +555,17 @@ mod tests {
         // the rule, not a general "absolute paths welcome".
         let dir = TempDir::new().unwrap();
         let main_conf = dir.path().join("main.conf");
-        fs::write(&main_conf, r#"include "/etc/hosts""#).unwrap();
+        let outside = TempDir::new().unwrap();
+        let path = outside.path().join("outside.limpid");
+        fs::write(&path, "").unwrap();
+        fs::write(
+            &main_conf,
+            format!(
+                "include \"{}\"",
+                path.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
 
         let err = load_config(&main_conf).unwrap_err().to_string();
         assert!(

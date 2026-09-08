@@ -1,0 +1,39 @@
+name: Windows integrated candidate
+
+on:
+  pull_request:
+    branches: [main, 'release/*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked -p limpid -p limpid-windows -p limpidctl -p limpid-prometheus --bins --lib -- -D warnings
+      # The full suite deliberately fails if the runner cannot create its
+      # symlink fixture. Do not silently omit the native security test.
+      - run: cargo test --locked -p limpid -p limpid-windows -p limpidctl -p limpid-prometheus --bins --lib -- --test-threads=4
+      - run: cargo build --locked -p limpid -p limpidctl -p limpid-prometheus
+      - name: Native control and Event Log pipeline
+        shell: pwsh
+        run: ./packaging/windows/test-native.ps1 -BinaryDirectory target/debug -ResultsDirectory '${{ runner.temp }}/limpid-native-results'
+      - name: Validate package construction
+        shell: pwsh
+        run: |
+          ./packaging/windows/build-package.ps1 -BinaryDirectory target/debug -OutputPath '${{ runner.temp }}/limpid-candidate.zip'
+          $package = @(Get-ChildItem '${{ runner.temp }}' -Directory -Filter 'limpid-package-*')
+          if ($package.Count -ne 1) { throw 'Expected one candidate staging directory' }
+          ./packaging/windows/test-install-acl.ps1 -PackageDirectory $package[0].FullName -ResultsDirectory '${{ runner.temp }}/limpid-acl-fixture'
+      # SCM lifecycle, alternate-user ACL denial, and the supported OS/CPU
+      # matrix remain separate acceptance checks; this job proves none of them.

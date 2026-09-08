@@ -129,9 +129,12 @@ mod tests {
 
     #[test]
     fn signed_time_is_total_and_elapsed_clamps_reversed_clocks() {
-        let before_epoch = UNIX_EPOCH - std::time::Duration::from_nanos(7);
+        // Windows SystemTime has 100ns resolution. Use an exactly
+        // representable instant on every platform, keeping sub-tick signed
+        // arithmetic covered independently below.
+        let before_epoch = UNIX_EPOCH - std::time::Duration::from_nanos(700);
         let sample = UnixNanos::from_system_time(before_epoch);
-        assert_eq!(sample.get(), -7);
+        assert_eq!(sample.get(), -700);
         assert_eq!(sample.to_wire_u64(), 0);
 
         let reversed = UnixNanos::new(4).elapsed_since(UnixNanos::new(9));

@@ -1,0 +1,20 @@
+[package]
+name = "limpid-native-windows-event-log-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Exercise the production API boundary before the daemon's remaining Unix
+# dependencies have been ported. This is not a replacement for runtime tests.
+[workspace]
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+roxmltree = "0.21"
+serde_json = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_EventLog", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"

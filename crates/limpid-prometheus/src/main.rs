@@ -33,9 +33,18 @@ use limpid_metrics_schema::{
     PROCESS_LABEL_NAME, PROCESS_LABEL_PATH, PROCESS_LABEL_PIPELINE, PROCESS_PATH_ROOT,
     process_path_parent,
 };
+#[cfg(windows)]
+use limpid_windows::pipe::AsyncClient as UnixStream;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UnixStream};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+#[cfg(unix)]
+const DEFAULT_CONTROL_PATH: &str = "/var/run/limpid/control.sock";
+#[cfg(windows)]
+const DEFAULT_CONTROL_PATH: &str = limpid_windows::pipe::DEFAULT_PATH;
 use tokio::sync::Semaphore;
 
 /// Hard upper bound on a single control-socket round trip. limpid's
@@ -79,7 +88,7 @@ struct Cli {
     bind: SocketAddr,
 
     /// limpid control socket path
-    #[arg(long, default_value = "/var/run/limpid/control.sock")]
+    #[arg(long, default_value = DEFAULT_CONTROL_PATH)]
     socket: PathBuf,
 }
 
@@ -748,7 +757,9 @@ async fn query_control(socket_path: &Path, command: &str) -> Result<String, Stri
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
-    use tokio::net::{TcpStream, UnixListener};
+    use tokio::net::TcpStream;
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
 
     const DROPPED_FAMILY: &str = "limpid_events_dropped_total";
     const DROPPED_OWN_FAMILY: &str = "limpid_events_dropped_own_total";
@@ -1851,7 +1862,30 @@ zeta_total{scope="z"} 9
         drop(idle);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn query_control_times_out_when_native_pipe_peer_stalls() {
+        let path = PathBuf::from(format!(
+            r"\\.\pipe\limpid-exporter-stall-{}",
+            std::process::id()
+        ));
+        let listener = limpid_windows::pipe::Listener::bind(&path).unwrap();
+        let call = tokio::spawn(async move { query_control(&path, "stats").await });
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("query must connect to the native pipe")
+            .unwrap();
+        let _held_open = stream;
+        let err = tokio::time::timeout(QUERY_TIMEOUT + Duration::from_secs(2), call)
+            .await
+            .expect("a stalled native peer must not block the exporter")
+            .unwrap()
+            .expect_err("stalled peer must time out");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+    }
+
     #[tokio::test(start_paused = true)]
+    #[cfg(unix)]
     async fn query_control_times_out_when_peer_stalls() {
         // Regression: with the previous synchronous code path, a
         // wedged limpid daemon (= accepted the connection but never

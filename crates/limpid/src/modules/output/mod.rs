@@ -2,17 +2,23 @@
 
 pub(crate) mod batched;
 pub mod file;
+#[cfg(windows)]
+mod file_windows;
 pub mod http;
 pub(crate) mod http_util;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod ltp;
 pub mod otlp;
+#[cfg(unix)]
 pub(crate) mod persistent_conn;
 pub mod stdout;
+#[cfg(windows)]
+mod stdout_windows;
 pub(crate) mod syslog_peers;
 pub mod syslog_tcp;
 pub mod syslog_udp;
+#[cfg(unix)]
 pub mod unix_socket;
 
 /// Concatenate `payload` and a trailing `\n` into a single buffer.

@@ -1119,6 +1119,7 @@ mod tests {
     use chrono::TimeZone as _;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use tokio::io::AsyncWriteExt as _;
     use tokio_rustls::TlsConnector;
@@ -1172,12 +1173,20 @@ mod tests {
         spki.extend_from_slice(pair.public_key().as_ref());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("node.pem");
-        std::fs::write(
-            &path,
-            pem::encode(&pem::Pem::new("PRIVATE KEY", document.as_ref())),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let encoded = pem::encode(&pem::Pem::new("PRIVATE KEY", document.as_ref()));
+        #[cfg(unix)]
+        {
+            std::fs::write(&path, &encoded).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use std::io::Write as _;
+            limpid_windows::security::create_private_key(&path)
+                .unwrap()
+                .write_all(encoded.as_bytes())
+                .unwrap();
+        }
         (crate::ltp::load_node_key(&path).unwrap(), spki)
     }
 

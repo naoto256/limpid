@@ -1,5 +1,6 @@
 //! LTP metadata, complete-frame wire encoding, and node-key preflight.
 
+#[cfg(unix)]
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
@@ -212,43 +213,58 @@ fn load_node_key_with_open_hook<F>(path: &Path, after_open: F) -> Result<Validat
 where
     F: FnOnce(),
 {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    #[cfg(windows)]
+    let mut file = {
+        let file = limpid_windows::security::open_private_key(path).with_context(|| {
+            format!("node_key '{}': secure Windows open failed", path.display())
+        })?;
+        after_open();
+        limpid_windows::security::validate_private_key(&file)?;
+        file
+    };
+    #[cfg(unix)]
+    let mut file = {
+        #[cfg(unix)]
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("node_key '{}': secure open failed", path.display()))?;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options
+            .open(path)
+            .with_context(|| format!("node_key '{}': secure open failed", path.display()))?;
 
-    after_open();
+        after_open();
 
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("node_key '{}': fstat failed", path.display()))?;
-    if !metadata.is_file() {
-        bail!("node_key '{}': not a regular file", path.display());
-    }
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("node_key '{}': fstat failed", path.display()))?;
+        if !metadata.is_file() {
+            bail!("node_key '{}': not a regular file", path.display());
+        }
 
-    let euid = unsafe { libc::geteuid() };
-    if !node_key_owner_matches(metadata.uid(), euid) {
-        bail!(
-            "node_key '{}': owner uid {} does not match daemon euid {}",
-            path.display(),
-            metadata.uid(),
-            euid
-        );
-    }
+        let euid = unsafe { libc::geteuid() };
+        if !node_key_owner_matches(metadata.uid(), euid) {
+            bail!(
+                "node_key '{}': owner uid {} does not match daemon euid {}",
+                path.display(),
+                metadata.uid(),
+                euid
+            );
+        }
 
-    let mode = metadata.permissions().mode() & 0o7777;
-    if mode != 0o400 && mode != 0o600 {
-        bail!(
-            "node_key '{}': mode 0o{:o} must be exactly 0o400 or 0o600",
-            path.display(),
-            mode
-        );
-    }
+        let mode = metadata.permissions().mode() & 0o7777;
+        if mode != 0o400 && mode != 0o600 {
+            bail!(
+                "node_key '{}': mode 0o{:o} must be exactly 0o400 or 0o600",
+                path.display(),
+                mode
+            );
+        }
+
+        file
+    };
 
     let encoded = read_node_key_bounded(&mut file, path)?;
     let document = pem::parse(encoded.as_slice())
@@ -295,7 +311,9 @@ mod tests {
     use super::*;
     use std::ffi::CString;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -338,6 +356,7 @@ mod tests {
         Bytes::from(frame)
     }
 
+    #[cfg(unix)]
     fn write_ed25519_key(path: &Path, mode: u32) {
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
         fs::write(
@@ -364,6 +383,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn secure_node_key_load_returns_the_validated_material_from_the_open_inode() {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("node.pem");
@@ -401,6 +421,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn node_key_preflight_accepts_generated_ed25519_at_exact_modes() {
         for mode in [0o400, 0o600] {
             let dir = tempfile::tempdir().unwrap();
@@ -411,6 +432,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn node_key_preflight_accepts_standard_pkcs8_v1_ed25519() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node-v1.pem");
@@ -425,6 +447,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn parsed_runtime_identity_is_send_sync_and_debug_elides_private_material() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ValidatedNodeKey>();
@@ -528,6 +551,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn wrong_pem_label_is_rejected_after_secret_contents_move_to_owned_zeroizing_storage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wrong-label.pem");
@@ -545,6 +569,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn node_key_preflight_rejects_symlinks_and_other_modes() {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("node.pem");
@@ -566,6 +591,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn node_key_preflight_rejects_a_fifo_without_waiting_for_a_writer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node-key.fifo");
@@ -593,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn node_key_preflight_rejects_garbage_and_wrong_algorithm_without_leaking_material() {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("node.pem");
@@ -614,6 +641,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn node_key_preflight_enforces_the_exact_64_kib_file_limit() {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("node.pem");
@@ -642,6 +670,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn node_key_preflight_fstats_and_reads_the_open_descriptor() {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("node.pem");
