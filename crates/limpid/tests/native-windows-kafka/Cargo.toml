@@ -1,0 +1,13 @@
+[package]
+name = "limpid-native-windows-kafka-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+rdkafka = { version = "=0.36.2", features = ["cmake-build", "ssl-vendored"] }

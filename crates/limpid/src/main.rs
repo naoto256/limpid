@@ -20,6 +20,8 @@ mod modules;
 mod pipeline;
 mod queue;
 mod runtime;
+#[cfg(windows)]
+mod service;
 mod signal;
 mod tap;
 mod time;
@@ -40,8 +42,13 @@ use crate::pipeline::{CompiledConfig, compile_runtime_blueprint, run_pipeline_bl
 #[command(name = "limpid", about = "Log pipelines, limpid as intent.")]
 struct Cli {
     /// Configuration file
-    #[arg(long, default_value = "/etc/limpid/limpid.conf")]
+    #[arg(long, default_value_t = default_config())]
     config: String,
+
+    /// Run under Windows Service Control Manager
+    #[cfg(windows)]
+    #[arg(long)]
+    service: bool,
 
     /// Check configuration and exit
     #[arg(long)]
@@ -83,6 +90,21 @@ struct Cli {
     debug: bool,
 }
 
+fn default_config() -> String {
+    #[cfg(windows)]
+    {
+        service::data_directory()
+            .join("config")
+            .join("limpid.conf")
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(unix)]
+    {
+        "/etc/limpid/limpid.conf".to_owned()
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -113,6 +135,14 @@ fn main() -> Result<()> {
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
+    }
+
+    #[cfg(windows)]
+    if cli.service {
+        if is_cli_mode {
+            anyhow::bail!("--service cannot be combined with check, graph or test modes");
+        }
+        return service::run(&cli.config, cli.debug);
     }
 
     // Initialize tracing
@@ -228,6 +258,12 @@ fn run_daemon(config_path: &str) -> Result<()> {
         let compiled = compile_and_analyze(&config_file)?;
 
         let mut runtime = runtime::Runtime::start(compiled, config_file).await?;
+
+        #[cfg(windows)]
+        if let Err(error) = service::running() {
+            runtime.shutdown().await;
+            return Err(error);
+        }
 
         // Wait for signals
         loop {

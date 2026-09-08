@@ -1,0 +1,3 @@
+# Source-structure regression tests inspect Rust source with include_str!.
+# Keep their input identical on Windows and Unix checkouts.
+*.rs text eol=lf

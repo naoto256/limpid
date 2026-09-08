@@ -1210,7 +1210,7 @@ def pipeline zeek_full_otlp {
             "parse_bind",
             b"30-Apr-2026 10:23:45.123 client @0x1 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)",
         );
-        let bind_default_expected = chrono_tz::America::New_York
+        let bind_default_expected = chrono::Local
             .with_ymd_and_hms(2026, 4, 30, 10, 23, 45)
             .single()
             .unwrap()
@@ -1247,7 +1247,7 @@ def pipeline zeek_full_otlp {
             .unwrap()
             .timestamp_nanos_opt()
             .unwrap();
-        let nsp_local_expected = chrono_tz::America::New_York
+        let nsp_local_expected = chrono::Local
             .with_ymd_and_hms(2026, 5, 16, 10, 0, 0)
             .single()
             .unwrap()
@@ -1278,7 +1278,7 @@ def pipeline zeek_full_otlp {
             "parse_syslog | parse_paloalto_syslog",
             &paloalto_wire,
         );
-        let paloalto_local_expected = chrono_tz::America::New_York
+        let paloalto_local_expected = chrono::Local
             .with_ymd_and_hms(2026, 4, 30, 10, 23, 45)
             .single()
             .unwrap()
@@ -1381,7 +1381,7 @@ def pipeline zeek_full_otlp {
             .unwrap()
             .timestamp_nanos_opt()
             .unwrap();
-        let local_expected = chrono_tz::America::New_York
+        let local_expected = chrono::Local
             .with_ymd_and_hms(
                 source_time.year(),
                 source_time.month(),

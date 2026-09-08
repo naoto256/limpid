@@ -1375,6 +1375,13 @@ impl ModuleRegistry {
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<CreatedInput> {
         let type_name = properties.type_name();
+        #[cfg(windows)]
+        if type_name == "unix_socket" {
+            anyhow::bail!(
+                "input '{}': unix_socket requires Unix and is not available on Windows",
+                name
+            );
+        }
         let entry = self
             .inputs
             .get(type_name)
@@ -1397,6 +1404,13 @@ impl ModuleRegistry {
         ctx: &BuildContext,
     ) -> Result<CreatedOutput> {
         let type_name = properties.type_name();
+        #[cfg(windows)]
+        if type_name == "unix_socket" {
+            anyhow::bail!(
+                "output '{}': unix_socket requires Unix and is not available on Windows",
+                name
+            );
+        }
         let entry = self
             .outputs
             .get(type_name)
@@ -1440,8 +1454,14 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     register_input_type::<input::syslog_tcp::SyslogTcpInput>(registry, "syslog_tcp");
     register_input_type::<input::ltp::LtpInput>(registry, "ltp");
     register_input_type::<input::tail::TailInput>(registry, "tail");
+    #[cfg(windows)]
+    register_input_type::<input::windows_event_log::WindowsEventLogInput>(
+        registry,
+        "windows_event_log",
+    );
     register_input_type::<input::otlp::http::OtlpHttpInput>(registry, "otlp_http");
     register_input_type::<input::otlp::grpc::OtlpGrpcInput>(registry, "otlp_grpc");
+    #[cfg(unix)]
     register_input_type::<input::unix_socket::UnixSocketInput>(registry, "unix_socket");
     #[cfg(feature = "journal")]
     register_input_type::<input::journal::JournalInput>(registry, "journal");
@@ -1450,6 +1470,7 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     // Build-time dependencies (`error_log`, `funcs`) arrive via
     // `BuildContext` in `from_properties`.
     register_output_type::<output::file::FileOutput>(registry, "file");
+    #[cfg(unix)]
     register_output_type::<output::unix_socket::UnixSocketOutput>(registry, "unix_socket");
     register_output_type::<output::syslog_tcp::SyslogTcpOutput>(registry, "syslog_tcp");
     register_output_type::<output::http::HttpOutput>(registry, "http");

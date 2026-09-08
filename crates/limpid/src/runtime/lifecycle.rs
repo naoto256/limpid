@@ -49,7 +49,7 @@ pub(super) fn pipeline_task_kind(has_error_log: bool, has_disk_output: bool) -> 
 }
 
 pub(super) fn input_task_kind(input_type: &str) -> TaskKind {
-    if input_type == "journal" {
+    if matches!(input_type, "journal" | "windows_event_log") {
         TaskKind::MustJoin
     } else {
         TaskKind::AbortSafe

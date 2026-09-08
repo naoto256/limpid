@@ -18,10 +18,13 @@
 //! interpolated values can't introduce `/`, `\`, or `..` segments
 //! that would escape into sibling directories.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+#[cfg(not(windows))]
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
@@ -166,6 +169,14 @@ impl Module for FileOutput {
 
         let owner = props::get_string(properties, "owner");
         let group = props::get_string(properties, "group");
+
+        #[cfg(windows)]
+        if mode.is_some() || owner.is_some() || group.is_some() {
+            anyhow::bail!(
+                "output '{}': file mode/owner/group require Unix; configure Windows filesystem ACLs outside the DSL",
+                name
+            );
+        }
 
         Ok(Self {
             name: name.to_string(),
@@ -461,6 +472,13 @@ impl FileOutput {
         // its own semantics; the fallback open explicitly asks
         // O_NOFOLLOW so a symlink at the path is refused with ELOOP).
         let requires_metadata = self.requires_metadata();
+        #[cfg(windows)]
+        if requires_metadata {
+            anyhow::bail!(
+                "output '{}': file mode/owner/group require Unix; configure Windows filesystem ACLs outside the DSL",
+                self.name
+            );
+        }
 
         // Birth mode for the fresh-create branch.
         //
@@ -482,22 +500,34 @@ impl FileOutput {
         //   inode group-readable to the daemon's own primary group
         //   for the microseconds between `open(2)` and `fchown(2)`,
         //   which on shared hosts can be a real co-tenant.
+        #[cfg(unix)]
         let birth_mode: Option<u32> = match (self.mode, self.owner.as_ref(), self.group.as_ref()) {
             (None, None, None) => None,
             (_, Some(_), _) | (_, _, Some(_)) => Some(0o600),
             (Some(m), None, None) => Some(m),
         };
 
-        let mut create_options = OpenOptions::new();
-        create_options.write(true).create_new(true).append(true);
-        #[cfg(unix)]
-        {
-            create_options.custom_flags(libc::O_NOFOLLOW);
-            if let Some(m) = birth_mode {
-                create_options.mode(m);
+        #[cfg(not(windows))]
+        let create_res = {
+            let mut create_options = OpenOptions::new();
+            create_options.write(true).create_new(true).append(true);
+            #[cfg(unix)]
+            {
+                create_options.custom_flags(libc::O_NOFOLLOW);
+                if let Some(m) = birth_mode {
+                    create_options.mode(m);
+                }
             }
-        }
-        let create_res = create_options.open(&path).await;
+            create_options.open(&path).await
+        };
+        #[cfg(windows)]
+        let create_res = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || super::file_windows::create_new(&path))
+                .await
+                .context("Windows file output create task failed")?
+                .map(tokio::fs::File::from_std)
+        };
 
         let mut file = match create_res {
             Ok(f) => {
@@ -513,6 +543,7 @@ impl FileOutput {
                 // "already exists" branch, fstat it, see the umask
                 // default, and refuse — the failure is surfaced loud
                 // instead of degrading silently.
+                #[cfg(unix)]
                 if requires_metadata {
                     self.apply_file_metadata_to_fd(&f, &path).await?;
                 }
@@ -529,11 +560,25 @@ impl FileOutput {
                 // `verify_fd_is_regular_file` refuses on `S_ISFIFO`.
                 // For regular files (the only shape we accept downstream)
                 // O_NONBLOCK is a no-op on write.
-                let mut existing_options = OpenOptions::new();
-                existing_options.write(true).append(true);
-                #[cfg(unix)]
-                existing_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-                let f = existing_options.open(&path).await.map_err(|e| {
+                #[cfg(not(windows))]
+                let existing_res = {
+                    let mut existing_options = OpenOptions::new();
+                    existing_options.write(true).append(true);
+                    #[cfg(unix)]
+                    existing_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                    existing_options.open(&path).await
+                };
+                #[cfg(windows)]
+                let existing_res = {
+                    let path = path.clone();
+                    // The worker owns the handle throughout open and validation;
+                    // cancellation cannot leave a borrowed/reused handle behind.
+                    tokio::task::spawn_blocking(move || super::file_windows::open_existing(&path))
+                        .await
+                        .context("Windows file output open task failed")?
+                        .map(tokio::fs::File::from_std)
+                };
+                let f = existing_res.map_err(|e| {
                     #[cfg(unix)]
                     if e.raw_os_error() == Some(libc::ELOOP) {
                         return anyhow::anyhow!(
@@ -558,6 +603,7 @@ impl FileOutput {
                 // byte.
                 #[cfg(unix)]
                 Self::verify_fd_is_regular_file(&f, &path).await?;
+                #[cfg(unix)]
                 if requires_metadata {
                     self.verify_existing_file_metadata(&f, &path).await?;
                 }
@@ -714,7 +760,14 @@ impl FileOutput {
 /// or a Windows path separator. `.` is left alone — operators rely on
 /// dots for FQDN-style filenames (`web01.example.com.log`).
 fn sanitize_path_component(s: &str) -> String {
-    s.replace(['/', '\\'], "_")
+    #[cfg(windows)]
+    {
+        super::file_windows::sanitize_path_component(s)
+    }
+    #[cfg(not(windows))]
+    {
+        s.replace(['/', '\\'], "_")
+    }
 }
 
 /// Pass 2: error if any path component (slash-separated segment) is
@@ -764,6 +817,7 @@ impl FileOutput {
     /// against a fd that stays live even if the outer future is
     /// cancelled, and the `OwnedFd`'s `Drop` closes it deterministically
     /// on task exit (success, panic, or otherwise).
+    #[cfg(unix)]
     async fn apply_file_metadata_to_fd(&self, file: &tokio::fs::File, path: &Path) -> Result<()> {
         use std::os::fd::{FromRawFd, OwnedFd};
         use std::os::unix::io::AsRawFd;
@@ -880,6 +934,7 @@ impl FileOutput {
     /// blocking call even if the outer future is cancelled, so a
     /// concurrently-closed source `File` can't cause the fstat to hit
     /// an unrelated inode via fd reuse.
+    #[cfg(unix)]
     async fn verify_existing_file_metadata(
         &self,
         file: &tokio::fs::File,
@@ -1091,6 +1146,7 @@ impl FileOutput {
 // daemon startup a fixed 4 KiB buffer is comfortably larger than any
 // realistic passwd/group record. Stack-allocated so there's no heap
 // concern.
+#[cfg(unix)]
 const NSS_RECORD_BUF: usize = 4096;
 
 /// Resolve a username to its uid via `getpwnam_r`. The reentrant
@@ -1101,6 +1157,7 @@ const NSS_RECORD_BUF: usize = 4096;
 /// (`apply_file_metadata_to_fd` on create, `verify_existing_file_metadata`
 /// on subsequent writes), so the thread-safety guarantee is
 /// load-bearing, not defensive.
+#[cfg(unix)]
 fn resolve_uid(name: &str) -> Result<u32> {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
@@ -1138,6 +1195,7 @@ fn resolve_uid(name: &str) -> Result<u32> {
 
 /// Resolve a group name to its gid via `getgrnam_r`. Same thread-
 /// safety rationale as [`resolve_uid`].
+#[cfg(unix)]
 fn resolve_gid(name: &str) -> Result<u32> {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
@@ -1367,7 +1425,10 @@ mod tests {
             OwnedValue::String("C:\\Users\\bob".into()),
         );
         let (rendered, _) = render_path_owned(&out, &event).unwrap();
+        #[cfg(unix)]
         assert_eq!(rendered, "/var/log/C:_Users_bob.log");
+        #[cfg(windows)]
+        assert_eq!(rendered, "/var/log/C__Users_bob.log");
     }
 
     #[test]
@@ -2126,6 +2187,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn mode_parser_accepts_all_zero_forms() {
         // `0o0000` is a legitimate Unix mode (no permission bits set).
         // The parser used to `trim_start_matches('0')` first, which

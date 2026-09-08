@@ -1,0 +1,16 @@
+[package]
+name = "limpid-native-windows-file-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Direct tests of the production Windows file boundary. The complete daemon
+# and its pipeline/recovery tests must also pass before claiming OS support.
+[workspace]
+
+[lib]
+path = "lib.rs"
+
+[dev-dependencies]
+tempfile = "3"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

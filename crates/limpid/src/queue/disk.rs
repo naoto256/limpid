@@ -1108,7 +1108,10 @@ mod tests {
             assert!(receiver.recv().await.is_none(), "no duplicate tail record");
         };
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        // Native Windows flushes to storage for every record; retain the full
+        // conservation workload with a separate bounded native I/O budget.
+        let budget = if cfg!(windows) { 600 } else { 120 };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(budget), async {
             tokio::join!(write, read)
         })
         .await;

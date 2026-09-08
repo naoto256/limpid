@@ -1194,7 +1194,9 @@ mod tests {
         let disposition = consume_and_wait_disposition(
             &output,
             &event_with("retry-once"),
-            Duration::from_secs(2),
+            // Native Windows may spend several seconds rejecting a closed
+            // loopback port. Cover the client's 30s request timeout as well.
+            Duration::from_secs(35),
         )
         .await
         .unwrap();
@@ -1346,8 +1348,8 @@ def output o {{
     verify false
 }}
 "#,
-            cert_path.display(),
-            key_path.display()
+            cert_path.to_string_lossy().replace('\\', "/"),
+            key_path.to_string_lossy().replace('\\', "/")
         );
         // `verify false` must NOT discard the client identity. Old
         // behaviour: tls block silently ignored; reqwest builds a
@@ -1713,7 +1715,8 @@ def output o {{
         // notifies the actor (threshold=1), the actor takes the
         // 1-element batch and ships. The peer is unreachable so the
         // disposition lands as Recovered via the DLQ path.
-        let mut props = vec![peer_block("http://127.0.0.1:1/")];
+        let (addr, _post_count, server) = run_counting_failing_collector().await;
+        let mut props = vec![peer_block(&format!("http://{addr}/"))];
         props.push(prop_int("batch_size", 1));
         props.push(fast_retry_block());
         let output = HttpOutput::from_properties(
@@ -1736,6 +1739,8 @@ def output o {{
         let batch_len = output.sink.inner.batch.lock().await.len();
         assert_eq!(batch_len, 0, "actor must drain the singleton batch");
         let actor_spawned = output.sink.actor_handle.lock().await.is_some();
+        output.shutdown(None).await.unwrap();
+        server.abort();
         assert!(
             actor_spawned,
             "the flusher actor is spawned for every batch_size (singleton included)"
@@ -2619,10 +2624,7 @@ def output o {{
     /// only place handles resolve.
     #[tokio::test]
     async fn consume_shutdown_buffers_for_batched_http() {
-        // Unreachable peer: the goal is to verify *no* network call
-        // happens on `consume_shutdown` itself; any accidental
-        // routing to the steady-state send + retry loop would burn
-        // attempts here.
+        let (addr, post_count, server) = run_counting_failing_collector().await;
         let dir = tempfile::TempDir::new().unwrap();
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(
             dir.path().join("errored.jsonl"),
@@ -2634,7 +2636,7 @@ def output o {{
         let output = HttpOutput::from_properties(
             "test",
             &mp(&[
-                peer_block("http://127.0.0.1:1/"),
+                peer_block(&format!("http://{addr}/")),
                 prop_int("batch_size", 100),
                 prop_str("batch_timeout", "30s"),
                 fast_retry_block(),
@@ -2665,8 +2667,13 @@ def output o {{
             "ack must NOT resolve in consume_shutdown — only in the post-loop shutdown drain"
         );
 
-        // The follow-up shutdown drains it. Unreachable peer → DLQ + Recovered.
-        let _ = tokio::time::timeout(Duration::from_secs(2), output.shutdown(Some(&writer))).await;
+        assert_eq!(post_count.load(Ordering::Relaxed), 0);
+        // Allow the production 3s drain deadline, and observe completion.
+        tokio::time::timeout(Duration::from_secs(5), output.shutdown(Some(&writer)))
+            .await
+            .expect("shutdown must complete within its drain budget")
+            .unwrap();
+        server.abort();
         let disposition = rx.try_recv().expect("ack must resolve after shutdown");
         assert!(
             matches!(disposition.1, crate::queue::AckDisposition::Recovered),
@@ -2771,10 +2778,11 @@ def output o {{
     /// the abort surface the timer task used to expose.
     #[tokio::test]
     async fn flusher_actor_spawned_once_at_construction() {
+        let (addr, _post_count, server) = run_counting_failing_collector().await;
         let output = HttpOutput::from_properties(
             "test",
             &mp(&[
-                peer_block("http://127.0.0.1:1/"),
+                peer_block(&format!("http://{addr}/")),
                 prop_int("batch_size", 100),
                 prop_str("batch_timeout", "30s"),
                 fast_retry_block(),
@@ -2807,7 +2815,11 @@ def output o {{
         // Drain the buffer so the (a,b,c) handles do not leak unresolved
         // when the output drops at end-of-test. The peer is unreachable,
         // so all three route to the test-DLQ-recovery path.
-        let _ = tokio::time::timeout(Duration::from_secs(2), output.shutdown(None)).await;
+        tokio::time::timeout(Duration::from_secs(5), output.shutdown(None))
+            .await
+            .expect("shutdown must complete within its drain budget")
+            .unwrap();
+        server.abort();
     }
 
     /// Audit-identified leak (2026-06-27 follow-up): the flusher actor

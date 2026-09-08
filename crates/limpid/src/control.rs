@@ -20,11 +20,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(unix)]
 use anyhow::Context;
 use bytes::Bytes;
+#[cfg(windows)]
+use limpid_windows::pipe::{
+    Listener as UnixListener, Server as ControlStream, ServerRead as ControlRead,
+    ServerWrite as ControlWrite,
+};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
+#[cfg(unix)]
+use tokio::net::{
+    UnixListener, UnixStream as ControlStream,
+    unix::{OwnedReadHalf as ControlRead, OwnedWriteHalf as ControlWrite},
+};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -38,7 +48,10 @@ use crate::pipeline::RuntimeBlueprint;
 use crate::queue::QueueSender;
 use crate::tap::TapRegistry;
 
+#[cfg(unix)]
 const DEFAULT_SOCKET_PATH: &str = "/var/run/limpid/control.sock";
+#[cfg(windows)]
+const DEFAULT_SOCKET_PATH: &str = limpid_windows::pipe::DEFAULT_PATH;
 
 /// Maximum command line length (bytes). Prevents OOM from malicious clients.
 const MAX_COMMAND_LEN: usize = 4096;
@@ -116,6 +129,15 @@ pub type InputInjectTarget = (mpsc::Sender<Event>, Arc<crate::metrics::InputMetr
 /// Under packaged systemd units (`RuntimeDirectory=limpid` with
 /// `RuntimeDirectoryMode=0750`) the parent is already safe and this
 /// validation is a no-op except for the symlink check.
+#[cfg(windows)]
+pub fn validate_control_socket_parent(socket_path_config: Option<&str>) -> anyhow::Result<()> {
+    limpid_windows::pipe::validate_path(std::path::Path::new(
+        socket_path_config.unwrap_or(DEFAULT_SOCKET_PATH),
+    ))?;
+    Ok(())
+}
+
+#[cfg(unix)]
 pub fn validate_control_socket_parent(socket_path_config: Option<&str>) -> anyhow::Result<()> {
     let socket_path = PathBuf::from(
         socket_path_config
@@ -818,10 +840,6 @@ impl ControlServer {
                 }
             }
         }
-        #[cfg(not(unix))]
-        {
-            let _ = std::fs::remove_file(&self.socket_path);
-        }
     }
 }
 
@@ -835,7 +853,7 @@ fn send_control_startup(
 }
 
 async fn handle_connection(
-    stream: tokio::net::UnixStream,
+    stream: ControlStream,
     tap: Arc<TapRegistry>,
     metrics: Arc<Registry>,
     blueprint: Arc<RuntimeBlueprint>,
@@ -1154,8 +1172,8 @@ async fn handle_inject(
     kind: &str,
     name: &str,
     json_mode: bool,
-    mut reader: BufReader<tokio::io::Take<tokio::net::unix::OwnedReadHalf>>,
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    mut reader: BufReader<tokio::io::Take<ControlRead>>,
+    writer: &mut ControlWrite,
     input_senders: &HashMap<String, InputInjectTarget>,
     output_senders: &HashMap<String, QueueSender>,
 ) {
@@ -1288,7 +1306,7 @@ async fn handle_inject(
 async fn handle_tap(
     output_name: &str,
     mut subscription: crate::tap::TapSubscription,
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &mut ControlWrite,
     json_mode: bool,
     strip_workspace_json: bool,
 ) {
@@ -1358,7 +1376,7 @@ async fn handle_tap(
 // own unit-test surface. A shared "protocol crate" was rejected as
 // over-engineering for a two-writer, one-reader line protocol; these
 // tests are the cheaper alternative that still pin the parser end.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod protocol_round_trip_tests {
     use std::time::Duration;
 

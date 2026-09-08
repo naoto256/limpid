@@ -1509,7 +1509,7 @@ def output test {{
         let disp = consume_and_wait_disposition(
             &output,
             &event_with_egress(singleton_bytes(790)),
-            Duration::from_secs(2),
+            Duration::from_secs(35),
         )
         .await
         .unwrap();
