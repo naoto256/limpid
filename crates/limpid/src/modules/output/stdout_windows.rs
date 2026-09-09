@@ -436,7 +436,7 @@ mod tests {
         reader.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes.len(), 8 * 16384);
         let mut ids = Vec::new();
-        for frame in bytes.chunks_exact(16384) {
+        for frame in bytes.as_chunks::<16384>().0 {
             assert!(frame.iter().all(|byte| *byte == frame[0]));
             ids.push(frame[0]);
         }
