@@ -35,5 +35,11 @@ jobs:
           $package = @(Get-ChildItem '${{ runner.temp }}' -Directory -Filter 'limpid-package-*')
           if ($package.Count -ne 1) { throw 'Expected one candidate staging directory' }
           ./packaging/windows/test-install-acl.ps1 -PackageDirectory $package[0].FullName -ResultsDirectory '${{ runner.temp }}/limpid-acl-fixture'
+      - name: Uninstall membership contract (PowerShell)
+        shell: pwsh
+        run: ./packaging/windows/test-uninstall.ps1 -NativeLocalAccounts
+      - name: Uninstall membership contract (Windows PowerShell)
+        shell: powershell
+        run: ./packaging/windows/test-uninstall.ps1 -NativeLocalAccounts
       # SCM lifecycle, alternate-user ACL denial, and the supported OS/CPU
       # matrix remain separate acceptance checks; this job proves none of them.

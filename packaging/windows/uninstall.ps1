@@ -12,7 +12,16 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run from an elevated PowerShell session.' }
 $sid = ([Security.Principal.NTAccount]::new('NT SERVICE\limpid')).Translate([Security.Principal.SecurityIdentifier])
 $readers = Get-LocalGroup -SID 'S-1-5-32-573'
-if (Get-LocalGroupMember -Group $readers | Where-Object { $_.SID -eq $sid }) { Remove-LocalGroupMember -Group $readers -Member $sid.Value }
+# Do not enumerate unrelated members: unresolved domain SIDs can break that
+# cmdlet. Remove only our SID and tolerate only an already-absent membership.
+try {
+    Remove-LocalGroupMember -Group $readers -Member $sid.Value -ErrorAction Stop
+} catch {
+    if ($_.Exception.GetType().FullName -ne 'Microsoft.PowerShell.Commands.MemberNotFoundException' -or
+        $_.FullyQualifiedErrorId -ne 'MemberNotFound,Microsoft.PowerShell.Commands.RemoveLocalGroupMemberCommand') {
+        throw
+    }
+}
 & "$env:SystemRoot/System32/sc.exe" delete limpid
 if ($LASTEXITCODE -ne 0) { throw "Service removal failed: $LASTEXITCODE" }
 Write-Output 'Service registration removed. Binaries, configuration, state and logs were preserved.'
