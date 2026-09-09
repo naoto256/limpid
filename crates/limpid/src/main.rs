@@ -269,6 +269,9 @@ fn run_daemon(config_path: &str) -> Result<()> {
         loop {
             match signal::wait_for_signal().await? {
                 signal::SignalAction::Shutdown => {
+                    #[cfg(windows)]
+                    runtime.shutdown_with_progress(service::task_joined).await;
+                    #[cfg(not(windows))]
                     runtime.shutdown().await;
                     break;
                 }
