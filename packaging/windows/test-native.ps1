@@ -74,8 +74,13 @@ Run-Candidate '*[System[EventID=999999]]' '' {
     $reply = Invoke-Bounded $ctlExe @('--socket', $pipe, 'inject', 'input', 'source') $payload
     if (($reply | ConvertFrom-Json).injected -ne 1) { throw 'Injection count mismatch.' }
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
-    while (-not (Test-Path -LiteralPath $output) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 20 }
-    if ([IO.File]::ReadAllText($output) -cne "native-pipe-to-file`n") { throw 'File output bytes differ.' }
+    $written = ''
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $output) { $written = [IO.File]::ReadAllText($output) }
+        if ($written -ceq "native-pipe-to-file`n") { break }
+        Start-Sleep -Milliseconds 20
+    }
+    if ($written -cne "native-pipe-to-file`n") { throw 'File output bytes differ.' }
     $portReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     $portReservation.Start()
     $port = $portReservation.LocalEndpoint.Port

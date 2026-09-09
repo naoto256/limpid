@@ -1193,6 +1193,9 @@ def pipeline zeek_full_otlp {
         use chrono::TimeZone;
 
         if std::env::var_os("LIMPID_SYSTEM_TZ_TEST_CHILD").is_none() {
+            // TZ selects a non-UTC local zone on Unix. Chrono uses Windows'
+            // system timezone API instead on Windows; the default assertion
+            // below deliberately checks host-local behavior, not New York.
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("pipeline::tests::offsetless_source_times_use_vendor_defaults_and_timezone_overrides")

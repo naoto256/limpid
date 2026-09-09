@@ -191,6 +191,15 @@ pub(super) async fn shutdown_tasks_with_timeout(
     handles: &mut [TrackedTask],
     total_timeout: std::time::Duration,
 ) -> CleanupOutcome {
+    shutdown_tasks_with_progress(shutdown_tx, handles, total_timeout, || {}).await
+}
+
+async fn shutdown_tasks_with_progress(
+    shutdown_tx: &watch::Sender<bool>,
+    handles: &mut [TrackedTask],
+    total_timeout: std::time::Duration,
+    mut joined: impl FnMut() + Send,
+) -> CleanupOutcome {
     let _ = shutdown_tx.send(true);
     let started = tokio::time::Instant::now();
     let overall_deadline = started + total_timeout;
@@ -205,6 +214,7 @@ pub(super) async fn shutdown_tasks_with_timeout(
             Ok(result) => {
                 record_join_result(result);
                 task.handle = None;
+                joined();
             }
             Err(_) => break,
         }
@@ -232,6 +242,7 @@ pub(super) async fn shutdown_tasks_with_timeout(
             Ok(result) => {
                 record_join_result(result);
                 task.handle = None;
+                joined();
             }
             Err(_) => break,
         }
@@ -249,6 +260,7 @@ pub(super) async fn shutdown_tasks_with_timeout(
             && let Some(handle) = task.handle.take()
         {
             record_join_result(handle.await);
+            joined();
         }
     }
 
@@ -270,6 +282,7 @@ pub(super) async fn shutdown_tasks_with_timeout(
         if let Some(handle) = task.handle.as_mut() {
             record_join_result(handle.await);
             task.handle = None;
+            joined();
         }
     }
 
@@ -290,12 +303,20 @@ impl Runtime {
     }
 
     pub async fn shutdown(self) {
+        self.shutdown_with_progress(|| {}).await;
+    }
+
+    /// Reports completed task joins, never elapsed waiting time. The observer
+    /// is synchronous and owned by this shutdown, with no background notifier.
+    pub async fn shutdown_with_progress(self, joined: impl FnMut() + Send) {
         info!(
             "initiating graceful shutdown (timeout: {}s)",
             SHUTDOWN_TIMEOUT.as_secs()
         );
         let mut handles = self.handles;
-        let cleanup = shutdown_tasks(&self.shutdown_tx, &mut handles).await;
+        let cleanup =
+            shutdown_tasks_with_progress(&self.shutdown_tx, &mut handles, SHUTDOWN_TIMEOUT, joined)
+                .await;
         if cleanup.abort_safe_incomplete != 0 {
             error!(
                 "shutdown reached the {}s hard deadline — {} abort-safe task(s) remain incomplete after abort",
@@ -318,6 +339,42 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_progress_requires_join_and_retains_must_join_ownership() {
+        let (shutdown_tx, _) = watch::channel(false);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&progress);
+        let cleanup = tokio::spawn(async move {
+            let mut tasks = vec![TrackedTask {
+                kind: TaskKind::MustJoin,
+                handle: Some(tokio::spawn(async move { release_rx.await.unwrap() })),
+            }];
+            let outcome = shutdown_tasks_with_progress(
+                &shutdown_tx,
+                &mut tasks,
+                std::time::Duration::from_millis(10),
+                || {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .await;
+            assert!(tasks.iter().all(|task| task.handle.is_none()));
+            outcome
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert_eq!(progress.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            !cleanup.is_finished(),
+            "must-join owner must not be detached"
+        );
+        release_tx.send(()).unwrap();
+        assert!(cleanup.await.unwrap().must_join_exceeded_threshold);
+        assert_eq!(progress.load(std::sync::atomic::Ordering::SeqCst), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(progress.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn durability_owners_are_must_join_and_network_inputs_are_abort_safe() {

@@ -1,8 +1,9 @@
 # Native Windows stdout boundary tests
 
-Run `cargo test --locked --manifest-path crates/limpid/tests/native-windows-stdout/Cargo.toml --lib`
+On Windows, run `cargo test --locked --manifest-path crates/limpid/tests/native-windows-stdout/Cargo.toml --lib`
 from the worktree root. Tests use temporary files and anonymous pipes; they do
 not change the process stdout handle or require administrative privileges.
+The harness is gated by `cfg(windows)`; a successful command on another OS does not verify these native tests.
 
 The harness includes the production Windows transport source. The daemon's
 stdout output selects this transport on Windows and retains its common event

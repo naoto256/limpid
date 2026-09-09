@@ -14,14 +14,15 @@ jobs:
   kafka:
     runs-on: windows-latest
     timeout-minutes: 20
-    env:
-      # OpenSSL's MSVC-generated object paths can exceed MAX_PATH when the
-      # standalone harness inherits its deeply nested default target path.
-      CARGO_TARGET_DIR: '${{ runner.temp }}/limpid-kafka'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin-audit:2026-06-03 de0fac2 | v6.0.2
         with:
           persist-credentials: false
+      - name: Configure short Cargo target path
+        shell: pwsh
+        run: |
+          # OpenSSL's MSVC-generated object paths can exceed MAX_PATH in the default target path.
+          "CARGO_TARGET_DIR=$env:RUNNER_TEMP/limpid-kafka" >> $env:GITHUB_ENV
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pin-audit:2026-05-20 29eef33 | stable-branch
         with:
           components: clippy, rustfmt
