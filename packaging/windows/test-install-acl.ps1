@@ -16,20 +16,29 @@ $payload = Join-Path $sibling 'fixture.txt'
 [IO.File]::WriteAllText($payload, 'synthetic sibling fixture')
 $everyone = [Security.Principal.SecurityIdentifier]::new('S-1-1-0')
 $original = Get-Acl -LiteralPath $fixture
+$parentOwner = (Get-Acl -LiteralPath ([IO.Path]::GetDirectoryName($fixture))).GetOwner([Security.Principal.SecurityIdentifier]).Value
+Write-Output "ACL fixture: user=$($identity.User.Value); owner=$($original.GetOwner([Security.Principal.SecurityIdentifier]).Value); parentOwner=$parentOwner; administratorRole=$([Security.Principal.WindowsPrincipal]::new($identity).IsInRole($admins))"
 $parentAcl = Get-Acl -LiteralPath $fixture
 $parentAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyone, 'Write', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
 try {
     Set-Acl -LiteralPath $fixture -AclObject $parentAcl
     $parentBefore = (Get-Acl -LiteralPath $fixture).Sddl
     $siblingBefore = (Get-Acl -LiteralPath $sibling).Sddl
+    Write-Output 'Checking shared-parent acceptance before child creation.'
     Assert-TrustedWrites $fixture -SharedParent
     # Test the native ACL-at-creation path without elevation. Production uses
     # Administrators as owner and the virtual service SID; those assignments
     # still require the separate elevated installation test.
-    $admins = $identity.User
     $script:serviceSid = $system
     $managed = Join-Path $fixture 'config'
-    Set-ManagedDirectory $managed 'ReadAndExecute'
+    $trustedOwnersBefore = @($admins.Value, $system.Value, $identity.User.Value)
+    & {
+        # Keep the test owner substitution out of later parent trust checks.
+        $admins = $identity.User
+        Set-ManagedDirectory $managed 'ReadAndExecute'
+    }
+    $trustedOwnersAfter = @($admins.Value, $system.Value, $identity.User.Value)
+    if (($trustedOwnersAfter -join ',') -cne ($trustedOwnersBefore -join ',')) { throw 'Test owner substitution changed parent trust.' }
     $createdAcl = Get-Acl -LiteralPath $managed
     if (-not $createdAcl.AreAccessRulesProtected) { throw 'Child ACL must be protected at creation.' }
     $rules = $createdAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
@@ -39,6 +48,7 @@ try {
     $parentAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyone, 'DeleteSubdirectoriesAndFiles', 'Allow'))
     Set-Acl -LiteralPath $fixture -AclObject $parentAcl
     $rejected = $false
+    Write-Output 'Checking shared-parent DeleteChild rejection.'
     try { Assert-TrustedWrites $fixture -SharedParent }
     catch { if ($_.Exception.Message -like 'Untrusted write grant*') { $rejected = $true } else { throw } }
     if (-not $rejected) { throw 'Unsafe parent deletion grant accepted.' }
