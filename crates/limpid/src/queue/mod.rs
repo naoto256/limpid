@@ -580,6 +580,7 @@ impl SpinController {
 
 /// Handle for receiving events from a queue.
 pub struct QueueReceiver {
+    shutdown_progress: crate::shutdown_progress::ShutdownProgress,
     inner: ReceiverInner,
     name: Arc<String>,
     /// Adaptive spin-before-park controller applied inside
@@ -596,6 +597,12 @@ enum ReceiverInner {
 }
 
 impl QueueReceiver {
+    pub(crate) fn attach_shutdown_progress(
+        &mut self,
+        progress: crate::shutdown_progress::ShutdownProgress,
+    ) {
+        self.shutdown_progress = progress;
+    }
     pub(crate) fn depth(&self) -> u64 {
         match &self.inner {
             ReceiverInner::Memory(rx) => rx.len() as u64,
@@ -851,6 +858,7 @@ pub fn create_queue(
                 },
                 QueueReceiver {
                     inner: ReceiverInner::Memory(rx),
+                    shutdown_progress: Default::default(),
                     name: Arc::clone(&name),
                     spin_ctrl: SpinController::new(),
                 },
@@ -866,6 +874,7 @@ pub fn create_queue(
                 },
                 QueueReceiver {
                     inner: ReceiverInner::Disk(rx),
+                    shutdown_progress: Default::default(),
                     name: Arc::clone(&name),
                     spin_ctrl: SpinController::new(),
                 },
@@ -1017,15 +1026,13 @@ enum AckSender {
 }
 
 impl AckSender {
-    fn send(self, resolution: AckResolution) {
+    fn send(self, resolution: AckResolution) -> bool {
         match self {
-            Self::Resolution(tx) => {
-                let _ = tx.send(resolution);
-            }
+            Self::Resolution(tx) => tx.send(resolution).is_ok(),
             #[cfg(test)]
-            Self::LegacyTest(tx) => {
-                let _ = tx.send((resolution.position(), resolution.disposition()));
-            }
+            Self::LegacyTest(tx) => tx
+                .send((resolution.position(), resolution.disposition()))
+                .is_ok(),
         }
     }
 }
@@ -1038,6 +1045,7 @@ impl AckSender {
 /// to [`AckDisposition::Dropped`] for the unhealthy paths, and
 /// `debug_assert!`s the contract was met.
 pub struct QueueAckHandle {
+    shutdown_progress: Option<crate::shutdown_progress::ShutdownProgress>,
     tx: Option<AckSender>,
     /// Position the handle's event occupied in the source queue,
     /// captured at `recv()` time. Pre-fix the disk receiver advanced
@@ -1079,6 +1087,7 @@ impl QueueAckHandle {
     ) -> Self {
         Self {
             tx: Some(AckSender::Resolution(tx)),
+            shutdown_progress: None,
             position,
             resolved: false,
             emitted_ns,
@@ -1108,10 +1117,14 @@ impl QueueAckHandle {
         let elapsed = delivered_at.elapsed_since(self.emitted_ns);
         self.resolved = true;
         if let Some(tx) = self.tx.take() {
-            tx.send(AckResolution::Delivered {
+            let sent = tx.send(AckResolution::Delivered {
                 position: self.position,
                 elapsed,
             });
+            if sent && let Some(progress) = &self.shutdown_progress {
+                // Notification accepted, not a durable cursor commit.
+                progress.mark();
+            }
         }
     }
 
@@ -1120,9 +1133,12 @@ impl QueueAckHandle {
     pub fn resolve_recovered(mut self) {
         self.resolved = true;
         if let Some(tx) = self.tx.take() {
-            tx.send(AckResolution::Recovered {
+            let sent = tx.send(AckResolution::Recovered {
                 position: self.position,
             });
+            if sent && let Some(progress) = &self.shutdown_progress {
+                progress.mark();
+            }
         }
     }
 
@@ -1176,6 +1192,7 @@ impl QueueAckHandle {
         (
             Self {
                 tx: Some(AckSender::LegacyTest(tx)),
+                shutdown_progress: None,
                 position: AckPosition::Memory,
                 resolved: false,
                 emitted_ns: crate::time::UnixNanos::now(),
@@ -1196,6 +1213,7 @@ impl QueueAckHandle {
         (
             Self {
                 tx: Some(AckSender::LegacyTest(tx)),
+                shutdown_progress: None,
                 position,
                 resolved: false,
                 emitted_ns: crate::time::UnixNanos::now(),
@@ -1363,11 +1381,12 @@ pub async fn run_queue_consumer(
                                 if let Some(tap) = &tap {
                                     tap.emit(&format!("output {}", name), &event).await;
                                 }
-                                let handle = QueueAckHandle::new(
+                                let mut handle = QueueAckHandle::new(
                                     ack_tx.clone(),
                                     position,
                                     event.emitted_ns(),
                                 );
+                                handle.shutdown_progress = Some(receiver.shutdown_progress.clone());
                                 in_flight += 1;
                                 // `consume_shutdown` (not `consume`) — the
                                 // shutdown contract forbids the steady-state
@@ -1462,6 +1481,10 @@ pub async fn run_queue_consumer(
                         metrics.queue_depth.set(receiver.depth());
                     }
                     in_flight = in_flight.saturating_sub(1);
+                    // ACK bookkeeping completed, not a cursor-fsync guarantee.
+                    if !matches!(disposition, AckDisposition::Dropped) {
+                        receiver.shutdown_progress.mark();
+                    }
                     // Natural queue-closure or wedge exit: the
                     // consumer stopped accepting (queue drained or
                     // fail-stop wedged) and the last in-flight
@@ -1492,11 +1515,12 @@ pub async fn run_queue_consumer(
                         if let Some(tap) = &tap {
                             tap.emit(&format!("output {}", name), &event).await;
                         }
-                        let handle = QueueAckHandle::new(
+                        let mut handle = QueueAckHandle::new(
                             ack_tx.clone(),
                             position,
                             event.emitted_ns(),
                         );
+                        handle.shutdown_progress = Some(receiver.shutdown_progress.clone());
                         in_flight += 1;
                         if let Err(e) = writer.consume(&event, handle).await {
                             // Reaching here means the output returned an
@@ -1583,6 +1607,9 @@ pub async fn run_queue_consumer(
                 metrics.queue_depth.set(receiver.depth());
             }
             in_flight = in_flight.saturating_sub(1);
+            if !matches!(disposition, AckDisposition::Dropped) {
+                receiver.shutdown_progress.mark();
+            }
         }
     }
     if in_flight != 0 {
@@ -4076,5 +4103,40 @@ mod schema_splice_tests {
         );
         let marker = ["shutdown_change_is_terminal", "(&mut shutdown)"].concat();
         assert!(include_str!("mod.rs").contains(&marker));
+    }
+
+    #[test]
+    fn shutdown_progress_requires_successful_disposition_notification() {
+        let progress = crate::shutdown_progress::ShutdownProgress::default();
+        let observation = progress.begin();
+        let (mut delivered, mut rx) = super::QueueAckHandle::for_test();
+        delivered.shutdown_progress = Some(progress.clone());
+        assert!(
+            !observation.take(),
+            "handle creation/enqueue is not progress"
+        );
+        delivered.resolve_delivered();
+        assert!(observation.take());
+        assert!(
+            rx.try_recv().is_ok(),
+            "mark represents notification, not cursor commit"
+        );
+
+        let (mut recovered, mut rx) = super::QueueAckHandle::for_test();
+        recovered.shutdown_progress = Some(progress.clone());
+        recovered.resolve_recovered();
+        assert!(observation.take());
+        assert!(rx.try_recv().is_ok());
+
+        let (mut failed, rx) = super::QueueAckHandle::for_test();
+        failed.shutdown_progress = Some(progress.clone());
+        drop(rx);
+        failed.resolve_delivered();
+        assert!(!observation.take(), "a failed channel send is not progress");
+
+        let (mut dropped, _rx) = super::QueueAckHandle::for_test();
+        dropped.shutdown_progress = Some(progress.clone());
+        dropped.resolve_dropped();
+        assert!(!observation.take(), "Dropped must not hide a wedged output");
     }
 }

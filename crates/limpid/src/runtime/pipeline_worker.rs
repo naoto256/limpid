@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) struct PipelineContext {
+    pub(super) shutdown_progress: crate::shutdown_progress::ShutdownProgress,
     pub(super) output_senders: Arc<HashMap<String, QueueSender>>,
     /// Names of outputs whose queue backend is disk-based. Precomputed
     /// at startup from each output's parsed `QueueConfig` and handed
@@ -130,6 +131,8 @@ pub(super) async fn run_pipeline_workers(
                             &mut bump,
                         )
                         .await;
+                        // Processing completed; output enqueue is not delivery.
+                        ctx.shutdown_progress.mark();
                         bump.reset();
                     }
                     break;
@@ -153,6 +156,7 @@ pub(super) async fn run_pipeline_workers(
             &mut bump,
         )
         .await;
+        ctx.shutdown_progress.mark();
         bump.reset();
     }
 

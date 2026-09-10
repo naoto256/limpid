@@ -22,6 +22,7 @@ mod queue;
 mod runtime;
 #[cfg(windows)]
 mod service;
+mod shutdown_progress;
 mod signal;
 mod tap;
 mod time;
@@ -270,7 +271,9 @@ fn run_daemon(config_path: &str) -> Result<()> {
             match signal::wait_for_signal().await? {
                 signal::SignalAction::Shutdown => {
                     #[cfg(windows)]
-                    runtime.shutdown_with_progress(service::task_joined).await;
+                    runtime
+                        .shutdown_with_progress(service::shutdown_progress)
+                        .await;
                     #[cfg(not(windows))]
                     runtime.shutdown().await;
                     break;

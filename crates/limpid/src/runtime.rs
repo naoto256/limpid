@@ -27,6 +27,7 @@ mod lifecycle;
 use lifecycle::*;
 
 pub struct Runtime {
+    shutdown_progress: crate::shutdown_progress::ShutdownProgress,
     shutdown_tx: watch::Sender<bool>,
     handles: Vec<TrackedTask>,
     config_file: PathBuf,
@@ -103,6 +104,67 @@ use pipeline_worker::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_shutdown_reports_work_without_waiting_for_owner_join() {
+        let progress = crate::shutdown_progress::ShutdownProgress::default();
+        progress.mark(); // Steady-state work must not be replayed.
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let runtime = Runtime {
+            shutdown_progress: progress.clone(),
+            shutdown_tx,
+            handles: vec![TrackedTask {
+                kind: TaskKind::MustJoin,
+                handle: Some(tokio::spawn(async move {
+                    let _ = wait.await;
+                })),
+            }],
+            config_file: PathBuf::from("progress-test.limpid"),
+            blueprint: crate::pipeline::compile_runtime_blueprint(&compiled_config("")).unwrap(),
+            test_identity: runtime_test_identity(),
+        };
+        let (notify, mut notified) = mpsc::unbounded_channel();
+        let shutdown = tokio::spawn(runtime.shutdown_with_progress(move || {
+            let _ = notify.send(());
+        }));
+        shutdown_rx.changed().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), notified.recv())
+                .await
+                .is_err()
+        );
+        progress.mark();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), notified.recv())
+                .await
+                .unwrap(),
+            Some(())
+        );
+        assert!(
+            !shutdown.is_finished(),
+            "progress must not detach the owner"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1100), notified.recv())
+                .await
+                .is_err(),
+            "an idle tick is not another completion"
+        );
+        release.send(()).unwrap();
+        shutdown.await.unwrap();
+        assert_eq!(
+            notified.recv().await,
+            Some(()),
+            "final join is real progress"
+        );
+        progress.mark();
+        assert_eq!(
+            notified.recv().await,
+            None,
+            "no observer remains after shutdown"
+        );
+    }
     use crate::dsl::parser::parse_config;
     use crate::event::Event;
     use crate::metrics::{MetricsError, OutputMetrics, Registry};
@@ -351,6 +413,7 @@ mod tests {
         );
         let (shutdown_tx, handles) = guard.commit();
         let runtime = Runtime {
+            shutdown_progress: Default::default(),
             shutdown_tx,
             handles,
             config_file: PathBuf::from("success-test.limpid"),
@@ -644,6 +707,7 @@ mod tests {
             .unwrap();
         });
         let runtime = Runtime {
+            shutdown_progress: Default::default(),
             shutdown_tx,
             handles: vec![TrackedTask {
                 kind: TaskKind::AbortSafe,
@@ -1722,6 +1786,7 @@ def pipeline p {{ input source; output sink }}
 
         let disk_outputs = Arc::new(HashSet::new());
         let ctx_a = PipelineContext {
+            shutdown_progress: Default::default(),
             output_senders: Arc::new(HashMap::new()),
             disk_outputs: Arc::clone(&disk_outputs),
             funcs: Arc::new(FunctionRegistry::new()),
@@ -1730,6 +1795,7 @@ def pipeline p {{ input source; output sink }}
             error_log_fallback: crate::error_log::ErrorLogFallback::default(),
         };
         let ctx_b = PipelineContext {
+            shutdown_progress: Default::default(),
             output_senders: Arc::clone(&ctx_a.output_senders),
             disk_outputs: Arc::clone(&disk_outputs),
             funcs: Arc::clone(&ctx_a.funcs),
@@ -1817,6 +1883,7 @@ def pipeline p {{ input source; output sink }}
         tap.register("input a").await;
         tap.register("input b").await;
         let ctx = Arc::new(PipelineContext {
+            shutdown_progress: Default::default(),
             output_senders: Arc::new(HashMap::from([("sink".to_owned(), queue_sender)])),
             disk_outputs: Arc::new(HashSet::new()),
             funcs: Arc::new(FunctionRegistry::new()),
@@ -1972,6 +2039,7 @@ def pipeline p {{ input source; output sink }}
                 .expect("pipeline p"),
         );
         let ctx = PipelineContext {
+            shutdown_progress: Default::default(),
             // Empty output_senders → every `output` statement falls
             // into the "unknown output" arm and is reported as a
             // failed enqueue. This is exactly the codepath the runtime
@@ -2049,6 +2117,7 @@ def pipeline p {{ input source; output sink }}
             let error_log = Arc::new(crate::error_log::ErrorLogWriter::new(log_path.clone()));
             let guard = error_log.hold_write_lock_for_testing().await;
             let ctx = PipelineContext {
+                shutdown_progress: Default::default(),
                 output_senders: Arc::new(HashMap::new()),
                 disk_outputs: Arc::new(HashSet::new()),
                 funcs: Arc::new(FunctionRegistry::new()),
@@ -2130,6 +2199,7 @@ def pipeline p {{ input source; output sink }}
         let normal_timer = crate::metrics::InputQueueTimer::register(&registry, "normal").unwrap();
         let drain_timer = crate::metrics::InputQueueTimer::register(&registry, "drain").unwrap();
         let context = PipelineContext {
+            shutdown_progress: Default::default(),
             output_senders: Arc::new(HashMap::new()),
             disk_outputs: Arc::new(HashSet::new()),
             funcs: Arc::new(FunctionRegistry::new()),
@@ -2215,6 +2285,7 @@ def pipeline second { input i; output sink; finish }
         let workers: Vec<_> = workers.into_iter().map(Arc::new).collect();
         let timer = crate::metrics::InputQueueTimer::register(&registry, "i").unwrap();
         let context = PipelineContext {
+            shutdown_progress: Default::default(),
             output_senders: Arc::new(HashMap::new()),
             disk_outputs: Arc::new(HashSet::new()),
             funcs: Arc::new(FunctionRegistry::new()),
@@ -2346,12 +2417,24 @@ def pipeline second { input i; output sink; finish }
         assert!(!rollback_body.contains(".abort()"));
         let cleanup = &production[production.find("shutdown_tasks_with_timeout").unwrap()..guard];
         assert!(cleanup.contains("task.handle = None"));
-        assert!(cleanup.contains("task.handle.take()"));
+        let reaper = &cleanup[cleanup.find("async fn reap_tasks").unwrap()
+            ..cleanup
+                .find("async fn shutdown_tasks_with_progress")
+                .unwrap()];
+        let ready = reaper.find("std::task::Poll::Ready(result)").unwrap();
+        let cleared = reaper.find("task.handle = None").unwrap();
+        let observed = reaper.find("joined()").unwrap();
+        assert!(
+            ready < cleared && cleared < observed,
+            "consume each completed handle before publishing its completion"
+        );
         assert!(cleanup.contains("graceful_deadline"));
         assert!(cleanup.contains("overall_deadline"));
         assert!(cleanup.contains("TaskKind::AbortSafe"));
         assert!(cleanup.contains("TaskKind::MustJoin"));
-        assert!(cleanup.contains("Await every remaining owner before returning"));
+        assert!(
+            cleanup.contains("reap_tasks(handles, Some(TaskKind::MustJoin), &mut joined).await")
+        );
     }
 
     #[tokio::test]
@@ -2385,6 +2468,7 @@ def pipeline second { input i; output sink; finish }
         );
         let workers = vec![Arc::clone(&worker)];
         let ctx = PipelineContext {
+            shutdown_progress: Default::default(),
             output_senders: Arc::new(HashMap::new()),
             disk_outputs: Arc::new(HashSet::new()),
             funcs: Arc::new(FunctionRegistry::new()),

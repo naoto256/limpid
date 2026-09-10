@@ -32,7 +32,7 @@ struct Status {
 
 enum Update {
     State(u32, bool),
-    Joined,
+    Progress,
     Interrogate,
 }
 
@@ -42,11 +42,11 @@ impl Status {
             return None;
         }
         match update {
-            Update::Joined if self.state == SERVICE_STOP_PENDING => Some(Self {
+            Update::Progress if self.state == SERVICE_STOP_PENDING => Some(Self {
                 checkpoint: self.checkpoint.saturating_add(1),
                 ..self
             }),
-            Update::Joined => None,
+            Update::Progress => None,
             Update::Interrogate => Some(self),
             Update::State(state, failed) => {
                 if self.state == SERVICE_STOP_PENDING && state != SERVICE_STOPPED {
@@ -117,9 +117,9 @@ pub fn running() -> Result<()> {
     Ok(())
 }
 
-pub fn task_joined() {
+pub fn shutdown_progress() {
     if active()
-        && let Err(error) = publish(Update::Joined)
+        && let Err(error) = publish(Update::Progress)
     {
         tracing::warn!("SCM shutdown progress failed: {error}");
     }
@@ -241,15 +241,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_completed_joins_advance_stop_progress() {
+    fn only_completed_work_advances_stop_progress() {
         let initial = Status {
             state: SERVICE_START_PENDING,
             checkpoint: 1,
             failed: false,
         };
-        assert!(initial.next(Update::Joined).is_none());
+        assert!(initial.next(Update::Progress).is_none());
         let running = initial.next(Update::State(SERVICE_RUNNING, false)).unwrap();
-        assert!(running.next(Update::Joined).is_none());
+        assert!(running.next(Update::Progress).is_none());
         let stopping = running
             .next(Update::State(SERVICE_STOP_PENDING, false))
             .unwrap();
@@ -265,14 +265,14 @@ mod tests {
                 .next(Update::State(SERVICE_RUNNING, false))
                 .is_none()
         );
-        let progressed = stopping.next(Update::Joined).unwrap();
+        let progressed = stopping.next(Update::Progress).unwrap();
         assert_eq!(progressed.checkpoint, 2);
         let stopped = progressed
             .next(Update::State(SERVICE_STOPPED, false))
             .unwrap();
         assert_eq!(stopped.checkpoint, 0);
         for update in [
-            Update::Joined,
+            Update::Progress,
             Update::Interrogate,
             Update::State(SERVICE_STOP_PENDING, false),
             Update::State(SERVICE_STOPPED, false),
@@ -293,7 +293,7 @@ mod tests {
         ));
         std::thread::scope(|scope| {
             for update in [
-                Update::Joined,
+                Update::Progress,
                 Update::Interrogate,
                 Update::State(SERVICE_STOPPED, false),
             ] {
