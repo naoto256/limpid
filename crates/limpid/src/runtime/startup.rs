@@ -333,6 +333,7 @@ impl Runtime {
         // after its output factory succeeds, before the next await or fallible
         // edge.
         let mut startup_guard = StartupGuard::new(shutdown_tx);
+        let shutdown_progress = crate::shutdown_progress::ShutdownProgress::default();
 
         // --- 1. Create outputs (each output owns its own OutputMetrics) ---
         let mut output_senders: HashMap<String, QueueSender> = HashMap::new();
@@ -362,7 +363,7 @@ impl Runtime {
             // Retry config is parsed by each output's `from_properties`
             // (outputs own retry + DLQ). The runtime no longer needs a
             // copy here.
-            let (mut sender, receiver) = match queue::create_queue(name.clone(), queue_config) {
+            let (mut sender, mut receiver) = match queue::create_queue(name.clone(), queue_config) {
                 Ok(queue) => queue,
                 Err(error) => return Err(startup_guard.rollback(error).await),
             };
@@ -382,6 +383,7 @@ impl Runtime {
             };
 
             // Attach metrics so QueueSender::send counts events_received.
+            receiver.attach_shutdown_progress(shutdown_progress.clone());
             sender.attach_metrics(Arc::clone(&created.metrics));
             let output_metrics = Arc::clone(&created.metrics);
             let shutdown = shutdown_rx.clone();
@@ -450,6 +452,7 @@ impl Runtime {
             // call per event. No ordering guarantee between inputs.
             let workers: Arc<Vec<Arc<PipelineWorker>>> = Arc::new(pipelines);
             let ctx = PipelineContext {
+                shutdown_progress: shutdown_progress.clone(),
                 output_senders: Arc::clone(&output_senders),
                 disk_outputs: Arc::clone(&disk_outputs),
                 funcs: Arc::clone(&func_registry),
@@ -610,6 +613,7 @@ impl Runtime {
         let (shutdown_tx, handles) = startup_guard.commit();
         info!("limpid daemon started");
         Ok(Self {
+            shutdown_progress,
             shutdown_tx,
             handles,
             config_file,
