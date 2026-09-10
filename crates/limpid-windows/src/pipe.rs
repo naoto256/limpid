@@ -230,6 +230,31 @@ mod tests {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
     }
+
+    async fn assert_name_released(path: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match Listener::bind(path) {
+                Ok(listener) => {
+                    drop(listener);
+                    return;
+                }
+                Err(error) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "pipe name was not released before deadline: {error:?}"
+                    );
+                }
+            }
+            // Mio retains the handle until cancelled overlapped I/O completes.
+            // Let the driver process IOCP completions; only a successful
+            // first-instance bind, not elapsed time, proves name release.
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(1)),
+            )
+            .await;
+        }
+    }
     #[tokio::test]
     async fn first_instance_refuses_an_existing_listener() {
         let path = name();
@@ -258,7 +283,7 @@ mod tests {
             .unwrap()
             .unwrap();
         drop((client, server, listener));
-        assert!(Listener::bind(&path).is_ok());
+        assert_name_released(&path).await;
     }
 
     #[tokio::test]
@@ -282,10 +307,7 @@ mod tests {
             .unwrap();
         assert!(listener.pending.lock().await.spare.is_none());
         drop((client, server, listener));
-        assert!(
-            Listener::bind(&path).is_ok(),
-            "drop must release all owned instances"
-        );
+        assert_name_released(&path).await;
     }
 
     #[tokio::test]
@@ -317,7 +339,7 @@ mod tests {
         observed.sort();
         assert_eq!(observed, b"AB");
         drop((first, second, listener));
-        assert!(Listener::bind(&path).is_ok());
+        assert_name_released(&path).await;
     }
     #[test]
     fn only_local_pipe_names_are_accepted() {
