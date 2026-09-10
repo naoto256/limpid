@@ -194,6 +194,40 @@ pub(super) async fn shutdown_tasks_with_timeout(
     shutdown_tasks_with_progress(shutdown_tx, handles, total_timeout, || {}).await
 }
 
+// Poll every owner on each wake. A slow first owner must not hide another
+// owner's completion; completed handles are removed before any later poll.
+async fn reap_tasks(
+    handles: &mut [TrackedTask],
+    until: Option<TaskKind>,
+    joined: &mut (impl FnMut() + Send),
+) {
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for task in handles.iter_mut() {
+            if let Some(handle) = task.handle.as_mut() {
+                match std::future::Future::poll(std::pin::Pin::new(handle), cx) {
+                    std::task::Poll::Ready(result) => {
+                        record_join_result(result);
+                        task.handle = None;
+                        joined();
+                    }
+                    std::task::Poll::Pending => {
+                        if until.is_none_or(|kind| kind == task.kind) {
+                            pending = true;
+                        }
+                    }
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+}
+
 async fn shutdown_tasks_with_progress(
     shutdown_tx: &watch::Sender<bool>,
     handles: &mut [TrackedTask],
@@ -205,20 +239,8 @@ async fn shutdown_tasks_with_progress(
     let overall_deadline = started + total_timeout;
     let abort_reserve = ABORT_JOIN_RESERVE.min(total_timeout / 2);
     let graceful_deadline = overall_deadline - abort_reserve;
-
-    for task in handles.iter_mut() {
-        let Some(handle) = task.handle.as_mut() else {
-            continue;
-        };
-        match tokio::time::timeout_at(graceful_deadline, handle).await {
-            Ok(result) => {
-                record_join_result(result);
-                task.handle = None;
-                joined();
-            }
-            Err(_) => break,
-        }
-    }
+    let _ =
+        tokio::time::timeout_at(graceful_deadline, reap_tasks(handles, None, &mut joined)).await;
 
     let forced_abort = handles
         .iter()
@@ -230,39 +252,12 @@ async fn shutdown_tasks_with_progress(
             handle.abort();
         }
     }
-
-    for task in handles.iter_mut() {
-        if task.kind != TaskKind::AbortSafe {
-            continue;
-        }
-        let Some(handle) = task.handle.as_mut() else {
-            continue;
-        };
-        match tokio::time::timeout_at(overall_deadline, handle).await {
-            Ok(result) => {
-                record_join_result(result);
-                task.handle = None;
-                joined();
-            }
-            Err(_) => break,
-        }
-    }
-
-    // Consume MustJoin handles that completed by the health threshold before
-    // deciding whether the threshold was exceeded. This also preserves the
-    // one-poll ownership invariant for every completed handle.
-    for task in handles.iter_mut() {
-        if task.kind == TaskKind::MustJoin
-            && task
-                .handle
-                .as_ref()
-                .is_some_and(|handle| handle.is_finished())
-            && let Some(handle) = task.handle.take()
-        {
-            record_join_result(handle.await);
-            joined();
-        }
-    }
+    // Still reap completed MustJoin owners while waiting for AbortSafe cleanup.
+    let _ = tokio::time::timeout_at(
+        overall_deadline,
+        reap_tasks(handles, Some(TaskKind::AbortSafe), &mut joined),
+    )
+    .await;
 
     let abort_safe_incomplete = handles
         .iter()
@@ -271,21 +266,9 @@ async fn shutdown_tasks_with_progress(
     let must_join_exceeded_threshold = handles
         .iter()
         .any(|task| task.kind == TaskKind::MustJoin && task.handle.is_some());
-
-    // Must-join tasks own durability or disposition state. The 10-second
-    // deadline is a health threshold for them, never permission to abort or
-    // detach. Await every remaining owner before returning.
-    for task in handles.iter_mut() {
-        if task.kind != TaskKind::MustJoin {
-            continue;
-        }
-        if let Some(handle) = task.handle.as_mut() {
-            record_join_result(handle.await);
-            task.handle = None;
-            joined();
-        }
-    }
-
+    // The deadline is only a health threshold for durability/disposition owners.
+    // No MustJoin is aborted or detached; all retained handles remain owned.
+    reap_tasks(handles, Some(TaskKind::MustJoin), &mut joined).await;
     CleanupOutcome {
         forced_abort,
         abort_safe_incomplete,
@@ -306,17 +289,39 @@ impl Runtime {
         self.shutdown_with_progress(|| {}).await;
     }
 
-    /// Reports completed task joins, never elapsed waiting time. The observer
-    /// is synchronous and owned by this shutdown, with no background notifier.
-    pub async fn shutdown_with_progress(self, joined: impl FnMut() + Send) {
+    /// Reports completed work, never elapsed waiting time. A single blocked
+    /// operation without real progress can still exceed the SCM wait hint.
+    pub async fn shutdown_with_progress(self, mut notify: impl FnMut() + Send) {
         info!(
             "initiating graceful shutdown (timeout: {}s)",
             SHUTDOWN_TIMEOUT.as_secs()
         );
         let mut handles = self.handles;
+        let observing = self.shutdown_progress.begin();
         let cleanup =
-            shutdown_tasks_with_progress(&self.shutdown_tx, &mut handles, SHUTDOWN_TIMEOUT, joined)
-                .await;
+            shutdown_tasks_with_progress(&self.shutdown_tx, &mut handles, SHUTDOWN_TIMEOUT, || {
+                self.shutdown_progress.mark()
+            });
+        tokio::pin!(cleanup);
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let cleanup = loop {
+            tokio::select! {
+                biased;
+                outcome = &mut cleanup => {
+                    // One final flush of actual progress, not a trailing task.
+                    if observing.take() { notify(); }
+                    break outcome;
+                }
+                _ = tick.tick() => {
+                    if observing.take() { notify(); }
+                }
+            }
+        };
+        drop(observing);
         if cleanup.abort_safe_incomplete != 0 {
             error!(
                 "shutdown reached the {}s hard deadline — {} abort-safe task(s) remain incomplete after abort",
@@ -338,6 +343,51 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn shutdown_reaps_completed_owners_behind_a_pending_join() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (tx, _) = tokio::sync::watch::channel(false);
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let joined = Arc::new(AtomicUsize::new(0));
+        let observed = joined.clone();
+        let shutdown = tokio::spawn(async move {
+            let mut tasks = vec![
+                super::TrackedTask {
+                    kind: super::TaskKind::MustJoin,
+                    handle: Some(tokio::spawn(async move {
+                        let _ = wait.await;
+                    })),
+                },
+                super::TrackedTask {
+                    kind: super::TaskKind::MustJoin,
+                    handle: Some(tokio::spawn(async {})),
+                },
+            ];
+            super::shutdown_tasks_with_progress(
+                &tx,
+                &mut tasks,
+                std::time::Duration::from_secs(1),
+                || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+            assert!(tasks.iter().all(|task| task.handle.is_none()));
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let before_release = joined.load(Ordering::SeqCst);
+        assert!(!shutdown.is_finished());
+        release.send(()).unwrap();
+        shutdown.await.unwrap();
+        assert_eq!(
+            before_release, 1,
+            "a pending first owner must not hide later completions"
+        );
+        assert_eq!(joined.load(Ordering::SeqCst), 2);
+    }
     use super::*;
 
     #[tokio::test]
