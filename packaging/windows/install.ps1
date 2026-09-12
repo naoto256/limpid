@@ -1,3 +1,20 @@
+# Purpose: Install or upgrade the limpid Windows service, its binaries, and its
+# protected data directories. The service is registered but never started here.
+# Preconditions: Elevated PowerShell; the fixed InstallDirectory
+# %ProgramFiles%\limpid and DataDirectory %ProgramData%\limpid; the package
+# supplies limpid.exe, limpidctl.exe, limpid-prometheus.exe, and
+# limpid.conf.example alongside this script.
+# Modifies: Copies the three binaries into InstallDirectory and applies
+# protected ACLs (owner Administrators; SYSTEM and Administrators FullControl;
+# NT SERVICE\limpid ReadAndExecute or Modify per role). Creates
+# DataDirectory\{config,state,log} the same way, registers the SCM service via
+# Win32_Service Create (StartName NT SERVICE\limpid), switches StartupType to
+# Automatic, and adds the service SID to the built-in Event Log Readers group.
+# Preserves: An existing limpid.conf is left untouched; sibling directories
+# under DataDirectory keep their inherited ACLs (shared-parent rules only guard
+# against write grants that could delete or reparent the managed children);
+# an existing service registration that does not match this package is refused
+# rather than replaced, and the service is left stopped for operator review.
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [string]$PackageDirectory = $PSScriptRoot,
