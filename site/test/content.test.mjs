@@ -7,6 +7,22 @@ import { createHash } from "node:crypto";
 import PageTemplate from "../src/pages.11ty.js";
 import { url, origin } from "../lib/config.js";
 
+test("0.9.0 downloads match release asset targets without claiming full Windows acceptance", () => {
+  const renderer = new PageTemplate();
+  const html = renderer.render({
+    entry: pages().find((p) => p.kind === "home"),
+  });
+  for (const target of ["x86_64", "aarch64"]) {
+    assert.ok(
+      html.includes(
+        `/releases/download/v0.9.0/limpid-0.9.0-${target}-pc-windows-msvc.zip`,
+      ),
+    );
+  }
+  assert.ok(html.includes("/releases/download/v0.9.0/SHA256SUMS"));
+  assert.ok(html.includes("Windows requirements and validation boundaries"));
+});
+
 test("social metadata uses each page title and canonical URL with the approved common image", () => {
   const renderer = new PageTemplate();
   for (const entry of pages()) {
@@ -620,13 +636,13 @@ test("published version and pack references use the same release boundary", () =
   ]) {
     assert.match(
       readFileSync(`../crates/${name}/Cargo.toml`, "utf8"),
-      /\nversion = "0\.8\.4"/,
+      /\nversion = "0\.9\.0"/,
     );
   }
   assert.ok(
     markdown(
       "[Pack](https://github.com/naoto256/limpid/blob/main/packaging/snippets/README.md)",
-    ).includes("/blob/v0.8.4/"),
+    ).includes("/blob/v0.9.0/"),
   );
 });
 

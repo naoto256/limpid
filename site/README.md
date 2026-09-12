@@ -39,8 +39,8 @@ The renderer reads all 48 chapters directly, preserving code fences and copying
 the existing images. No generated Markdown is checked in. `packaging/snippets`
 and its xtask-managed inventory remain in their existing locations.
 
-The current site targets stable 0.8.4. Runtime and snippet links resolve to
-`v0.8.4`; documentation's Read source links use the checked-out Git commit.
+The current site targets stable 0.9.0. Runtime and snippet links resolve to
+`v0.9.0`; documentation's Read source links use the checked-out Git commit.
 Build publication artifacts only from a clean checkout: uncommitted local preview
 edits are not represented by that commit link. Publishing content for another
 version requires an explicit content review and a version update in `lib/config.js`.

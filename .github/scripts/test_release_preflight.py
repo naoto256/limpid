@@ -2,6 +2,8 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+import hashlib
+from zipfile import ZipFile
 from urllib.error import HTTPError, URLError
 
 spec = importlib.util.spec_from_file_location("release_preflight", Path(__file__).with_name("release_preflight.py"))
@@ -35,6 +37,74 @@ class ReleasePreflightTests(unittest.TestCase):
     def test_repository_release_metadata(self):
         preflight.release_metadata(REPO, None)
 
+    def asset_fixture(self):
+        incoming = self.root / "incoming"
+        incoming.mkdir()
+        for name in ("limpid", "limpid-prometheus"):
+            (incoming / f"{name}_0.8.1-1_amd64.deb").write_bytes(b"fixture deb")
+        for target in ("x86_64", "aarch64"):
+            with ZipFile(incoming / f"limpid-0.8.1-{target}-pc-windows-msvc.zip", "w") as archive:
+                lines = []
+                for name in ("limpid.exe", "limpidctl.exe", "limpid-prometheus.exe"):
+                    machine = 0xAA64 if target == "aarch64" else 0x8664
+                    payload = b"MZ" + bytes(58) + (64).to_bytes(4, "little") + b"PE\0\0" + machine.to_bytes(2, "little") + name.encode()
+                    archive.writestr(name, payload)
+                    lines.append(f"{hashlib.sha256(payload).hexdigest()}  {name}\n")
+                archive.writestr("SHA256SUMS", "".join(lines))
+                for name in ("install.ps1", "uninstall.ps1", "limpid.conf.example", "README.md", "snippets/example.limpid"):
+                    archive.writestr(name, "fixture")
+        return incoming
+
+    def test_asset_set_and_outer_checksums(self):
+        incoming = self.asset_fixture()
+        output = self.root / "output"
+        preflight.release_assets(incoming, output, "0.8.1")
+        lines = (output / "SHA256SUMS").read_text().splitlines()
+        self.assertEqual(len(lines), 4)
+        for line in lines:
+            digest, name = line.split("  ")
+            self.assertEqual(digest, hashlib.sha256((output / name).read_bytes()).hexdigest())
+        with self.assertRaises(preflight.SourceDefect):
+            preflight.release_assets(incoming, output, "0.8.1")
+
+    def test_asset_missing_extra_duplicate_rejected(self):
+        incoming = self.asset_fixture()
+        target = incoming / "limpid_0.8.1-1_amd64.deb"
+        payload = target.read_bytes()
+        target.unlink()
+        with self.assertRaises(preflight.SourceDefect):
+            preflight.release_assets(incoming, self.root / "output", "0.8.1")
+        target.write_bytes(payload)
+        extra = incoming / "extra"
+        extra.write_bytes(b"extra")
+        with self.assertRaises(preflight.SourceDefect):
+            preflight.release_assets(incoming, self.root / "output", "0.8.1")
+        extra.unlink()
+        (incoming / "other-job").mkdir()
+        (incoming / "other-job" / target.name).write_bytes(payload)
+        with self.assertRaises(preflight.SourceDefect):
+            preflight.release_assets(incoming, self.root / "output", "0.8.1")
+
+    def test_corrupt_windows_binary_rejected(self):
+        incoming = self.asset_fixture()
+        path = incoming / "limpid-0.8.1-aarch64-pc-windows-msvc.zip"
+        with ZipFile(path) as archive:
+            entries = {name: archive.read(name) for name in archive.namelist()}
+        entries["limpid.exe"] = b"changed"
+        with ZipFile(path, "w") as archive:
+            for name, payload in entries.items():
+                archive.writestr(name, payload)
+        with self.assertRaises(preflight.SourceDefect):
+            preflight.release_assets(incoming, self.root / "output", "0.8.1")
+
+    def test_wrong_architecture_with_valid_checksums_rejected(self):
+        incoming = self.asset_fixture()
+        x64 = incoming / "limpid-0.8.1-x86_64-pc-windows-msvc.zip"
+        arm = incoming / "limpid-0.8.1-aarch64-pc-windows-msvc.zip"
+        arm.write_bytes(x64.read_bytes())
+        with self.assertRaises(preflight.SourceDefect):
+            preflight.release_assets(incoming, self.root / "output", "0.8.1")
+
     def test_missing_or_whitespace_notes_fail(self):
         for text in ["## [Unreleased]\n", "## [0.8.1]\n \n## [0.8.0]\nold\n"]:
             (self.root / "CHANGELOG.md").write_text(text)
@@ -44,7 +114,7 @@ class ReleasePreflightTests(unittest.TestCase):
     def test_tag_manifest_schema_and_lock_mismatch_fail(self):
         with self.assertRaises(preflight.SourceDefect):
             preflight.release_metadata(self.root, "99.0.0")
-        for relative in ["crates/limpidctl/Cargo.toml", "Cargo.toml", "Cargo.lock"]:
+        for relative in ["crates/limpidctl/Cargo.toml", "crates/limpid-windows/Cargo.toml", "Cargo.toml", "Cargo.lock"]:
             path = self.root / relative
             original = path.read_text()
             path.write_text(original.replace('"0.8.1"', '"99.0.0"', 1))
