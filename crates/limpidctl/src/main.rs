@@ -36,7 +36,11 @@ const DEFAULT_SOCKET: &str = "/var/run/limpid/control.sock";
 const DEFAULT_SOCKET: &str = limpid_windows::pipe::DEFAULT_PATH;
 
 #[derive(Parser)]
-#[command(name = "limpidctl", about = "Control and debug CLI for limpid")]
+#[command(
+    name = "limpidctl",
+    version,
+    about = "Control and debug CLI for limpid"
+)]
 struct Cli {
     /// Control socket path
     #[arg(long, global = true, default_value = DEFAULT_SOCKET)]

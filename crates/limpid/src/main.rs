@@ -40,7 +40,7 @@ use crate::functions::FunctionRegistry;
 use crate::pipeline::{CompiledConfig, compile_runtime_blueprint, run_pipeline_blueprint};
 
 #[derive(Parser)]
-#[command(name = "limpid", about = "Log pipelines, limpid as intent.")]
+#[command(name = "limpid", version, about = "Log pipelines, limpid as intent.")]
 struct Cli {
     /// Configuration file
     #[arg(long, default_value_t = default_config())]
