@@ -81,7 +81,11 @@ const DROPPED_OWN_HELP: &str =
     "Total events dropped directly at this processing node, excluding direct child drops.";
 
 #[derive(Parser)]
-#[command(name = "limpid-prometheus", about = "Prometheus exporter for limpid")]
+#[command(
+    name = "limpid-prometheus",
+    version,
+    about = "Prometheus exporter for limpid"
+)]
 struct Cli {
     /// HTTP bind address
     #[arg(long, default_value = "127.0.0.1:9100")]
