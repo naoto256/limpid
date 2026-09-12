@@ -1,3 +1,15 @@
+# Purpose: Assemble a ZIP distribution that contains the three limpid binaries,
+# the installer and uninstaller scripts, the example configuration, this
+# directory's README, and the bundled snippet library, plus a SHA256SUMS
+# manifest for the binaries.
+# Preconditions: BinaryDirectory holds a fresh build of limpid.exe,
+# limpidctl.exe, and limpid-prometheus.exe; OutputPath does not yet exist so a
+# stale archive cannot be republished by accident.
+# Modifies: Creates a per-invocation staging directory next to OutputPath,
+# copies the payload into it, writes SHA256SUMS, and produces the archive.
+# Preserves: The BinaryDirectory sources are copied, not moved; the staging
+# directory is deliberately retained after the archive is written so the exact
+# contents can be inspected before distribution.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$BinaryDirectory,

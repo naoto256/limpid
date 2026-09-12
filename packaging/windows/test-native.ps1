@@ -1,4 +1,23 @@
 #requires -Version 7.0
+# Purpose: Drive pre-built limpid binaries as short-lived foreground processes
+# to verify the native control-pipe -> file output path, the Prometheus
+# exporter scrape, and the Event Log resume-plus-ACK checkpoint boundaries.
+# Preconditions: PowerShell 7.0+; BinaryDirectory holds limpid.exe,
+# limpidctl.exe, and limpid-prometheus.exe; ResultsDirectory does not yet
+# exist; the local Windows System log contains at least two existing events
+# so the resume assertion has a Bookmark it can advance from.
+# Modifies: Creates ResultsDirectory plus per-run subdirectories, spawns
+# daemon and exporter processes bound to a unique named pipe, writes the
+# generated configs, bookmarks, event JSONL, and captured stdout/stderr
+# beneath ResultsDirectory, and writes a summary result.txt on success.
+# Preserves: Existing System log entries are read-only through wevtutil qe;
+# the host binaries are not modified. Subprocesses are torn down with
+# Stop-Process, which is a foreground cleanup and explicitly NOT an SCM
+# stop or a graceful-shutdown assertion.
+# Test boundary: Native command boundaries only. SCM registration, service
+# identity, graceful shutdown, and installer ACL work are out of scope and
+# have separate tests. ResultsDirectory may contain local event data and is
+# kept private (do not commit its contents as repository fixtures).
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$BinaryDirectory,

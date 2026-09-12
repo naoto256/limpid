@@ -1,3 +1,15 @@
+# Purpose: Deregister the limpid Windows service and detach it from Event Log
+# Readers. Binaries, configuration, state, and logs stay on disk for the
+# operator to remove or reuse.
+# Preconditions: Elevated PowerShell; the service is currently Stopped and its
+# PathName plus StartName match a package-installed limpid.
+# Modifies: Removes the NT SERVICE\limpid membership from the built-in Event
+# Log Readers group (tolerating only an already-absent membership) and deletes
+# the SCM registration through sc.exe. A non-Stopped or non-matching service
+# is refused rather than acted on.
+# Preserves: Every file under %ProgramFiles%\limpid and %ProgramData%\limpid,
+# and every other membership of Event Log Readers (see the block below for the
+# SID-targeted removal rationale).
 [CmdletBinding(SupportsShouldProcess)]
 param()
 $ErrorActionPreference = 'Stop'
