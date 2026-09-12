@@ -24,6 +24,7 @@
 param([switch]$NativeLocalAccounts)
 $ErrorActionPreference = 'Stop'
 
+# === Mock membership block extraction ===
 $source = Get-Content -Raw (Join-Path $PSScriptRoot 'uninstall.ps1')
 $match = [regex]::Match($source, '(?ms)^\$readers =.*?(?=^& )')
 if (-not $match.Success) { throw 'Uninstall membership block not found.' }
@@ -35,6 +36,7 @@ if (-not ('Microsoft.PowerShell.Commands.MemberNotFoundException' -as [type])) {
     Add-Type 'namespace Microsoft.PowerShell.Commands { public class MemberNotFoundException : System.Exception {} }'
 }
 
+# === Mock membership test harness ===
 function Test-MembershipCase([string]$Case, [bool]$ExpectedContinue) {
     $sid = [pscustomobject]@{ Value = 'S-1-5-21-1-2-3-1001' }
     function Get-LocalGroup {
@@ -46,7 +48,11 @@ function Test-MembershipCase([string]$Case, [bool]$ExpectedContinue) {
     function Get-LocalGroupMember { throw 'Unrelated (possibly orphaned) members must not be enumerated.' }
     function Remove-LocalGroupMember {
         param($Group, $Member, $ErrorAction)
-        if ($Group -ne 'owned-mock-group' -or $Member -ne $sid.Value -or $ErrorAction -ne 'Stop') { throw 'Unexpected removal target/options.' }
+        if ($Group -ne 'owned-mock-group' -or
+            $Member -ne $sid.Value -or
+            $ErrorAction -ne 'Stop') {
+            throw 'Unexpected removal target/options.'
+        }
         if ($Case -in @('absent', 'wrong-error-id')) {
             $errorId = if ($Case -eq 'absent') { $absentId } else { 'UnexpectedError' }
             throw [Management.Automation.ErrorRecord]::new(
@@ -57,13 +63,23 @@ function Test-MembershipCase([string]$Case, [bool]$ExpectedContinue) {
         if ($Case -eq 'other') { throw 'Other failure.' }
     }
     $continued = $false
-    try { & $membership; $continued = $true } catch { }
-    if ($continued -ne $ExpectedContinue) { throw "Unexpected service-delete eligibility: $Case" }
+    try {
+        & $membership
+        $continued = $true
+    } catch { }
+    if ($continued -ne $ExpectedContinue) {
+        throw "Unexpected service-delete eligibility: $Case"
+    }
     Write-Output "Mock $Case PASS"
 }
-foreach ($case in @('member', 'absent', 'unrelated-orphan')) { Test-MembershipCase $case $true }
-foreach ($case in @('denied', 'missing-group', 'other', 'wrong-error-id')) { Test-MembershipCase $case $false }
+foreach ($case in @('member', 'absent', 'unrelated-orphan')) {
+    Test-MembershipCase $case $true
+}
+foreach ($case in @('denied', 'missing-group', 'other', 'wrong-error-id')) {
+    Test-MembershipCase $case $false
+}
 
+# === Native LocalAccounts probe (opt-in) ===
 if (-not $NativeLocalAccounts) { return }
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:OS -ne 'Windows_NT') {
     throw 'Native group probe is restricted to GitHub-hosted Windows runners.'
@@ -78,9 +94,14 @@ try {
     Add-LocalGroupMember -Group $probe -Member $memberSid -ErrorAction Stop
     Remove-LocalGroupMember -Group $probe -Member $memberSid -ErrorAction Stop
     $absent = $false
-    try { Remove-LocalGroupMember -Group $probe -Member $memberSid -ErrorAction Stop } catch {
+    try {
+        Remove-LocalGroupMember -Group $probe -Member $memberSid -ErrorAction Stop
+    } catch {
         Write-Output "Native absence type=$($_.Exception.GetType().FullName) FQID=$($_.FullyQualifiedErrorId)"
-        if ($_.Exception.GetType().FullName -ne 'Microsoft.PowerShell.Commands.MemberNotFoundException' -or $_.FullyQualifiedErrorId -ne $absentId) { throw }
+        if ($_.Exception.GetType().FullName -ne 'Microsoft.PowerShell.Commands.MemberNotFoundException' -or
+            $_.FullyQualifiedErrorId -ne $absentId) {
+            throw
+        }
         $absent = $true
     }
     if (-not $absent) { throw 'Expected the already-absent membership to be reported.' }
