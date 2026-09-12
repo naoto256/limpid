@@ -1,5 +1,21 @@
 # CLI
 
+## Version
+
+Use `--version` to identify the installed executable. Each command prints its
+program name and Cargo package version, then exits successfully without starting
+the daemon or Windows service, opening an HTTP listener, or connecting to the
+control socket. For the 0.9.0 release:
+
+```console
+$ limpid --version
+limpid 0.9.0
+$ limpidctl --version
+limpidctl 0.9.0
+$ limpid-prometheus --version
+limpid-prometheus 0.9.0
+```
+
 ## limpid
 
 ```bash
