@@ -1,4 +1,25 @@
 #requires -Version 5.1
+# Purpose: Verify uninstall.ps1's Event Log Readers membership-removal block
+# against every observed error shape (member/absent/orphan/denied/
+# missing-group/other/wrong-error-id), and optionally probe the native
+# Microsoft.PowerShell.LocalAccounts absence semantics on a hosted runner.
+# Preconditions: PowerShell 5.1+; on Windows the LocalAccounts module is
+# imported for a real MemberNotFoundException type, on other platforms a
+# stub type is added so the mock still parses. The native probe requires
+# -NativeLocalAccounts plus GITHUB_ACTIONS=true on a github-hosted Windows
+# runner and refuses to run elsewhere.
+# Modifies: Reads uninstall.ps1 as text, extracts the membership block via
+# regex, and evaluates it against shim Get-LocalGroup /
+# Remove-LocalGroupMember functions for each case. The native probe creates
+# a disposable local group (unique GUID name) and deletes it in a finally
+# block that revalidates the probe's SID before removal.
+# Preserves: uninstall.ps1 is only read, never rewritten; no machine group
+# other than the disposable probe is touched. Get-LocalGroupMember is
+# intentionally never called even in the shim so the mock cannot encourage
+# enumerating unrelated (possibly orphaned) SIDs.
+# Test boundary: Membership-removal contract only. SCM deletion, elevation,
+# and service identity checks belong to the elevated installation and
+# uninstallation tests.
 [CmdletBinding()]
 param([switch]$NativeLocalAccounts)
 $ErrorActionPreference = 'Stop'

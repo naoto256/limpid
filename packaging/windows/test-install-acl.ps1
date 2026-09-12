@@ -1,4 +1,21 @@
 #requires -Version 7.0
+# Purpose: Exercise install.ps1's ACL and shared-parent helpers against a
+# throwaway fixture, covering the native ACL-at-creation path and the
+# DeleteChild rejection contract.
+# Preconditions: PowerShell 7.0+; PackageDirectory is usable by install.ps1's
+# WhatIf preflight (which is dot-sourced to reuse the production helpers);
+# ResultsDirectory does not yet exist so no unrelated content is co-mingled.
+# Modifies: Creates the fixture, an unmanaged sibling with a payload file,
+# and a managed child directory, and grants Everyone Write on the fixture
+# parent so the acceptance and rejection paths can both be exercised. The
+# finally block restores the fixture's original ACL before returning.
+# Preserves: Nothing outside the fixture directory is touched. Sibling
+# payload bytes and both the parent and sibling SDDLs are asserted unchanged,
+# and the local $admins substitution used to bypass elevation is scoped to a
+# nested block so parent-trust checks stay honest.
+# Test boundary: Helper ACL verification only; this does not validate the
+# production Administrators owner or virtual service SID assignments, which
+# require the separate elevated installation test.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$PackageDirectory,
