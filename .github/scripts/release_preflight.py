@@ -62,7 +62,8 @@ def release_assets(incoming, output, version):
                 binaries = {"limpid.exe", "limpidctl.exe", "limpid-prometheus.exe"}
                 required = binaries | {"SHA256SUMS", "install.ps1", "uninstall.ps1", "limpid.conf.example", "README.md"}
                 require(required <= set(entries), f"Incomplete Windows ZIP: {path.name}")
-                require(any(n.startswith("snippets/") for n in entries), "ZIP snippets missing")
+                require(any(entry.filename.startswith("snippets/") and not entry.is_dir()
+                            for entry in archive.infolist()), "ZIP snippets missing")
                 checksums = archive.read("SHA256SUMS").decode("utf-8").splitlines()
                 parsed = [line.split("  ", 1) for line in checksums]
                 require(len(parsed) == 3 and all(len(p) == 2 for p in parsed), "Invalid binary checksum manifest")
