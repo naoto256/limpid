@@ -4,7 +4,7 @@ The homepage shows a pipeline, not a complete configuration. Here are the input,
 
 ## Use one release for the binary and snippets
 
-Use limpid **0.8.4** and the snippet library from the [v0.8.4 source tree](https://github.com/naoto256/limpid/tree/v0.8.4). From the root of that source tree, save the following as `fortigate.conf`. The relative includes also load the snippets' own helper dependencies; keep the library directory structure intact.
+Use limpid **0.9.0** and the snippet library from the [v0.9.0 source tree](https://github.com/naoto256/limpid/tree/v0.9.0). From the root of that source tree, save the following as `fortigate.conf`. The relative includes also load the snippets' own helper dependencies; keep the library directory structure intact.
 
 ```limpid
 include "packaging/snippets/parsers/parse_syslog.limpid"

@@ -4,9 +4,22 @@ on:
   push:
     tags:
       - 'v*'
+  pull_request:
+    branches: [main, 'release/*']
+    paths:
+      - 'Cargo.*'
+      - 'crates/**'
+      - 'packaging/**'
+      - 'CHANGELOG.md'
+      - '.github/scripts/**'
+      - '.github/workflows/release.yml'
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +27,7 @@ env:
 jobs:
   build-deb:
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # pin-audit:2026-06-03 de0fac2 | v6.0.2
         with:
@@ -27,12 +41,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Validate tag and extract release notes
-        id: notes
+      - name: Validate release metadata
         run: |
-          python3 .github/scripts/release_preflight.py \
-            --version "${GITHUB_REF_NAME#v}" \
-            --notes-output RELEASE_NOTES.md --github-output "$GITHUB_OUTPUT"
+          args=()
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then args=(--version "${GITHUB_REF_NAME#v}"); fi
+          python3 .github/scripts/release_preflight.py "${args[@]}"
 
       - name: Install system dependencies
         # `libsystemd-dev` is required by the `journal` feature; the
@@ -70,16 +83,118 @@ jobs:
           cargo deb -p limpid --no-build
           cargo deb -p limpid-prometheus --no-build
 
-      - name: Generate checksums
-        # SHA256SUMS lets consumers verify asset integrity offline
-        # (`sha256sum -c SHA256SUMS`). Basenames (not paths) so the
-        # check works from the download directory. Cryptographic
-        # provenance (attest-build-provenance) is a separate decision:
-        # it needs the `id-token: write` permission, so it is left to
-        # an explicit owner call rather than bundled here.
+      - name: Stage Debian assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # pin-audit:2026-09-13 ea165f8 | v4
+        with:
+          name: release-debian-amd64
+          path: target/debian/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin-audit:2026-06-03 de0fac2 | v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # pin-audit:2026-05-21 29eef33 | stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Verify native build prerequisites
         run: |
-          cd target/debian
-          sha256sum *.deb > SHA256SUMS
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw 'CMake is required' }
+          $platform = perl -MIPC::Cmd -e 'print $^O'
+          if ($LASTEXITCODE -ne 0 -or $platform -ne 'MSWin32') { throw 'Native Windows Perl with IPC::Cmd is required' }
+          # Keep vendored OpenSSL object paths below the Windows path limit.
+          "CARGO_TARGET_DIR=$env:RUNNER_TEMP/limpid-release" >> $env:GITHUB_ENV
+      - name: Build and check release binaries
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          # Kafka uses the existing Windows vendored dependency path; journal is Unix-only.
+          cargo build --release --locked --target $env:BUILD_TARGET -p limpid -p limpidctl -p limpid-prometheus --features kafka
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Metadata failed' }
+          $version = @($metadata.packages | Where-Object name -eq 'limpid')[0].version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$version") { throw 'Tag/version mismatch' }
+          $binaries = Join-Path $env:CARGO_TARGET_DIR "$env:BUILD_TARGET/release"
+          foreach ($name in @('limpid', 'limpidctl', 'limpid-prometheus')) {
+            $identity = & (Join-Path $binaries "$name.exe") --version
+            if ($LASTEXITCODE -ne 0 -or "$identity" -cne "$name $version") { throw "Binary version mismatch: $name" }
+          }
+          ./packaging/windows/build-package.ps1 -BinaryDirectory $binaries -OutputPath "release-assets/limpid-$version-$env:BUILD_TARGET.zip"
+      - name: Stage Windows asset
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # pin-audit:2026-09-13 ea165f8 | v4
+        with:
+          name: release-${{ matrix.target }}
+          path: release-assets/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  verify-assets:
+    needs: [build-deb, build-windows]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin-audit:2026-06-03 de0fac2 | v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # pin-audit:2026-06-03 a309ff8 | v6.2.0
+        with:
+          python-version: '3.11'
+      # Keep per-job directories: merging first could silently overwrite duplicate basenames.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # pin-audit:2026-09-13 d3f86a1 | v4
+        with:
+          pattern: release-*
+          path: incoming
+      - run: python3 .github/scripts/release_preflight.py --assets incoming --asset-output release-assets
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # pin-audit:2026-09-13 ea165f8 | v4
+        with:
+          name: verified-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    # PRs exercise build/verification without reaching the only write-capable job.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: verify-assets
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      # Cryptographic provenance is a separate owner decision: adding an
+      # attestation would also require id-token: write, which is not granted here.
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin-audit:2026-06-03 de0fac2 | v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # pin-audit:2026-06-03 a309ff8 | v6.2.0
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # pin-audit:2026-09-13 d3f86a1 | v4
+        with:
+          name: verified-release-assets
+          path: release-assets
+      - name: Validate tag and extract release notes
+        id: notes
+        run: |
+          python3 .github/scripts/release_preflight.py --version "${GITHUB_REF_NAME#v}" --notes-output RELEASE_NOTES.md --github-output "$GITHUB_OUTPUT"
+          (cd release-assets && sha256sum --strict -c SHA256SUMS)
 
       - name: Upload to GitHub Release
         env:
@@ -95,7 +210,9 @@ jobs:
           # `steps.notes.outputs.name`.
           RELEASE_TITLE: ${{ steps.notes.outputs.name }}
         run: |
+          # Require an existing remote tag, not gh's implicit tag creation.
+          # This is not signature verification; create also refuses an existing release.
           gh release create "${GITHUB_REF_NAME}" \
-            target/debian/*.deb target/debian/SHA256SUMS \
+            release-assets/* --verify-tag \
             --title "$RELEASE_TITLE" \
             --notes-file RELEASE_NOTES.md

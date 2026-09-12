@@ -30,7 +30,7 @@ Build the three binaries for the intended Windows architecture, then run:
 
 The archive contains the binaries, installer and uninstaller, example configuration, snippet library, and `SHA256SUMS` for the binaries. The package script refuses to overwrite an existing archive. Installation and lifecycle details are in [Windows service](./windows.md).
 
-The tag-driven release workflow currently publishes Debian artifacts only. Until a Windows release job is added, build, validate, and upload the Windows ZIP as an explicit release step.
+The tag-driven release workflow builds Debian packages with `journal,kafka` and Windows x64/ARM64 MSVC ZIPs with `kafka`. Windows artifacts are named `limpid-<version>-<target>.zip`. One publication job waits for every build, validates the complete asset set, and generates a release-level `SHA256SUMS` covering both Debian packages and both ZIPs. This outer manifest is separate from the binary manifest inside each ZIP. Pull requests exercise the builds without creating a release.
 
 ## Debian builds with optional features
 

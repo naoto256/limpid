@@ -98,10 +98,11 @@ export function pages() {
     "limpidctl",
     "limpid-prometheus",
     "limpid-metrics-schema",
+    "limpid-windows",
   ]) {
-    if (!read(`crates/${name}/Cargo.toml`).includes('\nversion = "0.8.4"\n')) {
+    if (!read(`crates/${name}/Cargo.toml`).includes('\nversion = "0.9.0"\n')) {
       throw new Error(
-        "Site targets stable 0.8.4; review content/version before building a different release",
+        "Site targets stable 0.9.0; review content/version before building a different release",
       );
     }
   }

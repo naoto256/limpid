@@ -5,8 +5,8 @@ export const base = process.env.SITE_BASE || "/limpid/";
 if (!/^\/(?:[a-zA-Z0-9_-]+\/)*$/.test(base))
   throw new Error("SITE_BASE must be an absolute directory path ending in /");
 export const url = (path = "") => base + path.replace(/^\//, "");
-export const release = "0.8.4";
-export const sourceRef = "v0.8.4";
+export const release = "0.9.0";
+export const sourceRef = "v0.9.0";
 export const repository = "https://github.com/naoto256/limpid";
 export const origin = process.env.SITE_ORIGIN || "https://naoto256.github.io";
 if (new URL(origin).origin !== origin || !origin.startsWith("https://"))

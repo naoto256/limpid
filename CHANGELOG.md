@@ -8,6 +8,10 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-13
+
+> Native Windows pipelines, explicit platform boundaries.
+
 ### Added — native Windows service and Event Log input
 
 - Added native Windows Service Control Manager integration with graceful STOP, PARAMCHANGE configuration reload, automatic boot start, and progress reporting during shutdown.
@@ -2571,7 +2575,8 @@ See `docs/src/operations/upgrade-0.3.md` for end-to-end migration recipes includ
 
 Initial public release. Rust + tokio log pipeline daemon replacing rsyslog / syslog-ng / fluentd with a single readable DSL (`def input`, `def process`, `def output`, `def pipeline`). Includes syslog (UDP/TCP/ TLS) / tail / journal / unix socket inputs; file / HTTP / Kafka / TCP / UDP / unix socket / stdout outputs; in-DSL expression language with parsers (JSON / KV / CEF / syslog), regex, string templates, tables with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`); hot reload via `SIGHUP` with automatic rollback; per-output disk-backed queues.
 
-[Unreleased]: https://github.com/naoto256/limpid/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/naoto256/limpid/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/naoto256/limpid/compare/v0.8.4...v0.9.0
 [0.8.4]: https://github.com/naoto256/limpid/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/naoto256/limpid/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/naoto256/limpid/compare/v0.8.1...v0.8.2

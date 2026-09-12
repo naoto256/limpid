@@ -22,7 +22,7 @@ Each option starts by forwarding the original line without parsing it. Its Forti
 }
 ```
 
-Save it as `event.json`. For the parsed variations, keep the [snippet library](https://github.com/naoto256/limpid/tree/v0.8.4/packaging/snippets) from the same release as your binary under `packaging/snippets/` beside the configuration. Keep its directory structure for helper includes. The example declares the device timezone as `UTC`; replace that with the device's actual IANA timezone or fixed offset. RFC 3164 has no year, so the parser supplies the runtime year. This sample is FortiGate **CEF**, not FortiGate's other syslog formats.
+Save it as `event.json`. For the parsed variations, keep the [snippet library](https://github.com/naoto256/limpid/tree/v0.9.0/packaging/snippets) from the same release as your binary under `packaging/snippets/` beside the configuration. Keep its directory structure for helper includes. The example declares the device timezone as `UTC`; replace that with the device's actual IANA timezone or fixed offset. RFC 3164 has no year, so the parser supplies the runtime year. This sample is FortiGate **CEF**, not FortiGate's other syslog formats.
 
 ## Option A: choose the JSON fields
 
@@ -103,7 +103,7 @@ Expand the received JSON event and inspect its nested `source`, `destination`, a
 
 ## Option B: preserve OTLP structure
 
-Use this configuration instead of Option A. Place the matching [compose_otlp.limpid snippet](https://github.com/naoto256/limpid/blob/v0.8.4/packaging/snippets/composers/compose_otlp.limpid) beside the configuration file. Datadog's direct OTLP logs intake accepts HTTP Protobuf at `/v1/logs`.
+Use this configuration instead of Option A. Place the matching [compose_otlp.limpid snippet](https://github.com/naoto256/limpid/blob/v0.9.0/packaging/snippets/composers/compose_otlp.limpid) beside the configuration file. Datadog's direct OTLP logs intake accepts HTTP Protobuf at `/v1/logs`.
 
 ```limpid
 include "compose_otlp.limpid"
