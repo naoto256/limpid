@@ -46,7 +46,7 @@ priority = "optional"
 depends = "limpid"
 assets = [
     ["target/release/limpid-prometheus", "usr/bin/", "755"],
-    ["../../packaging/limpid-prometheus.default", "etc/default/limpid-prometheus", "644"],
+    ["../../packaging/linux/limpid-prometheus.default", "etc/default/limpid-prometheus", "644"],
     ["../../packaging/grafana/limpid-dashboard.json", "usr/share/limpid/grafana/", "644"],
     ["../../packaging/grafana/limpid-alerts.yaml", "usr/share/limpid/grafana/", "644"],
 ]
@@ -59,4 +59,4 @@ assets = [
 # holding the syslog ports on upgrade). enable = true (the default,
 # stated for parity with limpid) leaves the exporter to start with the
 # daemon on the next boot / explicit `systemctl start`.
-systemd-units = { unit-name = "limpid-prometheus", unit-scripts = "../../packaging", enable = true, start = false }
+systemd-units = { unit-name = "limpid-prometheus", unit-scripts = "../../packaging/linux/systemd", enable = true, start = false }
