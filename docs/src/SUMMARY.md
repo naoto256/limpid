@@ -13,6 +13,7 @@
 - [DSL Syntax Basics](./dsl-syntax.md)
 - [Main Configuration](./configuration.md)
 - [Inputs](./inputs/README.md)
+  - [windows_event_log](./inputs/windows-event-log.md)
   - [raw_udp](./inputs/raw-udp.md)
   - [syslog_udp](./inputs/syslog-udp.md)
   - [syslog_tcp](./inputs/syslog-tcp.md)
@@ -59,4 +60,5 @@
 - [Error Log (DLQ)](./operations/error-log.md)
 - [Packaging](./operations/packaging.md)
 - [systemd](./operations/systemd.md)
+- [Windows service](./operations/windows.md)
 - [Migrating from rsyslog](./operations/migration.md)

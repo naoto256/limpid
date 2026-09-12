@@ -130,22 +130,25 @@ Other useful flags during config development:
 - `--test-pipeline <name> --input '<json>'` — run a single Event through one named pipeline without binding any sockets.
 
 See the [Getting Started guide](docs/src/getting-started.md) for installation, .deb packaging, and systemd integration.
+Windows 0.9.0 uses a ZIP package and native Windows service; see the [Windows service guide](docs/src/operations/windows.md).
 
 ## What's in the box
 
 ### Inputs
 
-`raw_udp` · `syslog_udp` · `syslog_tcp` (with optional TLS / mTLS) · `tail` · `journal`&nbsp;\* · `unix_socket` · `otlp_http` · `otlp_grpc` · `ltp`
+`raw_udp` · `syslog_udp` · `syslog_tcp` (with optional TLS / mTLS) · `tail` · `windows_event_log`&nbsp;† · `journal`&nbsp;\* · `unix_socket`&nbsp;‡ · `otlp_http` · `otlp_grpc` · `ltp`
 
 ### Outputs
 
-`syslog_udp` · `syslog_tcp` (with optional per-peer TLS / mTLS) · `file` · `http` (with per-peer TLS / mTLS, round-robin across peers) · `kafka`&nbsp;\* (with optional TLS / mTLS / SASL) · `unix_socket` · `stdout` · `otlp_http` / `otlp_grpc` (with per-peer TLS / mTLS, round-robin across peers) · `ltp`
+`syslog_udp` · `syslog_tcp` (with optional per-peer TLS / mTLS) · `file` · `http` (with per-peer TLS / mTLS, round-robin across peers) · `kafka`&nbsp;\* (with optional TLS / mTLS / SASL) · `unix_socket`&nbsp;‡ · `stdout` · `otlp_http` / `otlp_grpc` (with per-peer TLS / mTLS, round-robin across peers) · `ltp`
 
-\* `journal` and `kafka` are feature-gated — build with `--features journal` / `--features kafka` (see [Quick start](#quick-start)).
+- `*` `journal` and `kafka` are feature-gated — build with `--features journal` / `--features kafka` (see [Quick start](#quick-start)).
+- `†` `windows_event_log` is available on Windows only.
+- `‡` `unix_socket` input/output are available on Unix only.
 
 ### Snippets
 
-Curated parser / composer / filter library, installed under `/usr/share/limpid/snippets/` and `include`-able by absolute path. Introduced in **v0.7.0**, with the transport layer split out as its own snippet category in **v0.7.1** and the vendor lineup expanded across the 0.7.x line:
+Curated parser / composer / filter library, installed under `/usr/share/limpid/snippets/` on Linux and `include`-able there by absolute path. The Windows ZIP contains the same tree; copy the files you use under the configuration directory and include them by relative path. Introduced in **v0.7.0**, with the transport layer split out as its own snippet category in **v0.7.1** and the vendor lineup expanded across the 0.7.x line:
 
 - **Transport / format parsers (3)** — `parse_syslog` (RFC 3164 / 5424 syslog wire, v0.7.1) · `parse_journald` (systemd journald JSON, v0.7.1) · `parse_cef` (ArcSight CEF format from a syslog body, with a generic `cef_to_otlp` adapter). These populate `workspace.<layer>.*` and feed any vocabulary parser downstream — vendor CEF parsers chain as `parse_syslog | parse_cef | parse_<vendor>_cef`.
 - **Source / vocabulary parsers (29)** — security devices / cloud audit: `parse_fortigate_cef` · `parse_fortigate_syslog` · `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` · `parse_cloudtrail` · `parse_juniper_srx_sd_syslog` (Junos structured-data) · `parse_juniper_srx_syslog` (Junos unstructured RT_IDP) · `parse_checkpoint_leef` (LEEF 2.0 / QRadar) · `parse_checkpoint_syslog` (Check Point Syslog Exporter) · `parse_nsp` (Trellix Network Security Platform). OSS NDR: `parse_suricata` (EVE JSON) · `parse_zeek_default` / `parse_zeek_soc` / `parse_zeek_full` (Zeek 8 / 20 / 43 protocol scripts, nested-superset scopes, with `_native` / `_flat` convenience variants for raw Zeek vs Filebeat-flat upstream). Cloud (audit / data-plane / findings / identity / orchestration): `parse_aws_guardduty` · `parse_aws_vpc_flow` · `parse_azure_activity` · `parse_k8s_audit` · `parse_okta_system`. Server / host vocabulary: `parse_openssh` · `parse_sudo` · `parse_combined_log` (Apache / Nginx) · `parse_postfix` · `parse_winevent_json` · `parse_sysmon` · `parse_bind` · `parse_auditd` (7 LSIS classes). Vendor-neutral: `parse_ocsf`.
@@ -228,7 +231,7 @@ and service reload procedures, see [Packaging](docs/src/operations/packaging.md#
 - [Process Design Guide](docs/src/processing/design-guide.md) · [User-defined Processes](docs/src/processing/user-defined.md)
 - [Functions](docs/src/functions/README.md) · [Built-in Functions](docs/src/functions/expression-functions.md) · [User-defined Functions](docs/src/functions/user-defined.md)
 - [Pipelines](docs/src/pipelines/README.md) · [Routing](docs/src/pipelines/routing.md) · [`drop`, `finish`, and `error`](docs/src/pipelines/drop-finish-error.md) · [Examples](docs/src/pipelines/examples.md) · [Multi-host Pipeline Example](docs/src/pipelines/multi-host.md)
-- [CLI](docs/src/operations/cli.md) · [Debug Tap](docs/src/operations/tap.md) · [Error Log (DLQ)](docs/src/operations/error-log.md) · [Schema Validation](docs/src/operations/schema-validation.md) · [Metrics](docs/src/operations/metrics.md) · [Packaging](docs/src/operations/packaging.md) · [systemd](docs/src/operations/systemd.md)
+- [CLI](docs/src/operations/cli.md) · [Debug Tap](docs/src/operations/tap.md) · [Error Log (DLQ)](docs/src/operations/error-log.md) · [Schema Validation](docs/src/operations/schema-validation.md) · [Metrics](docs/src/operations/metrics.md) · [Packaging](docs/src/operations/packaging.md) · [systemd](docs/src/operations/systemd.md) · [Windows service](docs/src/operations/windows.md)
 - [OTLP — design rationale](docs/src/otlp.md)
 - [Migrating from rsyslog](docs/src/operations/migration.md)
 

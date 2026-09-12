@@ -1,6 +1,6 @@
 # file
 
-Appends event `egress` bytes to a local file. Supports dynamic path templates (full DSL expressions) and file permission control.
+Appends event `egress` bytes to a local file. Supports dynamic path templates (full DSL expressions). Unix builds also support file permission and ownership control.
 
 ## Configuration
 
@@ -22,6 +22,8 @@ def output archive {
 | `mode` | no | See [Permissions contract](#permissions-contract) below — umask-derived when `mode` / `owner` / `group` are all unset; new file born `0o600` and `fchmod`'d nowhere further when `owner` or `group` are set with `mode` omitted; born directly at the configured `mode` when `mode` is set without `owner` / `group`; ownership applied first and then `fchmod` to `mode` when `mode` accompanies `owner` / `group` | Octal file permissions (e.g., `"0640"`) |
 | `owner` | no | process user | File owner (requires `CAP_CHOWN`) |
 | `group` | no | process group | File group |
+
+On Windows, `mode`, `owner`, and `group` are rejected with a configuration error. Configure filesystem ACLs outside the DSL. The other file-output behavior on this page, including regular-file checks and path interpolation, applies on Windows unless a section refers to a Unix syscall or mode bit.
 
 **Regular-file contract.** The output only ever writes to a regular
 file at `path`. If the path already exists and points at a symlink,

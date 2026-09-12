@@ -8,6 +8,25 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Added — native Windows service and Event Log input
+
+- Added native Windows Service Control Manager integration with graceful STOP, PARAMCHANGE configuration reload, automatic boot start, and progress reporting during shutdown.
+- Added `windows_event_log`, which subscribes through the native Event Log API, emits the complete raw XML plus a JSON projection that preserves duplicate EventData fields, and advances an optional native bookmark after pipeline completion.
+- Added local named-pipe control for the daemon, `limpidctl`, and `limpid-prometheus`, with first-instance ownership and ACLs restricted to the service identity, SYSTEM, and Administrators.
+- Added native Windows handling for file tail identity, file and stdout output, LTP private-key ACL validation, and the vendored Kafka build.
+
+### Added — Windows ZIP service package
+
+The package contains ARM64 or x64 native binaries, PowerShell install/uninstall scripts, the example Event Log pipeline, snippets, and binary SHA-256 checksums. It installs under Program Files, keeps configuration/state/logs under ProgramData, and runs as `NT SERVICE\limpid`. Upgrades and uninstall preserve operator data. MSI packaging is deferred.
+
+### Changed — platform-specific configuration is explicit
+
+Windows defaults to `%ProgramData%\limpid\config\limpid.conf` and `\\.\pipe\limpid-control`. Unix defaults remain unchanged. `file` output accepts native Windows paths but rejects the Unix-only `mode`, `owner`, and `group` properties; `journal` and Unix sockets remain Unix-only.
+
+### Validation — Windows 11 ARM64
+
+Saved results from earlier integration builds cover package install and upgrade, service identity and ACL isolation, Event Log bookmark resume, named-pipe control and exporter scrape, configuration reload, graceful stop, and automatic start after reboot; they are not a full-matrix rerun on every later candidate. The integrated candidate also completed a long-running SCM stop with observable progress and mixed delivery/recovery. No-progress stalls and higher-level control-client timeouts remain untested. Windows 11 x64 and Windows Server 2022 or later x64 remain release targets pending the same native acceptance run. The ZIP configures boot start but does not yet configure SCM recovery actions after an unexpected process termination.
+
 ## [0.8.4] - 2026-09-06
 
 > Static string objects for explicit header configuration.

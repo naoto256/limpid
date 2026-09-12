@@ -26,6 +26,7 @@ Rules:
 
 - Relative paths resolve against the **including file's** directory.
 - Absolute paths are rejected, **except** under `/usr/share/limpid/snippets/` (the shipped snippet library — see [Snippet Library](./snippets/README.md)).
+- On Windows, copy packaged snippets beneath the configuration directory and use relative includes. The ZIP installer does not install a Windows system-snippet tree.
 - Nested includes are supported — an included file may itself contain `include` directives. The same file is loaded only once even if multiple parents reference it (diamond-safe). Cycles are detected and reported as a parse error.
 - Glob patterns are supported.
 
@@ -71,7 +72,7 @@ stderr.
 
 ### control
 
-Configures the runtime control surface — the Unix socket used by `limpidctl` and the Prometheus exporter, plus the optional dead-letter queue file.
+Configures the runtime control surface — the local Unix socket or Windows named pipe used by `limpidctl` and the Prometheus exporter, plus the optional dead-letter queue file.
 
 ```limpid
 control {
@@ -82,7 +83,7 @@ control {
 
 | Property | Default | Effect |
 |----------|---------|--------|
-| `socket` | `/var/run/limpid/control.sock` | Unix socket path consumed by `limpidctl` and `limpid-prometheus`. |
+| `socket` | `/var/run/limpid/control.sock` on Unix; `\\.\pipe\limpid-control` on Windows | Local control endpoint consumed by `limpidctl` and `limpid-prometheus`. Windows accepts local `\\.\pipe\<name>` paths only. |
 | `error_log` | *(unset)* | JSONL file appended to when an event terminates at a producer site that needs replay — pipeline-side process / pipeline-skeleton runtime errors and sink-side retry exhaustion / shutdown-drain / enqueue failures (see [Error Log → Producer sites](./operations/error-log.md#producer-sites)). When unset, every failure site emits a one-line `tracing::error!` summary — payload is not persisted anywhere by default. Strongly recommended when any output declares `retry` or is a batched OTLP/HTTP output — `--check` warns (see [Error Log → Recovery readiness check](./operations/error-log.md#recovery-readiness-check---check)). See [Error Log (DLQ)](./operations/error-log.md) for the current v3 record format and flavor-aware replay recipes. |
 | `error_log_fallback` | `"off"` | Confidentiality policy for the tracing-side fallback line when `error_log` is set but its write fails: `"off"` (default) keeps the line payload-free, `"meta"` adds structured metadata (timestamp, size, queue position — no payload bytes), `"full"` attaches the full event JSONL via an `event_record` field. Only takes effect when `error_log` is also set; `--check` warns on the inert combination. See [Error Log → Tracing fallback ladder](./operations/error-log.md#tracing-fallback-ladder-error_log_fallback). |
 

@@ -28,6 +28,21 @@ cargo build --release -p limpid --features kafka
 cargo build --release -p limpid --features journal,kafka
 ```
 
+## Installing on Windows
+
+The Windows distribution is a ZIP with native binaries and PowerShell scripts. It requires the Microsoft Visual C++ runtime for the package architecture.
+
+Extract the archive, open elevated 64-bit PowerShell in that directory, and run:
+
+```powershell
+.\install.ps1
+& "$env:ProgramFiles\limpid\limpid.exe" --check `
+  --config "$env:ProgramData\limpid\config\limpid.conf"
+Start-Service limpid
+```
+
+The installer registers `NT SERVICE\limpid`, protects the ProgramData directories, and enables automatic boot start. It leaves the service stopped on first installation so the generated configuration can be reviewed first. See [Windows service](./operations/windows.md) for Event Log setup, control commands, upgrades, security boundaries, and the tested platform matrix.
+
 ## Installing the .deb packages
 
 ```bash
