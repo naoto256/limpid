@@ -551,7 +551,7 @@ test("docs directory shows Configuration parents without hiding sidebar children
   });
   for (const item of children)
     assert.ok(article.includes(`href="${url(item.route)}"`));
-  assert.equal(entry.nav.length, 48);
+  assert.equal(entry.nav.length, 50);
 });
 
 test("every existing chapter is rendered once, without an authored content copy", () => {
@@ -559,14 +559,33 @@ test("every existing chapter is rendered once, without an authored content copy"
     (x) => x.endsWith(".md") && x !== "SUMMARY.md",
   );
   const docs = pages().filter((x) => x.kind === "docs");
-  assert.equal(docs.length, 48);
+  assert.equal(docs.length, 50);
   assert.deepEqual(docs.map((x) => x.file).sort(), files.sort());
   assert.equal(new Set(pages().map((x) => x.route)).size, pages().length);
 });
 
 test("navigation links, README routes and repeated headings retain usable targets", () => {
   assert.equal(route("pipelines/README.md"), "docs/pipelines/index.html");
-  assert.equal(navigation().length, 48);
+  assert.equal(navigation().length, 50);
+  for (const [file, expectedRoute] of [
+    ["inputs/windows-event-log.md", "docs/inputs/windows-event-log.html"],
+    ["operations/windows.md", "docs/operations/windows.html"],
+  ]) {
+    assert.equal(route(file), expectedRoute);
+    assert.equal(
+      navigation().filter((item) => item.route === expectedRoute).length,
+      1,
+    );
+    assert.equal(
+      pages().filter(
+        (page) =>
+          page.kind === "docs" &&
+          page.file === file &&
+          page.route === expectedRoute,
+      ).length,
+      1,
+    );
+  }
   const result = markdown(
     "# Hello\n\n## Hello\n\n[Route](../pipelines/README.md#basic-structure)",
     "operations/cli.md",
