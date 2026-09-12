@@ -1,8 +1,8 @@
 # Windows ZIP package
 
-This directory builds the Windows ZIP package for the unreleased 0.9.0 line.
-It is not a released support announcement. Initial packaging is ZIP +
-PowerShell; MSI remains a future option.
+This directory builds the Windows ZIP package for 0.9.0.
+Distribution artifacts do not establish full OS/service acceptance. Packaging
+is ZIP + PowerShell; MSI remains a future option.
 
 Saved results from earlier Windows 11 ARM64 integration builds cover
 install, first start, service ACLs, Event Log collection and bookmark resume,
@@ -67,6 +67,9 @@ the control pipe or read LTP keys; and upgrade/uninstall preserve existing
 configuration and bookmarks. Native foreground tests do not establish SCM
 behavior. Debug candidate archives are for validation, not release assets.
 
-The tag-driven release workflow currently publishes Debian artifacts only.
-Build, validate, and upload the final Windows ZIP explicitly until that workflow
-gains a Windows release job.
+The tag-driven release workflow builds x64 and ARM64 MSVC ZIPs with Kafka
+support alongside the Debian packages. Archives are named
+`limpid-<version>-<target>.zip`; the release-level `SHA256SUMS` covers each ZIP
+and Debian package, while the ZIP's own manifest covers its three binaries.
+The release is created only after all build jobs succeed. Native build checks
+do not replace the acceptance matrix above.

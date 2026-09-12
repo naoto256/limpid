@@ -4,7 +4,7 @@ limpid 0.9.0 uses a ZIP package with PowerShell installation scripts. MSI packag
 
 ## Platform status
 
-Windows support is under preparation for 0.9.0, not a released support announcement. Saved results from earlier Windows 11 ARM64 integration builds cover package installation, the virtual service account, Event Log collection and bookmark resume, the control pipe, Prometheus scraping, configuration reload, upgrade, and automatic start after reboot. These are not a full-matrix rerun on every subsequent candidate. The integrated candidate has also been exercised through SCM for a long-running shutdown with observable progress.
+0.9.0 distributes Windows x64 and ARM64 ZIPs; availability of an architecture build is not a full OS/service support certification. Saved results from earlier Windows 11 ARM64 integration builds cover package installation, the virtual service account, Event Log collection and bookmark resume, the control pipe, Prometheus scraping, configuration reload, upgrade, and automatic start after reboot. These are not a full-matrix rerun on every subsequent candidate. The integrated candidate has also been exercised through SCM for a long-running shutdown with observable progress.
 
 Windows 11 x64 and Windows Server 2022 or later x64 are release targets, but they must complete the same native acceptance matrix before being advertised as tested combinations. The package requires the Microsoft Visual C++ runtime for its architecture (`VCRUNTIME140.dll`); the ZIP does not install it.
 

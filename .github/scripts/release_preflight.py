@@ -9,13 +9,15 @@ import hashlib
 from html.parser import HTMLParser
 from pathlib import Path
 import re
+import shutil
 import sys
 import tomllib
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urldefrag, urlsplit
 from urllib.request import Request, urlopen
+from zipfile import ZipFile
 
-PRODUCTS = ("limpid", "limpidctl", "limpid-prometheus", "limpid-metrics-schema")
+PRODUCTS = ("limpid", "limpidctl", "limpid-prometheus", "limpid-metrics-schema", "limpid-windows")
 REPOSITORY_PREFIX = "https://github.com/naoto256/limpid/blob/"
 
 
@@ -36,6 +38,53 @@ def read_toml(path):
     return tomllib.loads(path.read_text(encoding="utf-8"))
 
 
+def release_assets(incoming, output, version):
+    """Validate before flattening; never overwrite a prior publication staging area."""
+    # This is the complete distribution contract, not a glob of whatever happened
+    # to build. Changing the build matrix also requires updating this set.
+    expected = {
+        f"limpid_{version}-1_amd64.deb",
+        f"limpid-prometheus_{version}-1_amd64.deb",
+        f"limpid-{version}-x86_64-pc-windows-msvc.zip",
+        f"limpid-{version}-aarch64-pc-windows-msvc.zip",
+    }
+    files = [p for p in incoming.rglob("*") if not p.is_dir()]
+    names = [p.name for p in files]
+    require(len(names) == len(set(names)), "Duplicate release asset basename")
+    require(set(names) == expected, f"Asset set mismatch: missing={sorted(expected - set(names))}, extra={sorted(set(names) - expected)}")
+    require(not output.exists(), "Asset output already exists")
+    for path in files:
+        require(path.is_file() and not path.is_symlink() and path.stat().st_size > 0, f"Invalid asset: {path.name}")
+        if path.suffix == ".zip":
+            with ZipFile(path) as archive:
+                entries = archive.namelist()
+                require(len(entries) == len(set(entries)), "Duplicate ZIP entry")
+                binaries = {"limpid.exe", "limpidctl.exe", "limpid-prometheus.exe"}
+                required = binaries | {"SHA256SUMS", "install.ps1", "uninstall.ps1", "limpid.conf.example", "README.md"}
+                require(required <= set(entries), f"Incomplete Windows ZIP: {path.name}")
+                require(any(n.startswith("snippets/") for n in entries), "ZIP snippets missing")
+                checksums = archive.read("SHA256SUMS").decode("utf-8").splitlines()
+                parsed = [line.split("  ", 1) for line in checksums]
+                require(len(parsed) == 3 and all(len(p) == 2 for p in parsed), "Invalid binary checksum manifest")
+                require({p[1] for p in parsed} == binaries, "Binary checksum set mismatch")
+                for digest, name in parsed:
+                    binary = archive.read(name)
+                    require(hashlib.sha256(binary).hexdigest() == digest.lower(), f"Binary checksum mismatch: {name}")
+                    # A successful --version on ARM can also be an emulated x64 binary.
+                    # Bind the archive target to the PE machine, not the runner label alone.
+                    pe_offset = int.from_bytes(binary[60:64], "little")
+                    machine = 0xAA64 if "aarch64" in path.name else 0x8664
+                    require(binary[:2] == b"MZ" and binary[pe_offset:pe_offset + 4] == b"PE\0\0"
+                            and int.from_bytes(binary[pe_offset + 4:pe_offset + 6], "little") == machine,
+                            f"PE target mismatch: {path.name}/{name}")
+    output.mkdir(parents=True)
+    manifest = []
+    for path in sorted(files, key=lambda p: p.name):
+        shutil.copyfile(path, output / path.name)
+        manifest.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n")
+    (output / "SHA256SUMS").write_text("".join(manifest), encoding="utf-8")
+
+
 def release_metadata(root, version):
     manifests = {name: read_toml(root / "crates" / name / "Cargo.toml") for name in PRODUCTS}
     version = version or manifests["limpid"]["package"]["version"]
@@ -44,7 +93,7 @@ def release_metadata(root, version):
         require(manifest["package"]["version"] == version, f"Version mismatch: {name}")
     workspace_schema = read_toml(root / "Cargo.toml")["workspace"]["dependencies"]["limpid-metrics-schema"]
     require(workspace_schema["version"] == version, "Workspace schema requirement mismatch")
-    for name in PRODUCTS[:-1]:
+    for name in ("limpid", "limpidctl", "limpid-prometheus"):
         dependency = manifests[name]["dependencies"]["limpid-metrics-schema"]
         require(dependency.get("workspace") is True, f"Schema requirement must inherit workspace: {name}")
     packages = read_toml(root / "Cargo.lock")["package"]
@@ -155,9 +204,14 @@ def main():
     parser.add_argument("--check-remote", action="store_true", help="Validate selected repository links, not arbitrary external sites")
     parser.add_argument("--notes-output", type=Path)
     parser.add_argument("--github-output", type=Path)
+    parser.add_argument("--assets", type=Path, help="Per-job artifact directories to validate")
+    parser.add_argument("--asset-output", type=Path, help="New flat directory for validated release assets")
     args = parser.parse_args()
     try:
         version, title, body = release_metadata(args.root, args.version)
+        require(bool(args.assets) == bool(args.asset_output), "--assets and --asset-output are required together")
+        if args.assets:
+            release_assets(args.assets, args.asset_output, version)
         if args.check_remote and not args.book:
             raise SourceDefect("--check-remote requires --book")
         if args.book:
