@@ -54,7 +54,7 @@ ReadWritePaths=/var/log/limpid
 WantedBy=multi-user.target
 ```
 
-The full unit (`packaging/limpid.service`) carries a comment above each
+The full unit (`packaging/linux/systemd/limpid.service`) carries a comment above each
 directive explaining why it's safe for limpid's inputs/outputs; this
 page shows the trimmed shape but keeps the trust-boundary-relevant
 directives. `RuntimeDirectoryMode=0750` is one of those: the daemon's

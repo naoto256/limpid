@@ -119,7 +119,7 @@ priority = "optional"
 assets = [
     ["target/release/limpid", "usr/bin/", "755"],
     ["target/release/limpidctl", "usr/bin/", "755"],
-    ["../../packaging/limpid.conf.example", "usr/share/limpid/limpid.conf.example", "644"],
+    ["../../packaging/linux/limpid.conf.example", "usr/share/limpid/limpid.conf.example", "644"],
     ["../../README.md", "usr/share/doc/limpid/README.md", "644"],
     # The snippet library under packaging/snippets/ is loaded by the
     # daemon via SYSTEM_SNIPPET_DIR (`/usr/share/limpid/snippets/`,
@@ -135,7 +135,7 @@ assets = [
     ["../../packaging/snippets/functions/*.limpid", "usr/share/limpid/snippets/functions/", "644"],
     ["../../packaging/snippets/parsers/*.limpid", "usr/share/limpid/snippets/parsers/", "644"],
 ]
-maintainer-scripts = "../../packaging"
+maintainer-scripts = "../../packaging/linux/debian"
 # start = false preserves the existing "enable but don't start on first
 # install" behaviour: cargo-deb's dh_installsystemd port defaults both
 # `enable` and `start` to true when unset (see cargo-deb's
@@ -143,4 +143,4 @@ maintainer-scripts = "../../packaging"
 # silently start limpid.service as part of `#DEBHELPER#` and conflict
 # with rsyslog/syslog-ng still bound to the syslog ports on upgrade.
 # enable = true is the default and is listed explicitly for clarity.
-systemd-units = { unit-name = "limpid", unit-scripts = "../../packaging", enable = true, start = false }
+systemd-units = { unit-name = "limpid", unit-scripts = "../../packaging/linux/systemd", enable = true, start = false }

@@ -58,7 +58,7 @@ cargo deb -p limpid -- --features journal,kafka
 | `/usr/share/limpid/snippets/` | Shipped snippet library (`composers/`, `filters/`, `functions/`, `parsers/`) — resolved by absolute-`include` under `SYSTEM_SNIPPET_DIR`. See [Snippet Library](../snippets/README.md). |
 | `/usr/lib/systemd/system/limpid.service` | systemd unit file (operator overrides live under `/etc/systemd/system/limpid.service.d/*.conf`) |
 
-The post-install script (`packaging/postinst`) runs on first install:
+The post-install script (`packaging/linux/debian/postinst`) runs on first install:
 
 1. Creates `syslog` user and group (if not present)
 2. Creates directory structure:
@@ -81,7 +81,7 @@ The post-install script (`packaging/postinst`) runs on first install:
 
 ## systemd unit
 
-The included unit file (`packaging/limpid.service`) runs limpid as the `syslog` user with security hardening:
+The included unit file (`packaging/linux/systemd/limpid.service`) runs limpid as the `syslog` user with security hardening:
 
 ```ini
 [Service]
@@ -110,7 +110,7 @@ See [systemd](./systemd.md) for operational details.
 
 ### limpid-prometheus
 
-The unit (`packaging/limpid-prometheus.service`) depends on `limpid.service` and reads settings from `/etc/default/limpid-prometheus`:
+The unit (`packaging/linux/systemd/limpid-prometheus.service`) depends on `limpid.service` and reads settings from `/etc/default/limpid-prometheus`:
 
 ```ini
 [Service]
