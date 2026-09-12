@@ -69,23 +69,41 @@ def pipeline collect { input source output captured }
 "@
     [IO.File]::WriteAllText($config, $text, $utf8)
     Invoke-Bounded $daemonExe @('--check', '--config', ('"' + $config + '"')) | Out-Null
-    $daemon = Start-Process -FilePath $daemonExe -ArgumentList @('--config', ('"' + $config + '"')) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'stdout.log') -RedirectStandardError (Join-Path $run 'stderr.log')
+    $daemonOptions = @{
+        FilePath = $daemonExe
+        ArgumentList = @('--config', ('"' + $config + '"'))
+        WindowStyle = 'Hidden'
+        PassThru = $true
+        RedirectStandardOutput = Join-Path $run 'stdout.log'
+        RedirectStandardError = Join-Path $run 'stderr.log'
+    }
+    $daemon = Start-Process @daemonOptions
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds(10)
         $ready = $false
         while ([DateTime]::UtcNow -lt $deadline) {
             if ($daemon.HasExited) { throw "Daemon exited; inspect $run" }
-            try { Invoke-Bounded $ctlExe @('--socket', $pipe, 'health') | Out-Null; $ready = $true; break }
-            catch { Start-Sleep -Milliseconds 100 }
+            try {
+                Invoke-Bounded $ctlExe @('--socket', $pipe, 'health') | Out-Null
+                $ready = $true
+                break
+            } catch {
+                Start-Sleep -Milliseconds 100
+            }
         }
         if (-not $ready) { throw 'Daemon did not become ready within 10s.' }
         & $Verify $pipe $output $state $run
     } finally {
         # Cleanup only our foreground test process. This is NOT an SCM or
         # graceful-shutdown assertion; native service tests are separate.
-        if (-not $daemon.HasExited) { Stop-Process -Id $daemon.Id -Force; $daemon.WaitForExit() }
+        if (-not $daemon.HasExited) {
+            Stop-Process -Id $daemon.Id -Force
+            $daemon.WaitForExit()
+        }
     }
 }
+
+# === Run 1: control-to-file pipeline plus exporter scrape ===
 Run-Candidate '*[System[EventID=999999]]' '' {
     param($pipe, $output, $state, $run)
     $payload = Join-Path $run 'payload'
@@ -104,20 +122,41 @@ Run-Candidate '*[System[EventID=999999]]' '' {
     $portReservation.Start()
     $port = $portReservation.LocalEndpoint.Port
     $portReservation.Stop()
-    $exporter = Start-Process -FilePath (Join-Path $BinaryDirectory 'limpid-prometheus.exe') -ArgumentList @('--socket', $pipe, '--bind', "127.0.0.1:$port") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'exporter.stdout') -RedirectStandardError (Join-Path $run 'exporter.stderr')
+    $exporterOptions = @{
+        FilePath = Join-Path $BinaryDirectory 'limpid-prometheus.exe'
+        ArgumentList = @('--socket', $pipe, '--bind', "127.0.0.1:$port")
+        WindowStyle = 'Hidden'
+        PassThru = $true
+        RedirectStandardOutput = Join-Path $run 'exporter.stdout'
+        RedirectStandardError = Join-Path $run 'exporter.stderr'
+    }
+    $exporter = Start-Process @exporterOptions
     try {
         $response = $null
         $deadline = [DateTime]::UtcNow.AddSeconds(10)
         do {
             if ($exporter.HasExited) { throw 'Exporter exited before a successful scrape.' }
-            try { $response = Invoke-WebRequest "http://127.0.0.1:$port/metrics" -TimeoutSec 6; break }
-            catch { Start-Sleep -Milliseconds 50 }
+            try {
+                $response = Invoke-WebRequest "http://127.0.0.1:$port/metrics" -TimeoutSec 6
+                break
+            } catch {
+                Start-Sleep -Milliseconds 50
+            }
         } while ([DateTime]::UtcNow -lt $deadline)
-        if (-not $response -or $response.StatusCode -ne 200 -or -not $response.Content.Contains('captured')) { throw 'Exporter did not expose native daemon metrics.' }
+        if (-not $response -or
+            $response.StatusCode -ne 200 -or
+            -not $response.Content.Contains('captured')) {
+            throw 'Exporter did not expose native daemon metrics.'
+        }
     } finally {
-        if (-not $exporter.HasExited) { Stop-Process -Id $exporter.Id -Force; $exporter.WaitForExit() }
+        if (-not $exporter.HasExited) {
+            Stop-Process -Id $exporter.Id -Force
+            $exporter.WaitForExit()
+        }
     }
 }
+
+# === Run 2: resume plus ACK checkpoint ===
 # Read existing events only. Results may contain local event data: keep this
 # directory private and do not turn its contents into repository fixtures.
 $xml = Invoke-Bounded "$env:SystemRoot/System32/wevtutil.exe" @('qe', 'System', '/c:2', '/rd:false', '/f:xml')
@@ -136,7 +175,11 @@ Run-Candidate "*[System[EventRecordID=$second]]" $bookmark {
     if ($saved -ne $second) { throw 'Pipeline ACK did not advance the bookmark.' }
     $records = @([IO.File]::ReadAllLines($output))
     if ($records.Count -ne 1) { throw 'Resume must emit exactly one matching event.' }
-    if ([string](($records[0] | ConvertFrom-Json).EventRecordID) -ne $second) { throw 'Resumed record identity differs.' }
+    if ([string](($records[0] | ConvertFrom-Json).EventRecordID) -ne $second) {
+        throw 'Resumed record identity differs.'
+    }
 }
+
+# === Final result artifact ===
 [IO.File]::WriteAllText((Join-Path $ResultsDirectory 'result.txt'), 'PASS: native control-to-file, exporter scrape, and Event Log resume/ACK checkpoint. SCM shutdown not tested.', $utf8)
 Write-Output 'PASS: native control-to-file, exporter scrape, and Event Log resume/ACK checkpoint.'

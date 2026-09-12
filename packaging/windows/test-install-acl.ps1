@@ -22,6 +22,8 @@ param(
     [Parameter(Mandatory)][string]$ResultsDirectory
 )
 $ErrorActionPreference = 'Stop'
+
+# === Fixture setup and baseline snapshot ===
 $fixture = [IO.Path]::GetFullPath($ResultsDirectory)
 if (Test-Path -LiteralPath $fixture) { throw 'Choose a new fixture directory.' }
 # Load production helpers through the read-only installer preflight.
@@ -35,6 +37,8 @@ $everyone = [Security.Principal.SecurityIdentifier]::new('S-1-1-0')
 $original = Get-Acl -LiteralPath $fixture
 $parentOwner = (Get-Acl -LiteralPath ([IO.Path]::GetDirectoryName($fixture))).GetOwner([Security.Principal.SecurityIdentifier]).Value
 Write-Output "ACL fixture: user=$($identity.User.Value); owner=$($original.GetOwner([Security.Principal.SecurityIdentifier]).Value); parentOwner=$parentOwner; administratorRole=$([Security.Principal.WindowsPrincipal]::new($identity).IsInRole($admins))"
+
+# === Shared-parent acceptance and rejection paths ===
 $parentAcl = Get-Acl -LiteralPath $fixture
 $parentAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyone, 'Write', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
 try {
@@ -55,19 +59,37 @@ try {
         Set-ManagedDirectory $managed 'ReadAndExecute'
     }
     $trustedOwnersAfter = @($admins.Value, $system.Value, $identity.User.Value)
-    if (($trustedOwnersAfter -join ',') -cne ($trustedOwnersBefore -join ',')) { throw 'Test owner substitution changed parent trust.' }
+    if (($trustedOwnersAfter -join ',') -cne ($trustedOwnersBefore -join ',')) {
+        throw 'Test owner substitution changed parent trust.'
+    }
     $createdAcl = Get-Acl -LiteralPath $managed
     if (-not $createdAcl.AreAccessRulesProtected) { throw 'Child ACL must be protected at creation.' }
     $rules = $createdAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
-    if (@($rules | Where-Object { $_.IdentityReference.Value -eq $everyone.Value }).Count) { throw 'Broad parent grant leaked into child.' }
-    if ((Get-Acl -LiteralPath $fixture).Sddl -ne $parentBefore -or (Get-Acl -LiteralPath $sibling).Sddl -ne $siblingBefore) { throw 'Parent or sibling ACL changed.' }
-    if ([IO.File]::ReadAllText($payload) -cne 'synthetic sibling fixture') { throw 'Sibling contents changed.' }
+    if (@($rules | Where-Object { $_.IdentityReference.Value -eq $everyone.Value }).Count) {
+        throw 'Broad parent grant leaked into child.'
+    }
+    if ((Get-Acl -LiteralPath $fixture).Sddl -ne $parentBefore -or
+        (Get-Acl -LiteralPath $sibling).Sddl -ne $siblingBefore) {
+        throw 'Parent or sibling ACL changed.'
+    }
+    if ([IO.File]::ReadAllText($payload) -cne 'synthetic sibling fixture') {
+        throw 'Sibling contents changed.'
+    }
+
+    # --- DeleteChild rejection path ---
     $parentAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyone, 'DeleteSubdirectoriesAndFiles', 'Allow'))
     Set-Acl -LiteralPath $fixture -AclObject $parentAcl
     $rejected = $false
     Write-Output 'Checking shared-parent DeleteChild rejection.'
-    try { Assert-TrustedWrites $fixture -SharedParent }
-    catch { if ($_.Exception.Message -like 'Untrusted write grant*') { $rejected = $true } else { throw } }
+    try {
+        Assert-TrustedWrites $fixture -SharedParent
+    } catch {
+        if ($_.Exception.Message -like 'Untrusted write grant*') {
+            $rejected = $true
+        } else {
+            throw
+        }
+    }
     if (-not $rejected) { throw 'Unsafe parent deletion grant accepted.' }
 } finally {
     Set-Acl -LiteralPath $fixture -AclObject $original
