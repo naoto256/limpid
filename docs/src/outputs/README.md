@@ -11,7 +11,7 @@ Output modules write processed events to external destinations.
 | [`kafka`](./kafka.md) | Apache Kafka topic with optional TLS / mTLS / SASL (requires `--features kafka`) |
 | [`syslog_tcp`](./syslog-tcp.md) | Syslog TCP with persistent per-peer connections; per-peer TLS / mTLS optional |
 | [`syslog_udp`](./syslog-udp.md) | Syslog UDP datagrams |
-| [`unix_socket`](./unix-socket.md) | Unix stream socket |
+| [`unix_socket`](./unix-socket.md) | Unix stream socket (Unix only) |
 | [`stdout`](./stdout.md) | Standard output (debugging) |
 | [`otlp_http`](./otlp_http.md) | OTLP/HTTP logs sender (`http_protobuf` / `http_json`), per-peer TLS / mTLS |
 | [`otlp_grpc`](./otlp_grpc.md) | OTLP/gRPC logs sender, per-peer TLS / mTLS |

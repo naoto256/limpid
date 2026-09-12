@@ -30,6 +30,8 @@ limpid --debug --config /etc/limpid/limpid.conf
 | `--input <json>` | Sample event for test mode (JSON) |
 | `--debug` | Enable trace-level logging |
 
+On Windows the default configuration path is `%ProgramData%\limpid\config\limpid.conf`. `--service` is reserved for Service Control Manager and cannot be combined with check, graph, or test modes. See [Windows service](./windows.md).
+
 `--check` prints a per-file header line and a final status footer:
 
 ```
@@ -135,9 +137,9 @@ checks.
 
 | Flag | Description |
 |------|-------------|
-| `--socket <path>` | Control socket path (default: `/var/run/limpid/control.sock`) |
+| `--socket <path>` | Control endpoint (default: `/var/run/limpid/control.sock` on Unix; `\\.\pipe\limpid-control` on Windows) |
 
-### Control socket parent safety
+### Control socket parent safety (Unix)
 
 The control socket is a root-equivalent trust boundary, and its `bind → chmod 0o660` window relies on the parent directory being a real, trusted-owner directory that keeps non-group traffic out. Daemon startup **refuses to start** when the configured `control { socket "..." }`'s parent fails any of:
 

@@ -1,12 +1,20 @@
-# Windows package candidate
+# Windows ZIP package
 
-This directory is the 0.9.0 implementation candidate, not a released support
-announcement. Native SCM install/upgrade/uninstall and architecture matrix
-validation are required before release. Initial packaging is ZIP + PowerShell;
-MSI remains a future option.
+This directory builds the Windows ZIP package for the unreleased 0.9.0 line.
+It is not a released support announcement. Initial packaging is ZIP +
+PowerShell; MSI remains a future option.
+
+Saved results from earlier Windows 11 ARM64 integration builds cover
+install, first start, service ACLs, Event Log collection and bookmark resume,
+control and exporter access, PARAMCHANGE, graceful STOP, upgrade, and automatic
+start after reboot. These are not a full-matrix rerun on every later candidate.
+See [Windows service](../../docs/src/operations/windows.md) for the integrated
+candidate's long-running SCM shutdown check and remaining limits.
+Windows 11 x64 and Windows Server 2022 or later x64 remain
+release targets until they complete the same acceptance matrix.
 
 Run `install.ps1` from elevated 64-bit PowerShell after extracting the package.
-The candidate binaries require the Microsoft Visual C++ runtime for their
+The binaries require the Microsoft Visual C++ runtime for their
 architecture (`VCRUNTIME140.dll`). This package does not install that runtime.
 Existing sibling directories under ProgramData/limpid are preserved, including
 their ACLs. Only config/state/log are managed; an existing parent ACL is left
@@ -45,15 +53,20 @@ administrator must be provisioned for the service identity before use: owner
 must be NT SERVICE\limpid and grants must be restricted to that identity,
 SYSTEM and Administrators. The daemon refuses broad or reparse-point keys.
 
-Candidate test matrix: Windows 11 x64/ARM64; Windows Server 2022+ x64. Only
-actually tested combinations may be advertised as supported. Security and
-provider-specific channels can impose additional read permissions; an input
-startup failure is fatal and must be resolved explicitly.
+Test matrix: Windows 11 x64/ARM64; Windows Server 2022+ x64. Only actually
+tested combinations may be advertised as tested. Security and provider-specific
+channels can impose additional read permissions; an input startup failure is
+fatal and must be resolved explicitly. The service is set to Automatic, but the
+package does not configure SCM recovery actions after unexpected termination.
 
-Before release, test installation, first start, startup failure, PARAMCHANGE,
+For each unqualified architecture, test installation, first start, startup failure, PARAMCHANGE,
 STOP with queued events, upgrade, and uninstall on an elevated test machine.
 Verify the service stays stopped after initial installation; its account can
 read config and write state/logs; an unrelated standard user cannot connect to
 the control pipe or read LTP keys; and upgrade/uninstall preserve existing
 configuration and bookmarks. Native foreground tests do not establish SCM
 behavior. Debug candidate archives are for validation, not release assets.
+
+The tag-driven release workflow currently publishes Debian artifacts only.
+Build, validate, and upload the final Windows ZIP explicitly until that workflow
+gains a Windows release job.
