@@ -85,6 +85,21 @@ class ReleasePreflightTests(unittest.TestCase):
         with self.assertRaises(preflight.SourceDefect):
             preflight.release_assets(incoming, self.root / "output", "0.8.1")
 
+    def test_directory_only_snippets_rejected(self):
+        incoming = self.asset_fixture()
+        path = incoming / "limpid-0.8.1-aarch64-pc-windows-msvc.zip"
+        with ZipFile(path) as archive:
+            entries = {name: archive.read(name) for name in archive.namelist()
+                       if not name.startswith("snippets/")}
+        with ZipFile(path, "w") as archive:
+            for name, payload in entries.items():
+                archive.writestr(name, payload)
+            archive.writestr("snippets/", b"")
+            archive.writestr("snippets/nested/", b"")
+        with self.assertRaisesRegex(preflight.SourceDefect, "ZIP snippets missing"):
+            preflight.release_assets(incoming, self.root / "output", "0.8.1")
+        self.assertFalse((self.root / "output").exists())
+
     def test_corrupt_windows_binary_rejected(self):
         incoming = self.asset_fixture()
         path = incoming / "limpid-0.8.1-aarch64-pc-windows-msvc.zip"
