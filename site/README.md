@@ -35,7 +35,7 @@ native Kafka/journal dependencies. Commit the npm lockfile with dependency chang
 ## Content ownership
 
 `docs/src` remains the documentation source; `SUMMARY.md` supplies navigation.
-The renderer reads all 48 chapters directly, preserving code fences and copying
+The renderer reads all 50 chapters directly, preserving code fences and copying
 the existing images. No generated Markdown is checked in. `packaging/snippets`
 and its xtask-managed inventory remain in their existing locations.
 
@@ -44,7 +44,7 @@ The current site targets stable 0.9.0. Runtime and snippet links resolve to
 Build publication artifacts only from a clean checkout: uncommitted local preview
 edits are not represented by that commit link. Publishing content for another
 version requires an explicit content review and a version update in `lib/config.js`.
-The four-package version assertion catches version mismatches, not semantic
+The five-package version assertion (including `limpid-windows`) catches version mismatches, not semantic
 unreleased-feature drift; review the exact content before publication. There is no next site.
 
 The Recipes index and detail pages use `/recipes/`; `/docs/pipelines/` remains
@@ -68,6 +68,8 @@ emitted. A project-local `/limpid/robots.txt` cannot control origin-root crawlin
 so none is generated. Check the origin's `/robots.txt` and live URLs at first
 publication; this project does not modify the account-level site.
 
-The existing Rust CI and release workflow remain unchanged. mdBook is retained
+The existing Rust CI remains unchanged. The release workflow adds native Windows
+x64/ARM64 builds and ZIP packaging alongside Debian, then verifies the complete
+asset set and checksums before a single tag-only publish job. mdBook is retained
 for migration comparison until the site is accepted; it is not a second content
 source. Remove its renderer/config only as part of the approved cutover.
