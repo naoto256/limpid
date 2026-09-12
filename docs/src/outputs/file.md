@@ -25,6 +25,8 @@ def output archive {
 
 On Windows, `mode`, `owner`, and `group` are rejected with a configuration error. Configure filesystem ACLs outside the DSL. The other file-output behavior on this page, including regular-file checks and path interpolation, applies on Windows unless a section refers to a Unix syscall or mode bit.
 
+In interpolated path components, Windows replaces `/`, `\`, and `:` with `_`. This sanitisation does not rewrite literal path text.
+
 **Regular-file contract.** The output only ever writes to a regular
 file at `path`. If the path already exists and points at a symlink,
 FIFO, socket, directory, or device node, the write is refused with a
