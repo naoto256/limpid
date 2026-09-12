@@ -1,5 +1,7 @@
 # Packaging
 
+Linux uses `.deb` packages and systemd. Windows uses a ZIP containing native binaries and PowerShell service-management scripts; see [Windows service](./windows.md). MSI packaging is not part of 0.9.0.
+
 limpid uses [cargo-deb](https://github.com/kornelski/cargo-deb) to build `.deb` packages. Each crate produces its own package.
 
 ## Building packages
@@ -16,7 +18,21 @@ cargo deb -p limpid-prometheus
 
 Packages are written to `target/debian/`.
 
-### Building with optional features
+## Building a Windows ZIP
+
+Build the three binaries for the intended Windows architecture, then run:
+
+```powershell
+.\packaging\windows\build-package.ps1 `
+  -BinaryDirectory .\target\release `
+  -OutputPath .\target\limpid-windows.zip
+```
+
+The archive contains the binaries, installer and uninstaller, example configuration, snippet library, and `SHA256SUMS` for the binaries. The package script refuses to overwrite an existing archive. Installation and lifecycle details are in [Windows service](./windows.md).
+
+The tag-driven release workflow currently publishes Debian artifacts only. Until a Windows release job is added, build, validate, and upload the Windows ZIP as an explicit release step.
+
+## Debian builds with optional features
 
 ```bash
 # With systemd journal support
@@ -29,7 +45,7 @@ cargo deb -p limpid -- --features kafka
 cargo deb -p limpid -- --features journal,kafka
 ```
 
-## Package contents
+## Debian package contents
 
 ### limpid
 

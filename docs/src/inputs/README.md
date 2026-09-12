@@ -6,12 +6,13 @@ Input modules receive log messages from external sources and feed them into pipe
 
 | Type | Description |
 |------|-------------|
+| [`windows_event_log`](./windows-event-log.md) | Native Windows Event Log subscription with resumable bookmarks (Windows only) |
 | [`raw_udp`](./raw-udp.md) | Byte-exact UDP datagram receiver |
 | [`syslog_udp`](./syslog-udp.md) | UDP syslog receiver |
 | [`syslog_tcp`](./syslog-tcp.md) | TCP syslog receiver (RFC 6587); optional TLS termination + mTLS |
 | [`tail`](./tail.md) | File tailing with rotation detection |
-| [`journal`](./journal.md) | systemd journal reader (requires `--features journal`) |
-| [`unix_socket`](./unix-socket.md) | Unix datagram socket (`/dev/log`) |
+| [`journal`](./journal.md) | systemd journal reader (Linux only; requires `--features journal`) |
+| [`unix_socket`](./unix-socket.md) | Unix datagram socket (`/dev/log`; Unix only) |
 | [`otlp_http`](./otlp-http.md) | OTLP/HTTP logs receiver (`POST /v1/logs`) |
 | [`otlp_grpc`](./otlp-grpc.md) | OTLP/gRPC logs receiver (`LogsService.Export`) |
 | [`ltp`](../ltp.md) | LTP node-to-node transport (mutual TLS 1.3 with raw public keys); see [LTP protocol notes](../ltp.md) |
