@@ -7,20 +7,33 @@ import { createHash } from "node:crypto";
 import PageTemplate from "../src/pages.11ty.js";
 import { url, origin } from "../lib/config.js";
 
-test("0.9.0 downloads match release asset targets without claiming full Windows acceptance", () => {
+test("Downloads uses the stable release in the main menu without a hero announcement", () => {
   const renderer = new PageTemplate();
-  const html = renderer.render({
-    entry: pages().find((p) => p.kind === "home"),
-  });
-  for (const target of ["x86_64", "aarch64"]) {
-    assert.ok(
-      html.includes(
-        `/releases/download/v0.9.0/limpid-0.9.0-${target}-pc-windows-msvc.zip`,
-      ),
+  for (const entry of pages()) {
+    const html = renderer.render({ entry });
+    const mainNav = html.match(/<nav aria-label="Main">([\s\S]*?)<\/nav>/)[1];
+    assert.equal(
+      mainNav.split(
+        '<a href="https://github.com/naoto256/limpid/releases/tag/v0.9.0">Downloads ↗</a>',
+      ).length - 1,
+      1,
+      entry.route,
     );
+    if (entry.kind === "home") {
+      const hero = html.match(/<section class="hero">([\s\S]*?)<\/section>/)[1];
+      assert.ok(!hero.includes("Version 0.9.0 brings"));
+      assert.ok(
+        !hero.includes("Windows requirements and validation boundaries"),
+      );
+      assert.ok(!hero.includes("/releases/"));
+      assert.ok(hero.includes("Start with the docs"));
+      assert.ok(
+        hero.includes(
+          '<em>picking which pieces to use</em>.<br>Linux. Windows. macOS.</p><div class="actions">',
+        ),
+      );
+    }
   }
-  assert.ok(html.includes("/releases/download/v0.9.0/SHA256SUMS"));
-  assert.ok(html.includes("Windows requirements and validation boundaries"));
 });
 
 test("social metadata uses each page title and canonical URL with the approved common image", () => {
@@ -159,18 +172,22 @@ test("filtering is second and archival never drops messages", () => {
   assert.match(archive, /default \{ output other \}/);
 });
 
-test("Datadog is sixth and documents JSON and direct OTLP with literal payloads", () => {
+test("destination ordering preserves adjacent Better Stack and New Relic recipes", () => {
   const recipes = pages().filter((page) => page.kind === "recipe");
-  assert.equal(recipes[5].route, "recipes/datadog/index.html");
-  assert.equal(recipes[6].route, "recipes/better-stack/index.html");
-  assert.equal(recipes[7].route, "recipes/cloudwatch/index.html");
-  assert.equal(recipes[7].number, 8);
+  assert.equal(recipes[3].route, "recipes/safe-forwarding/index.html");
+  assert.equal(recipes[4].route, "recipes/quarantine-invalid/index.html");
+  assert.equal(recipes[5].route, "recipes/asset-enrichment/index.html");
+  assert.equal(recipes[8].route, "recipes/datadog/index.html");
+  assert.equal(recipes[9].route, "recipes/better-stack/index.html");
+  assert.equal(recipes[10].route, "recipes/new-relic/index.html");
+  assert.equal(recipes[10].number, 11);
+  assert.equal(recipes[11].route, "recipes/cloudwatch/index.html");
   assert.deepEqual(
     recipes.map((recipe, index) => recipe.number ?? index + 1),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
   );
-  assert.equal(recipes[8].route, "recipes/ama-forwarding/index.html");
-  assert.equal(recipes[9].route, "recipes/cef-to-amp/index.html");
+  assert.equal(recipes[12].route, "recipes/ama-forwarding/index.html");
+  assert.equal(recipes[13].route, "recipes/cef-to-amp/index.html");
   const source = readFileSync("src/datadog.md", "utf8");
   for (const text of [
     '"DD-API-KEY":',
@@ -192,7 +209,7 @@ test("Datadog is sixth and documents JSON and direct OTLP with literal payloads"
     (m) => m[1],
   );
   const rendered = [
-    ...recipes[5].content.matchAll(
+    ...recipes[8].content.matchAll(
       /<pre><code class="language-limpid">([\s\S]*?)<\/code>/g,
     ),
   ].map((m) => m[1].replace(/<span class="[^"]+">|<\/span>/g, ""));
@@ -289,7 +306,7 @@ test("Better Stack documents both transports with literal public placeholders", 
   const entry = pages().find(
     (page) => page.route === "recipes/better-stack/index.html",
   );
-  assert.equal(entry.number, 7);
+  assert.equal(entry.number, 10);
   for (const text of [
     '"Authorization": "Bearer <SOURCE_TOKEN>"',
     'url "https://ingesting-host.example/"',
@@ -367,7 +384,7 @@ test("AMA recipe pairs PRI rewriting with distinct connector DCRs", () => {
 
 test("Loki is fourth and distinguishes native JSON from OTLP", () => {
   const recipes = pages().filter((p) => p.kind === "recipe");
-  assert.equal(recipes[3].route, "recipes/loki-http-json/index.html");
+  assert.equal(recipes[6].route, "recipes/loki-http-json/index.html");
   const source = readFileSync("src/loki-http-json.md", "utf8");
   for (const text of [
     "batch_size 1",
@@ -394,7 +411,7 @@ test("Loki is fourth and distinguishes native JSON from OTLP", () => {
 
 test("Elastic is fifth and documents both ingestion paths and acknowledgement limits", () => {
   const recipes = pages().filter((p) => p.kind === "recipe");
-  assert.equal(recipes[4].route, "recipes/elasticsearch/index.html");
+  assert.equal(recipes[7].route, "recipes/elasticsearch/index.html");
   const source = readFileSync("src/elasticsearch.md", "utf8");
   for (const text of [
     "application/x-ndjson",

@@ -48,12 +48,27 @@ The five-package version assertion (including `limpid-windows`) catches version 
 unreleased-feature drift; review the exact content before publication. There is no next site.
 
 The Recipes index and detail pages use `/recipes/`; `/docs/pipelines/` remains
-the DSL pipeline reference. The ten recipe sources live in `src/`: archive, filtering and thinning, branching, Loki, Elasticsearch, Datadog,
-Better Stack, CloudWatch, AMA, and CEF to AMP. Archival routes every sender to a file; filtering
+the DSL pipeline reference. The fourteen recipe sources live in `src/`: archive, filtering and thinning, branching, safe forwarding, quarantine, asset enrichment, Loki, Elasticsearch, Datadog,
+Better Stack, New Relic, CloudWatch, AMA, and CEF to AMP. Archival routes every sender to a file; filtering
 and table-based suppression are separate examples in Recipe 02. Recipes are
 authored configurations with receiver prerequisites; changes must preserve their
 actual validation boundaries. Rendering is not an integration test.
 The home-page DSL is the existing README pipeline fragment.
+
+### Running the new recipe examples
+
+On a Unix host, opt into the real-process checks with explicit 0.9.0 binaries:
+
+```sh
+LIMPID_BIN=/path/to/limpid LIMPIDCTL_BIN=/path/to/limpidctl node test/recipes-live.mjs
+```
+
+This reads configuration, fixture and injection fences from New Relic, safe forwarding,
+quarantine and asset enrichment. It uses private temporary directories and loopback
+receivers, checks output contents and counts, and requires normal daemon exit.
+The evidence directory records article hashes and results. It does not contact cloud
+services or prove provider-side storage, authentication or TLS. It is separate from
+the static site tests and does not yet cover the older recipes.
 
 ## Publication
 
