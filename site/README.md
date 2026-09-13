@@ -66,6 +66,12 @@ LIMPID_BIN=/path/to/limpid LIMPIDCTL_BIN=/path/to/limpidctl node test/recipes-li
 This reads configuration, fixture and injection fences from New Relic, safe forwarding,
 quarantine and asset enrichment. It uses private temporary directories and loopback
 receivers, checks output contents and counts, and requires normal daemon exit.
+Setup and test failures run all acquired-resource cleanup. A daemon that misses
+the 10-second normal-stop deadline still fails the test: the harness sends SIGKILL
+only to its own spawned child and waits up to 5 seconds for exit confirmation.
+An unconfirmed exit is reported as an additional cleanup failure; cleanup errors
+do not hide the original failure. No existing service, arbitrary PID or process
+group is targeted.
 The evidence directory records article hashes and results. It does not contact cloud
 services or prove provider-side storage, authentication or TLS. It is separate from
 the static site tests and does not yet cover the older recipes.

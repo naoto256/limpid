@@ -6,8 +6,9 @@ import path from "node:path";
 import net from "node:net";
 import http from "node:http";
 import { createHash } from "node:crypto";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { once } from "node:events";
+import { spawnRecipe, withRecipeCleanup } from "./recipe-process.mjs";
 const bin = process.env.LIMPID_BIN;
 const ctl = process.env.LIMPIDCTL_BIN;
 assert.ok(
@@ -71,39 +72,19 @@ async function daemon(config, dir) {
     }),
   );
   const out = fs.openSync(path.join(dir, "stdout.log"), "w");
-  const err = fs.openSync(path.join(dir, "stderr.log"), "w");
-  const child = spawn(bin, ["--config", filename], {
-    stdio: ["ignore", out, err],
-  });
-  fs.closeSync(out);
-  fs.closeSync(err);
-  const ended = once(child, "exit");
-  const socket = path.join(dir, "control.sock");
-  const stop = async () => {
-    if (child.exitCode === null && child.signalCode === null)
-      child.kill("SIGINT");
-    let timer;
-    try {
-      assert.deepEqual(
-        await Promise.race([
-          ended,
-          new Promise((_, reject) => {
-            timer = setTimeout(
-              () =>
-                reject(
-                  Error(`Normal-stop deadline; no force: PID ${child.pid}`),
-                ),
-              10000,
-            );
-          }),
-        ]),
-        [0, null],
-      );
-    } finally {
-      clearTimeout(timer);
-    }
-  };
+  let err, owned;
   try {
+    try {
+      err = fs.openSync(path.join(dir, "stderr.log"), "w");
+      owned = spawnRecipe(bin, ["--config", filename], {
+        stdio: ["ignore", out, err],
+      });
+    } finally {
+      fs.closeSync(out);
+      if (err !== undefined) fs.closeSync(err);
+    }
+    const { child, stop } = owned;
+    const socket = path.join(dir, "control.sock");
     await until(() => {
       try {
         execFileSync(ctl, ["--socket", socket, "health"], {
@@ -116,11 +97,13 @@ async function daemon(config, dir) {
         return false;
       }
     });
+    return { socket, stop, filename };
   } catch (e) {
-    await stop();
-    throw e;
+    await withRecipeCleanup(async (defer) => {
+      if (owned) defer(owned.stop);
+      throw e;
+    });
   }
-  return { socket, stop, filename };
 }
 function inject(instance, source, input, extraLines) {
   const command = source.text.match(
@@ -195,51 +178,54 @@ for (const [name, baseIndex, parsed] of [
   const isOtlp = name.startsWith("otlp");
   let receiver, sink;
   const received = path.join(dir, "receiver", "received.jsonl");
-  const port = await freePort();
-  if (isOtlp) {
-    const recvDir = path.join(dir, "receiver");
-    receiver = await daemon(
-      control(recvDir) +
-        `def input wire {type otlp_http bind "127.0.0.1:${port}"}\ndef output records {type file path "${received}"}\ndef process decode {egress = to_json(otlp.decode_resourcelog_protobuf(ingress))}\ndef pipeline capture {input wire process decode output records}`,
-      recvDir,
+  await withRecipeCleanup(async (defer) => {
+    const port = await freePort();
+    if (isOtlp) {
+      const recvDir = path.join(dir, "receiver");
+      receiver = await daemon(
+        control(recvDir) +
+          `def input wire {type otlp_http bind "127.0.0.1:${port}"}\ndef output records {type file path "${received}"}\ndef process decode {egress = to_json(otlp.decode_resourcelog_protobuf(ingress))}\ndef pipeline capture {input wire process decode output records}`,
+        recvDir,
+      );
+      defer(receiver.stop);
+    } else {
+      sink = await jsonReceiver();
+      defer(() => sink.close());
+    }
+    let conf = nrBlocks[baseIndex];
+    if (parsed)
+      conf =
+        conf.slice(0, conf.indexOf("def pipeline")) + nrBlocks[baseIndex + 1];
+    const wireBody = name === "otlp-parsed-wire-body";
+    if (wireBody) {
+      const assignment = nr.text.match(
+        /assigning `([^`]+)` after the adapter/,
+      )[1];
+      conf =
+        conf.replace("| compose_otlp", "| retain_wire | compose_otlp") +
+        `\ndef process retain_wire {${assignment}}\n`;
+    }
+    const substitutions = [
+      ["127.0.0.1:5514", `127.0.0.1:${await freePort()}`],
+      ["<NEW_RELIC_LICENSE_KEY>", "SYNTHETIC_LOCAL_KEY"],
+      [
+        isOtlp
+          ? "https://otlp.nr-data.net/v1/logs"
+          : "https://log-api.newrelic.com/log/v1",
+        `http://127.0.0.1:${isOtlp ? port : sink.port}${isOtlp ? "/v1/logs" : "/"}`,
+      ],
+    ];
+    for (const [from, to] of substitutions) {
+      assert.ok(conf.includes(from));
+      conf = conf.replaceAll(from, to);
+    }
+    fs.writeFileSync(
+      path.join(dir, "substitutions.json"),
+      JSON.stringify(substitutions),
     );
-  } else {
-    sink = await jsonReceiver();
-  }
-  let conf = nrBlocks[baseIndex];
-  if (parsed)
-    conf =
-      conf.slice(0, conf.indexOf("def pipeline")) + nrBlocks[baseIndex + 1];
-  const wireBody = name === "otlp-parsed-wire-body";
-  if (wireBody) {
-    const assignment = nr.text.match(
-      /assigning `([^`]+)` after the adapter/,
-    )[1];
-    conf =
-      conf.replace("| compose_otlp", "| retain_wire | compose_otlp") +
-      `\ndef process retain_wire {${assignment}}\n`;
-  }
-  const substitutions = [
-    ["127.0.0.1:5514", `127.0.0.1:${await freePort()}`],
-    ["<NEW_RELIC_LICENSE_KEY>", "SYNTHETIC_LOCAL_KEY"],
-    [
-      isOtlp
-        ? "https://otlp.nr-data.net/v1/logs"
-        : "https://log-api.newrelic.com/log/v1",
-      `http://127.0.0.1:${isOtlp ? port : sink.port}${isOtlp ? "/v1/logs" : "/"}`,
-    ],
-  ];
-  for (const [from, to] of substitutions) {
-    assert.ok(conf.includes(from));
-    conf = conf.replaceAll(from, to);
-  }
-  fs.writeFileSync(
-    path.join(dir, "substitutions.json"),
-    JSON.stringify(substitutions),
-  );
-  let sender;
-  try {
+    let sender;
     sender = await daemon(control(dir) + conf, dir);
+    defer(sender.stop);
     // Execute the published pipeline-inspection form too; OTLP decode is inspection-only.
     let inspect = control(dir) + conf;
     if (isOtlp)
@@ -343,11 +329,7 @@ for (const [name, baseIndex, parsed] of [
       received: 1,
     });
     console.log(`${name}: PASS`);
-  } finally {
-    if (sender) await sender.stop();
-    if (receiver) await receiver.stop();
-    if (sink) await sink.close();
-  }
+  });
 }
 for (const name of [
   "safe-forwarding",
@@ -383,23 +365,25 @@ for (const name of [
       JSON.stringify({ ...base, event_id: "FAKE_ID_ONLY" }),
     ].join("\n");
   }
-  const sink = safe ? await jsonReceiver() : null;
-  let config = fences(source.text, "limpid")[0]
-    .replaceAll(
-      safe
-        ? "/tmp/limpid-safe"
-        : quarantine
-          ? "/tmp/limpid-quarantine"
-          : "/tmp/limpid-assets",
-      dir,
-    )
-    .replace("127.0.0.1:15514", `127.0.0.1:${await freePort()}`);
-  if (safe)
-    config = config.replace("127.0.0.1:18080", `127.0.0.1:${sink.port}`);
-  let instance;
-  const read = (file) => lines(path.join(dir, file));
-  try {
+  await withRecipeCleanup(async (defer) => {
+    const sink = safe ? await jsonReceiver() : null;
+    if (sink) defer(() => sink.close());
+    let config = fences(source.text, "limpid")[0]
+      .replaceAll(
+        safe
+          ? "/tmp/limpid-safe"
+          : quarantine
+            ? "/tmp/limpid-quarantine"
+            : "/tmp/limpid-assets",
+        dir,
+      )
+      .replace("127.0.0.1:15514", `127.0.0.1:${await freePort()}`);
+    if (safe)
+      config = config.replace("127.0.0.1:18080", `127.0.0.1:${sink.port}`);
+    let instance;
+    const read = (file) => lines(path.join(dir, file));
     instance = await daemon(config, dir);
+    defer(instance.stop);
     inject(instance, source, fixture);
     await until(() =>
       safe
@@ -476,10 +460,7 @@ for (const name of [
       normal_exit: 0,
     });
     console.log(`${name}: PASS`);
-  } finally {
-    if (instance) await instance.stop();
-    if (sink) await sink.close();
-  }
+  });
 }
 fs.writeFileSync(
   path.join(root, "results.json"),
