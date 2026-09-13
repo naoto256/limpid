@@ -251,6 +251,67 @@ export function pages() {
     ),
     siteRecipe: true,
   });
+  recipes.splice(7, 0, {
+    kind: "recipe",
+    title: "Send syslog to New Relic",
+    description:
+      "Forward raw syslog or parsed FortiGate fields using JSON or OTLP over HTTPS.",
+    route: "recipes/new-relic/index.html",
+    content: markdown(
+      readFileSync(new URL("../src/new-relic.md", import.meta.url), "utf8"),
+      "pipelines/examples.md",
+    ),
+    siteRecipe: true,
+  });
+  recipes.splice(3, 0, {
+    kind: "recipe",
+    title: "Keep private fields out of forwarded logs",
+    description:
+      "Archive the original, validate a small outbound contract, and forward only approved fields.",
+    route: "recipes/safe-forwarding/index.html",
+    content: markdown(
+      readFileSync(
+        new URL("../src/safe-forwarding.md", import.meta.url),
+        "utf8",
+      ),
+      "pipelines/examples.md",
+    ),
+    siteRecipe: true,
+  });
+  recipes.splice(
+    4,
+    0,
+    {
+      kind: "recipe",
+      title: "Separate malformed logs without hiding failures",
+      description:
+        "Keep broken input locally and distinguish expected format problems from schema failures.",
+      route: "recipes/quarantine-invalid/index.html",
+      content: markdown(
+        readFileSync(
+          new URL("../src/quarantine-invalid.md", import.meta.url),
+          "utf8",
+        ),
+        "pipelines/examples.md",
+      ),
+      siteRecipe: true,
+    },
+    {
+      kind: "recipe",
+      title: "Add device context from the sender address",
+      description:
+        "Attach a known device, site, and environment without trusting hostnames inside the message.",
+      route: "recipes/asset-enrichment/index.html",
+      content: markdown(
+        readFileSync(
+          new URL("../src/asset-enrichment.md", import.meta.url),
+          "utf8",
+        ),
+        "pipelines/examples.md",
+      ),
+      siteRecipe: true,
+    },
+  );
   recipes.forEach((recipe, index) => {
     recipe.number = index + 1;
   });

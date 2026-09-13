@@ -35,7 +35,7 @@ test("home keeps the approved concise copy and links to operational details", ()
   assert.equal((html.match(/class="number"/g) || []).length, 3);
 });
 
-test("ten recipes remain grouped with the homepage example first", () => {
+test("fourteen recipes remain grouped with the homepage example first", () => {
   const entries = pages();
   const html = new PageTemplate().render({
     entry: entries.find((p) => p.kind === "recipes"),
@@ -51,9 +51,35 @@ test("ten recipes remain grouped with the homepage example first", () => {
   );
   assert.deepEqual(
     [...html.matchAll(/class="number">(\d+)<\/span>/g)].map((m) => m[1]),
-    ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10"],
+    [
+      "00",
+      "01",
+      "02",
+      "03",
+      "04",
+      "05",
+      "06",
+      "07",
+      "08",
+      "09",
+      "10",
+      "11",
+      "12",
+      "13",
+      "14",
+    ],
   );
-  assert.equal(entries.filter((p) => p.kind === "recipe").length, 10);
+  assert.equal(entries.filter((p) => p.kind === "recipe").length, 14);
+  assert.ok(
+    html.indexOf("recipes/safe-forwarding/") <
+      html.indexOf("<h2>Destinations</h2>"),
+  );
+  assert.ok(entries.find((p) => p.route === "recipes/new-relic/index.html"));
+  for (const name of ["quarantine-invalid", "asset-enrichment"]) {
+    assert.ok(
+      html.indexOf(`recipes/${name}/`) < html.indexOf("<h2>Destinations</h2>"),
+    );
+  }
   assert.ok(
     entries.find((p) => p.route === "recipes/fortigate-cef-to-ocsf/index.html"),
   );
