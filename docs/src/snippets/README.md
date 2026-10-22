@@ -253,8 +253,8 @@ Every parser's docstring records:
 Highlights (security devices / cloud audit first, server / host
 systems below):
 
-- **PAN-OS** parsers were verified against a live PA-460 in Tap
-  mode, with four wire-format quirks fixed vs. the legacy CEF docs
+- **PAN-OS** parsers were verified against live PAN-OS traffic,
+  with four wire-format quirks fixed vs. the legacy CEF docs
   (severity is 1-5 not 0-10, `cs1=Rule` not Threat Category,
   `signature_id` carries the threat name not `cs2`,
   `SourceLocation` is GeoIP not hostname).
@@ -267,7 +267,7 @@ systems below):
   events): activity_id verb prefix mapping (Get/Describe/List →
   Read, Create/Put/Add → Create, Update/Modify/Set → Update,
   Delete/Remove/Detach → Delete, etc.) covers ~99% of the corpus.
-- **OpenSSH** verified against a playground sshd capture plus a
+- **OpenSSH** verified against a lab sshd capture plus a
   journald feed of internet-facing sshd traffic; covers
   `Accepted` / `Failed` / `Invalid user` / `Disconnected` /
   `Connection closed` / `banner exchange` / `Did not receive

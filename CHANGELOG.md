@@ -1658,7 +1658,7 @@ One filter in `packaging/snippets/filters/`:
 
 Field naming follows the parser ↔ composer contract: `workspace.limpid.<canonical-OCSF-field>` — the parser picks vendor fields off the wire and writes them to a single canonical scratch namespace, the composer reads only that namespace and emits OCSF JSON. Vendor intermediates (`workspace.cef`, `workspace.syslog`, `workspace.pf`, etc.) are parser-private.
 
-Verified against real / public test corpora where available (playground sshd, FLAWS CloudTrail dataset, OTRF Mordor Windows event JSON, miroslav-siklosi Cisco ASA syslog generator, real Postfix mail.log slice). Each parser's docstring records the specific dataset and its parse-rate, plus `NOTE`-flagged subtypes that are documented but not yet exercised against live data.
+Verified against real / public test corpora where available (lab sshd, FLAWS CloudTrail dataset, OTRF Mordor Windows event JSON, miroslav-siklosi Cisco ASA syslog generator, real Postfix mail.log slice). Each parser's docstring records the specific dataset and its parse-rate, plus `NOTE`-flagged subtypes that are documented but not yet exercised against live data.
 
 ### Fixed — sub-process `error` propagates past the `ProcessCall` boundary
 
