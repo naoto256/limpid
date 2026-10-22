@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn header_escape_handles_utf8_and_odd_backslash_parity() {
-        // Pin two shapes the reviewer confirmed the splitter handles:
+        // Pin two shapes the splitter handles:
         // multi-byte UTF-8 around an escaped pipe (the byte scan keys
         // on ASCII `\` / `|`, which cannot occur inside a multi-byte
         // sequence), and odd backslash parity before a pipe —
