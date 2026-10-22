@@ -14,6 +14,7 @@
 //!     type otlp_http
 //!     bind "0.0.0.0:4318"
 //!     body_limit "16MB"            // optional, default 16 MiB
+//!     body_timeout "30s"           // optional, total body receive deadline
 //!     rate_limit 10000             // optional, events/sec budget
 //!     request_rate_limit 100       // optional, req/sec budget
 //!     max_concurrent_requests 32   // optional, in-flight req cap
@@ -32,10 +33,12 @@
 //! are required, `ca` enables client-certificate verification
 //! (mTLS). Same shape as `input otlp_grpc` and `input syslog_tcp`.
 //!
-//! The four budgets stack as orthogonal defense layers:
+//! The five budgets stack as orthogonal defense layers:
 //! - `body_limit` caps **bytes per single request** (axum body limit)
 //! - `max_concurrent_requests` caps **simultaneous in-flight requests**
-//!   — bounds worst-case decode memory to `permits × body_limit`
+//!   — bounds buffered request bodies to `permits × body_limit`; decoded
+//!   requests and emitted events are not covered
+//! - `body_timeout` caps **time spent receiving each body** (default 30s)
 //! - `request_rate_limit` caps **sustained req/sec** (burst-equal-to-rate)
 //! - `rate_limit` caps **emitted events/sec** to the pipeline
 //!   (per-LogRecord, applied after split — the same one as `syslog_*`)
@@ -59,7 +62,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{
     Router,
-    extract::{ConnectInfo, DefaultBodyLimit, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::post,
@@ -107,6 +110,7 @@ fn truncate_decode_err(s: &str) -> String {
 pub struct OtlpHttpInput {
     bind_addr: String,
     body_limit: usize,
+    body_timeout: Duration,
     rate_limit: Option<u64>,
     request_rate_limit: Option<u64>,
     max_concurrent_requests: Option<usize>,
@@ -130,6 +134,13 @@ const OTLP_HTTP_INPUT_SCHEMA: &[PropertySpec] = &[
         repeatable: false,
         exclusive_group: None,
         kind: PropertyValueKind::Size,
+    },
+    PropertySpec {
+        name: "body_timeout",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Duration,
     },
     PropertySpec {
         name: "rate_limit",
@@ -202,6 +213,14 @@ impl Module for OtlpHttpInput {
             }
             None => DEFAULT_BODY_LIMIT_BYTES,
         };
+        let body_timeout = props::get_string(properties, "body_timeout")
+            .map(|s| props::parse_duration(&s))
+            .transpose()
+            .with_context(|| format!("input '{}': invalid body_timeout", name))?
+            .unwrap_or(Duration::from_secs(30));
+        if body_timeout.is_zero() {
+            anyhow::bail!("input '{}': body_timeout must be greater than 0", name);
+        }
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
         let request_rate_limit =
             props::get_strictly_positive_int(properties, "request_rate_limit")?;
@@ -211,6 +230,7 @@ impl Module for OtlpHttpInput {
         Ok(Self {
             bind_addr: bind,
             body_limit,
+            body_timeout,
             rate_limit,
             request_rate_limit,
             max_concurrent_requests,
@@ -229,14 +249,16 @@ impl HasMetrics for OtlpHttpInput {
 
 #[derive(Clone)]
 struct AppState {
+    body_limit: usize,
+    body_timeout: Duration,
     tx: mpsc::Sender<Event>,
     metrics: Arc<InputMetrics>,
     rate_limiter: Option<Arc<RateLimiter>>,
     request_limiter: Option<Arc<RateLimiter>>,
     /// Bounds the number of in-flight `handle_logs` invocations.
-    /// Worst-case decode memory = `permits × body_limit`, so this
-    /// turns an open-ended decode-amplification path into a known
-    /// quantity. Pairs with `request_limiter` (smooths sustained QPS)
+    /// Acquired before body collection, bounding buffered request bodies
+    /// to `permits × body_limit` bytes. Pairs with `request_limiter`
+    /// (smooths sustained QPS)
     /// and the per-event `rate_limiter` (caps pipeline send rate).
     concurrency: Option<Arc<Semaphore>>,
 }
@@ -265,16 +287,15 @@ impl Input for OtlpHttpInput {
             info!("otlp_http max_concurrent_requests: {}", n);
         }
         let state = AppState {
+            body_limit: self.body_limit,
+            body_timeout: self.body_timeout,
             tx,
             metrics: Arc::clone(&self.metrics),
             rate_limiter,
             request_limiter,
             concurrency,
         };
-        let app = Router::new()
-            .route("/v1/logs", post(handle_logs))
-            .layer(DefaultBodyLimit::max(self.body_limit))
-            .with_state(state);
+        let app = logs_router(state);
 
         // Build the TLS server config up-front so cert / key parse
         // errors fail-fast before the listener binds. `RustlsConfig`
@@ -352,6 +373,13 @@ where
     }
 }
 
+fn logs_router(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/logs", post(handle_logs))
+        .layer(DefaultBodyLimit::max(state.body_limit))
+        .with_state(state)
+}
+
 /// Handler for `POST /v1/logs`. Decodes the wire body per
 /// `Content-Type`, then hands the parsed request off to
 /// [`split_request`] which is shared with [`super::grpc`].
@@ -359,15 +387,27 @@ async fn handle_logs(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    request: Request,
 ) -> impl IntoResponse {
-    state.metrics.events_received.inc();
-    state.metrics.bytes_received.inc_by(body.len() as u64);
+    // Reject oversized declarations even when all permits are occupied.
+    // The body extractor still enforces the limit for streamed bodies.
+    if request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|length| length > state.body_limit as u64)
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "otlp_http: body_limit exceeded",
+        )
+            .into_response();
+    }
 
-    // Concurrency cap (semaphore) bounds simultaneous decode work.
-    // Combined with body_limit, this turns the worst-case decode
-    // memory into a fixed `permits × body_limit` budget. Held for
-    // the entire handler lifetime via `_permit`.
+    // Acquire before collecting the body so concurrent uploads cannot
+    // bypass the `permits × body_limit` buffered-body budget. Hold the
+    // permit through body collection, decode, throttling and dispatch.
     //
     // Failure mode is fail-fast (HTTP 503) rather than queue-and-wait
     // because OTLP senders typically retry, so backpressuring the
@@ -387,6 +427,29 @@ async fn handle_logs(
         },
         None => None,
     };
+
+    // Use the Bytes extractor explicitly to retain DefaultBodyLimit and
+    // its standard rejection responses (including HTTP 413).
+    // A stalled upload must not retain a concurrency permit indefinitely.
+    // This is a total receive deadline, excluding decode and dispatch.
+    let body = match tokio::time::timeout(
+        state.body_timeout,
+        axum::body::Bytes::from_request(request, &state),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(rejection)) => return rejection.into_response(),
+        Err(_) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                "otlp_http: body_timeout exceeded",
+            )
+                .into_response();
+        }
+    };
+    state.metrics.events_received.inc();
+    state.metrics.bytes_received.inc_by(body.len() as u64);
 
     // Per-request token bucket. Smooths sustained req/sec; pairs with
     // (not replaces) the concurrency cap above. A burst-equal-to-rate
@@ -860,6 +923,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let metrics = InputMetrics::for_testing();
         let state = AppState {
+            body_limit: DEFAULT_BODY_LIMIT_BYTES,
+            body_timeout: Duration::from_secs(30),
             tx,
             metrics: Arc::clone(&metrics),
             rate_limiter: None,
@@ -873,7 +938,7 @@ mod tests {
             State(state.clone()),
             ConnectInfo(peer),
             HeaderMap::new(),
-            invalid.clone(),
+            Request::new(axum::body::Body::from(invalid.clone())),
         )
         .await
         .into_response();
@@ -889,7 +954,7 @@ mod tests {
             State(state),
             ConnectInfo(peer),
             HeaderMap::new(),
-            axum::body::Bytes::new(),
+            Request::new(axum::body::Body::empty()),
         )
         .await
         .into_response();
@@ -1144,5 +1209,243 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+    }
+
+    #[tokio::test]
+    async fn concurrency_permit_covers_body_read_and_rejects_without_polling_body() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+
+        let (tx, _rx) = mpsc::channel(8);
+        let metrics = InputMetrics::for_testing();
+        let concurrency = Arc::new(Semaphore::new(1));
+        let state = AppState {
+            body_limit: DEFAULT_BODY_LIMIT_BYTES,
+            body_timeout: Duration::from_secs(30),
+            tx,
+            metrics: Arc::clone(&metrics),
+            rate_limiter: None,
+            request_limiter: None,
+            concurrency: Some(Arc::clone(&concurrency)),
+        };
+        let peer: SocketAddr = "127.0.0.1:4318".parse().unwrap();
+        // Keep the first upload incomplete: it must hold the permit
+        // while waiting for its body, before any decode can begin.
+        let (body_tx, body_rx) = mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            handle_logs(
+                State(first_state),
+                ConnectInfo(peer),
+                HeaderMap::new(),
+                Request::new(axum::body::Body::from_stream(ReceiverStream::new(body_rx))),
+            )
+            .await
+            .into_response()
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while concurrency.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload must acquire the permit before reading its body");
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let body_polls = Arc::clone(&polls);
+        let large_body = tokio_stream::iter([()]).map(move |_| {
+            body_polls.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![0; 32 * 1024 * 1024]))
+        });
+        let request = Request::builder()
+            .body(axum::body::Body::from_stream(large_body))
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle_logs(State(state), ConnectInfo(peer), HeaderMap::new(), request),
+        )
+        .await
+        .expect("overflow must fail without reading the body")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            0,
+            "rejected body must never be polled"
+        );
+        assert_eq!(metrics.bytes_received.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 0);
+
+        drop(body_tx);
+        let response = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            concurrency.available_permits(),
+            1,
+            "permit must be released after completion"
+        );
+    }
+
+    #[test]
+    fn body_timeout_defaults_and_validates_duration() {
+        let build = |properties: &[crate::dsl::ast::Property]| {
+            OtlpHttpInput::from_properties(
+                "test",
+                &mp(properties),
+                &crate::modules::BuildContext::for_testing(),
+            )
+        };
+        assert_eq!(build(&[]).unwrap().body_timeout, Duration::from_secs(30));
+        assert_eq!(
+            build(&[prop_str("body_timeout", "250ms")])
+                .unwrap()
+                .body_timeout,
+            Duration::from_millis(250)
+        );
+        for value in ["0", "0s", "0ms", "nonsense", "-1s"] {
+            assert!(
+                build(&[prop_str("body_timeout", value)]).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn router_enforces_body_deadline_size_precedence_and_releases_permit() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn status(stream: &mut tokio::net::TcpStream) -> u16 {
+            tokio::time::timeout(Duration::from_secs(4), async {
+                let mut line = Vec::new();
+                loop {
+                    let byte = stream.read_u8().await.unwrap();
+                    line.push(byte);
+                    if byte == b'\n' {
+                        break;
+                    }
+                    assert!(line.len() < 256);
+                }
+                String::from_utf8(line)
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .await
+            .expect("server must respond without waiting for the rest of the body")
+        }
+
+        let (tx, _rx) = mpsc::channel(8);
+        let metrics = InputMetrics::for_testing();
+        let concurrency = Arc::new(Semaphore::new(1));
+        let state = AppState {
+            body_limit: 256,
+            body_timeout: Duration::from_secs(2),
+            tx,
+            metrics: Arc::clone(&metrics),
+            rate_limiter: None,
+            request_limiter: None,
+            concurrency: Some(Arc::clone(&concurrency)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = Handle::new();
+        let server_handle = handle.clone();
+        let server = tokio::spawn(async move {
+            axum_server::from_tcp(listener.into_std().unwrap())
+                .handle(server_handle)
+                .serve(logs_router(state).into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+        handle.listening().await.expect("listener must be ready");
+
+        // Both a partial fixed-length body and a partial chunked body
+        // must time out through the real router and HTTP server.
+        for framing in [
+            "Content-Length: 100\r\n\r\nx",
+            "Transfer-Encoding: chunked\r\n\r\n1\r\nx\r\n",
+        ] {
+            let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+            slow.write_all(
+                format!(
+                    "POST /v1/logs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{framing}"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while concurrency.available_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("slow upload must own the permit");
+
+            // An oversized declaration wins over saturation, without
+            // sending any body at all.
+            let mut oversized = tokio::net::TcpStream::connect(addr).await.unwrap();
+            oversized.write_all(b"POST /v1/logs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 257\r\n\r\n").await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), status(&mut oversized))
+                    .await
+                    .unwrap(),
+                413
+            );
+            assert_eq!(concurrency.available_permits(), 0);
+
+            let mut overflow = tokio::net::TcpStream::connect(addr).await.unwrap();
+            overflow.write_all(b"POST /v1/logs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), status(&mut overflow))
+                    .await
+                    .unwrap(),
+                503
+            );
+            assert_eq!(status(&mut slow).await, 408);
+            assert_eq!(concurrency.available_permits(), 1);
+        }
+        // Without a declared size the extractor must still enforce
+        // DefaultBodyLimit while collecting an admitted chunked body.
+        let mut streamed = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST /v1/logs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n101\r\n{}\r\n0\r\n\r\n",
+            "x".repeat(257)
+        );
+        streamed.write_all(request.as_bytes()).await.unwrap();
+        assert_eq!(status(&mut streamed).await, 413);
+        assert_eq!(concurrency.available_permits(), 1);
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.bytes_received.load(Ordering::Relaxed), 0);
+
+        // The oversized declaration must also return immediately when
+        // capacity is free, leaving it available for a valid request.
+        let mut oversized = tokio::net::TcpStream::connect(addr).await.unwrap();
+        oversized.write_all(b"POST /v1/logs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 257\r\n\r\n").await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), status(&mut oversized))
+                .await
+                .unwrap(),
+            413
+        );
+        assert_eq!(concurrency.available_permits(), 1);
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/logs"))
+            .body(Vec::new())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.bytes_received.load(Ordering::Relaxed), 0);
+        handle.shutdown();
+        server.await.unwrap();
     }
 }
