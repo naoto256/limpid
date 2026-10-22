@@ -1,9 +1,8 @@
 # cargo-audit configuration.
 #
 # Mirrors `deny.toml`'s [advisories.ignore] entries so the two tools
-# stay in sync. The uchgs pre-push gate verifies both
-# `push cargo-deny` and `push cargo-audit` push-receipts; their
-# acceptance criteria must match or one will silently drift past the
+# stay in sync: `cargo audit` and `cargo deny check advisories` must
+# accept the same advisories, or one will silently drift past the
 # other.
 #
 # Every ignore MUST carry a rationale comment pointing at the underlying

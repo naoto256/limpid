@@ -176,8 +176,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
-      # Cryptographic provenance is a separate owner decision: adding an
-      # attestation would also require id-token: write, which is not granted here.
+      # Release assets are published without build attestations; adding
+      # one would also require id-token: write, which this job does not grant.
       contents: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin-audit:2026-06-03 de0fac2 | v6.0.2

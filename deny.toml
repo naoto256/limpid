@@ -1,9 +1,9 @@
 # cargo-deny configuration.
 #
-# Gate `cargo deny check` for limpid's supply chain. Run as part of the
-# uchgs pre-push security audit (see ~/.config/git/uchgs/README.md);
-# `code-rust-audit` skill reads this config and issues the
-# `push cargo-deny` receipt.
+# Gate `cargo deny check` for limpid's supply chain. CI runs
+# `cargo deny check advisories bans sources licenses` against this config
+# on pull requests and pushes to main and release branches
+# (.github/workflows/ci.yml).
 #
 # Posture: limpid itself is dual-licensed `MIT OR Apache-2.0` (permissive,
 # no source-disclosure obligation). The allow list below admits only
