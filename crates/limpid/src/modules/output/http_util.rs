@@ -13,6 +13,38 @@
 /// needs to see in the daemon log.
 pub(crate) const ERROR_BODY_BYTE_CAP: usize = 4096;
 
+/// Maximum characters shown for a redirect destination, excluding the
+/// field label, quotes and optional truncation marker.
+const LOCATION_MAX_CHARS: usize = 200;
+
+/// Show a redirect destination without URL credentials, query or fragment.
+/// Resolve relative references against the response URL; never echo an
+/// unparseable value or a non-HTTP URL, which may itself contain secrets.
+pub(crate) fn location_snippet(
+    headers: &reqwest::header::HeaderMap,
+    base: &reqwest::Url,
+) -> String {
+    let Some(value) = headers.get(reqwest::header::LOCATION) else {
+        return String::new();
+    };
+    let Some(mut url) = value.to_str().ok().and_then(|value| base.join(value).ok()) else {
+        return "; Location: <invalid URL>".into();
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return "; Location: <non-HTTP URL>".into();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut chars = url.as_str().chars();
+    let mut snippet: String = chars.by_ref().take(LOCATION_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        snippet.push('…');
+    }
+    format!("; Location: {snippet:?}")
+}
+
 /// Drain at most `cap` bytes from the response, then stop. Uses
 /// `Response::chunk()` (available without the `stream` reqwest
 /// feature) so we don't have to pull in `futures-util` for one
@@ -72,5 +104,57 @@ pub(crate) async fn error_snippet(
             .chars()
             .take(max_chars)
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snippet(location: &str) -> String {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::LOCATION, location.parse().unwrap());
+        location_snippet(
+            &headers,
+            &reqwest::Url::parse("https://origin.example/v1/logs").unwrap(),
+        )
+    }
+
+    #[test]
+    fn location_omits_credentials_queries_and_fragments() {
+        assert_eq!(
+            snippet("https://user:password@collector.example:8443/logs?token=secret#private"),
+            "; Location: \"https://collector.example:8443/logs\""
+        );
+        assert_eq!(
+            snippet("../target?token=secret#private"),
+            "; Location: \"https://origin.example/target\""
+        );
+        assert_eq!(
+            snippet("//user:password@collector.example/logs?token=secret"),
+            "; Location: \"https://collector.example/logs\""
+        );
+    }
+
+    #[test]
+    fn location_caps_long_paths_and_hides_unparseable_values() {
+        let url = format!(
+            "https://collector.example/{}?token=secret",
+            "x".repeat(1000)
+        );
+        let expected: String = url.chars().take(LOCATION_MAX_CHARS).collect();
+        assert_eq!(snippet(&url), format!("; Location: \"{expected}…\""));
+        assert_eq!(snippet("http://[secret"), "; Location: <invalid URL>");
+        assert_eq!(
+            snippet("data:text/plain,secret"),
+            "; Location: <non-HTTP URL>"
+        );
+        assert!(
+            location_snippet(
+                &reqwest::header::HeaderMap::new(),
+                &reqwest::Url::parse("https://origin.example/").unwrap()
+            )
+            .is_empty()
+        );
     }
 }

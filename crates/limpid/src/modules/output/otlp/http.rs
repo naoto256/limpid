@@ -60,7 +60,9 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::batched::{BatchSinkPolicy, BatchedSink, SendOutcome};
-use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet, read_body_capped};
+use crate::modules::output::http_util::{
+    ERROR_BODY_BYTE_CAP, error_snippet, location_snippet, read_body_capped,
+};
 use crate::modules::output::syslog_peers::{RotatingPeers, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
@@ -286,6 +288,7 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
     // `crate::tls::TLS_PROTOCOL_VERSIONS` (see the rationale there
     // and the matching builder in `output http`).
     let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(HTTP_REQUEST_TIMEOUT)
         .min_tls_version(reqwest::tls::Version::TLS_1_2);
     if !verify {
@@ -549,15 +552,17 @@ async fn send_once(
     policy.metrics.bytes_written.inc_by(body_len as u64);
     let status = resp.status();
     if !status.is_success() {
+        let location = location_snippet(resp.headers(), resp.url());
         // 4 KiB byte cap, 500 chars on the lossy decode for the log
         // line; gzip / brotli / deflate get a placeholder so the
         // daemon log doesn't fill with replacement-char soup (limpid's
         // reqwest is built without those decompression features).
         let snippet = error_snippet(resp, ERROR_BODY_BYTE_CAP, 500).await;
         bail!(
-            "output otlp_http: {} returned HTTP {} — {}",
+            "output otlp_http: {} returned HTTP {}{} — {}",
             peer.endpoint,
             status.as_u16(),
+            location,
             snippet
         );
     }
@@ -2203,5 +2208,94 @@ def output test {{
             Arc::ptr_eq(stored, &writer),
             "constructor must store the exact Arc passed in"
         );
+    }
+
+    #[tokio::test]
+    async fn redirects_fail_without_forwarding_and_preserve_events_in_dlq() {
+        use axum::{Router, http::StatusCode, routing::any};
+        for code in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::TEMPORARY_REDIRECT,
+        ] {
+            let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let target_hits = Arc::clone(&hits);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app =
+                Router::new()
+                    .route(
+                        "/",
+                        any(move || async move {
+                            (code, [("Location", "/target?token=secret#private")])
+                        }),
+                    )
+                    .route(
+                        "/target",
+                        any(move || {
+                            let hits = Arc::clone(&target_hits);
+                            async move {
+                                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                StatusCode::OK
+                            }
+                        }),
+                    );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let dlq_path = dir.path().join("redirect.jsonl");
+            let ctx = crate::modules::BuildContext {
+                error_log: Some(Arc::new(crate::error_log::ErrorLogWriter::new(
+                    dlq_path.clone(),
+                ))),
+                ..crate::modules::BuildContext::for_testing()
+            };
+            let props = vec![
+                peer_block(&format!("http://{addr}/")),
+                prop_int("batch_size", 1),
+                Property::Block {
+                    key: "retry".into(),
+                    key_quoted: false,
+                    key_span: None,
+                    properties: vec![
+                        prop_int("max_attempts", 1),
+                        prop_str("initial_wait", "1ms"),
+                        prop_str("max_wait", "1ms"),
+                    ],
+                },
+            ];
+            let output = OtlpHttpOutput::from_properties("redirect", &mp(&props), &ctx).unwrap();
+            let event = event_with_egress(singleton_bytes(1));
+            let disposition = consume_and_wait_disposition(&output, &event, Duration::from_secs(3))
+                .await
+                .unwrap();
+            assert_eq!(disposition, crate::queue::AckDisposition::Recovered);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert_eq!(
+                output
+                    .metrics
+                    .events_written
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+            let dlq = tokio::fs::read_to_string(&dlq_path).await.unwrap();
+            assert_eq!(dlq.lines().count(), 1);
+            assert!(
+                dlq.contains(&event.key().to_string()),
+                "original event must be retained: {dlq}"
+            );
+            let record: serde_json::Value = serde_json::from_str(dlq.trim()).unwrap();
+            let reason = record["reason"].as_str().unwrap();
+            let destination = format!("http://{addr}/target");
+            let expected = format!(
+                "returned HTTP {}; Location: {destination:?} — ",
+                code.as_u16()
+            );
+            assert!(reason.contains(&expected), "{reason}");
+            assert!(!reason.contains("token=secret"), "{reason}");
+            assert!(!reason.contains("private"), "{reason}");
+            assert_eq!(record["event"]["egress"], event.to_json_value()["egress"]);
+            server.abort();
+        }
     }
 }
