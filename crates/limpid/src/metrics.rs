@@ -788,7 +788,7 @@ mod registry_core {
             self.value.fetch_add(1, Ordering::Relaxed);
         }
 
-        /// Decrement by one, saturating at zero. `fetch_update`
+        /// Decrement by one, saturating at zero. `try_update`
         /// carries the concurrent CAS, and `checked_sub` keeps an
         /// underflow at zero instead of wrapping to `u64::MAX`; the
         /// `debug_assert!` surfaces a lifecycle imbalance loudly in
@@ -796,7 +796,7 @@ mod registry_core {
         pub(crate) fn dec(&self) {
             let updated = self
                 .value
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_sub(1)
                 });
             debug_assert!(updated.is_ok(), "gauge decrement underflow");
