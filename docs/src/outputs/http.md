@@ -4,6 +4,8 @@ Sends events to one or more HTTP/HTTPS endpoints. Supports batching, gzip compre
 
 Works with Elasticsearch Bulk API, Splunk HEC, Datadog, Grafana Loki, and any generic HTTP endpoint.
 
+Redirects are not followed. All 3xx responses are failures and use the normal retry and DLQ path; errors include a sanitized `Location` destination when present (userinfo, query and fragment removed; capped at 200 characters plus a truncation marker). Configure the final endpoint directly.
+
 ## Configuration
 
 ```limpid
