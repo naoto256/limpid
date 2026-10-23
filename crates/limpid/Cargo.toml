@@ -48,10 +48,12 @@ zeroize = { workspace = true }
 indexmap = { version = "2", features = ["serde"] }
 # Per-event bump arena for the DSL `Value` tree. Each event allocates
 # transient `Value::Object` / `Value::Array` / `Value::String` /
-# `Value::Bytes` payloads from a thread-local `Bump`; the bump is reset
-# at event end, replacing per-allocation `drop_in_place<Value>` chains
-# (~23% of allocator samples on v0.5.7 D pipeline) with a single
-# pointer reset. See `_PLAN_V060_PERF.md`.
+# `Value::Bytes` payloads from a `Bump` owned by its pipeline worker
+# task; the bump is reset at event end, replacing per-allocation
+# `drop_in_place<Value>` chains (~23% of allocator samples on v0.5.7 D
+# pipeline) with a single pointer reset. See
+# `runtime/pipeline_worker.rs` for arena ownership and the `pipeline`
+# module docs for the owned/borrowed event boundary.
 bumpalo = { version = "3", features = ["collections"] }
 # Small-string optimisation for the boundary `OwnedValue::String` form.
 # Strings up to 24 bytes (the inline budget on 64-bit targets) live in
