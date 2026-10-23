@@ -183,7 +183,8 @@ fn main() -> Result<()> {
 /// privileged ports (< 1024) — the packaged `limpid.service` ships
 /// with `User=syslog`. Operators who genuinely need to run as
 /// root (containerised init that hasn't dropped UID yet, debugging on
-/// a workstation, …) can set `LIMPID_ALLOW_ROOT=1` to override.
+/// a workstation, …) can set `LIMPID_ALLOW_ROOT=1` to override. Only
+/// that exact value is accepted; an empty value or `0` does not opt in.
 ///
 /// The check applies only to daemon mode. `--check` / `--test-pipeline`
 /// / `--graph` are read-only analyses with no network or file-system
@@ -193,7 +194,7 @@ fn refuse_root_unless_overridden() -> Result<()> {
     #[cfg(unix)]
     {
         let euid = unsafe { libc::geteuid() };
-        if euid == 0 && std::env::var_os("LIMPID_ALLOW_ROOT").is_none() {
+        if !root_allowed(euid, std::env::var_os("LIMPID_ALLOW_ROOT").as_deref()) {
             anyhow::bail!(
                 "limpid refuses to start as root (euid 0). Run as an \
                  unprivileged user; bind privileged ports via systemd \
@@ -203,6 +204,49 @@ fn refuse_root_unless_overridden() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn root_allowed(euid: libc::uid_t, override_value: Option<&std::ffi::OsStr>) -> bool {
+    euid != 0 || override_value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(all(test, unix))]
+mod root_guard_tests {
+    use super::root_allowed;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn root_requires_exact_opt_in_value() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some("01"),
+            Some(" 1"),
+            Some("1 "),
+            Some("1\n"),
+        ] {
+            assert!(!root_allowed(0, value.map(OsStr::new)), "{value:?}");
+        }
+        assert!(!root_allowed(0, Some(OsStr::from_bytes(&[0xff]))));
+        assert!(root_allowed(0, Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn unprivileged_execution_does_not_require_an_override() {
+        for value in [
+            None,
+            Some(OsStr::new("0")),
+            Some(OsStr::new("1")),
+            Some(OsStr::from_bytes(&[0xff])),
+        ] {
+            assert!(root_allowed(1000, value));
+        }
+    }
 }
 
 /// Load a config file from disk and run the full compile-validate-
