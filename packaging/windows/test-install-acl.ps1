@@ -1,7 +1,7 @@
 #requires -Version 7.0
 # Purpose: Exercise install.ps1's ACL and shared-parent helpers against a
-# throwaway fixture, covering the native ACL-at-creation path and the
-# DeleteChild rejection contract.
+# throwaway fixture with a protected, explicit DACL, covering the native
+# ACL-at-creation path and the DeleteChild rejection contract.
 # Preconditions: PowerShell 7.0+; PackageDirectory is usable by install.ps1's
 # WhatIf preflight (which is dot-sourced to reuse the production helpers);
 # ResultsDirectory does not yet exist so no unrelated content is co-mingled.
@@ -28,20 +28,35 @@ $fixture = [IO.Path]::GetFullPath($ResultsDirectory)
 if (Test-Path -LiteralPath $fixture) { throw 'Choose a new fixture directory.' }
 # Load production helpers through the read-only installer preflight.
 . "$PSScriptRoot/install.ps1" -PackageDirectory $PackageDirectory -WhatIf
-New-Item -ItemType Directory -Path $fixture | Out-Null
-$sibling = Join-Path $fixture 'unmanaged'
-New-Item -ItemType Directory -Path $sibling | Out-Null
-$payload = Join-Path $sibling 'fixture.txt'
-[IO.File]::WriteAllText($payload, 'synthetic sibling fixture')
-$everyone = [Security.Principal.SecurityIdentifier]::new('S-1-1-0')
-$original = Get-Acl -LiteralPath $fixture
-$parentOwner = (Get-Acl -LiteralPath ([IO.Path]::GetDirectoryName($fixture))).GetOwner([Security.Principal.SecurityIdentifier]).Value
-Write-Output "ACL fixture: user=$($identity.User.Value); owner=$($original.GetOwner([Security.Principal.SecurityIdentifier]).Value); parentOwner=$parentOwner; administratorRole=$([Security.Principal.WindowsPrincipal]::new($identity).IsInRole($admins))"
-
-# === Shared-parent acceptance and rejection paths ===
-$parentAcl = Get-Acl -LiteralPath $fixture
-$parentAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyone, 'Write', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+# Give the fixture its own trusted ACL at creation. Inheriting the runner's
+# temporary-directory DACL can introduce unrelated grants into this test.
+$fixtureAcl = [Security.AccessControl.DirectorySecurity]::new()
+$fixtureAcl.SetOwner($identity.User)
+$fixtureAcl.SetAccessRuleProtection($true, $false)
+$inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+foreach ($sid in @($admins, $system, $identity.User)) {
+    $fixtureAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', $inherit, 'None', 'Allow'))
+}
+$original = $null
 try {
+    [IO.FileSystemAclExtensions]::Create([IO.DirectoryInfo]::new($fixture), $fixtureAcl)
+    $original = Get-Acl -LiteralPath $fixture
+    if (-not $original.AreAccessRulesProtected -or
+        $original.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) {
+        throw 'Fixture must start with a protected ACL owned by the current user.'
+    }
+    Assert-TrustedWrites $fixture
+    $sibling = Join-Path $fixture 'unmanaged'
+    New-Item -ItemType Directory -Path $sibling | Out-Null
+    $payload = Join-Path $sibling 'fixture.txt'
+    [IO.File]::WriteAllText($payload, 'synthetic sibling fixture')
+    $everyone = [Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+    $parentOwner = (Get-Acl -LiteralPath ([IO.Path]::GetDirectoryName($fixture))).GetOwner([Security.Principal.SecurityIdentifier]).Value
+    Write-Output "ACL fixture: user=$($identity.User.Value); owner=$($original.GetOwner([Security.Principal.SecurityIdentifier]).Value); parentOwner=$parentOwner; administratorRole=$([Security.Principal.WindowsPrincipal]::new($identity).IsInRole($admins))"
+
+    # === Shared-parent acceptance and rejection paths ===
+    $parentAcl = Get-Acl -LiteralPath $fixture
+    $parentAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyone, 'Write', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
     Set-Acl -LiteralPath $fixture -AclObject $parentAcl
     $parentBefore = (Get-Acl -LiteralPath $fixture).Sddl
     $siblingBefore = (Get-Acl -LiteralPath $sibling).Sddl
@@ -91,7 +106,26 @@ try {
         }
     }
     if (-not $rejected) { throw 'Unsafe parent deletion grant accepted.' }
+} catch {
+    # Capture the failing DACL before cleanup restores the fixture baseline.
+    # Diagnostic failures must not hide the original assertion or setup error.
+    try {
+        if (Test-Path -LiteralPath $fixture) {
+            $failedAcl = Get-Acl -LiteralPath $fixture
+            Write-Output "Failed fixture ACL: $($failedAcl.Sddl)"
+            foreach ($rule in $failedAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+                Write-Output ("ACE: sid={0}; type={1}; rights={2}; mask={3}; inherited={4}; inheritance={5}; propagation={6}" -f
+                    $rule.IdentityReference.Value, $rule.AccessControlType, $rule.FileSystemRights,
+                    [int64]$rule.FileSystemRights, $rule.IsInherited, $rule.InheritanceFlags, $rule.PropagationFlags)
+            }
+        }
+    } catch {
+        Write-Warning "Unable to inspect failed fixture ACL: $($_.Exception.Message)"
+    }
+    throw
 } finally {
-    Set-Acl -LiteralPath $fixture -AclObject $original
+    if ($null -ne $original) {
+        Set-Acl -LiteralPath $fixture -AclObject $original
+    }
 }
 Write-Output 'PASS: shared parent accepted; child ACL protected at creation; sibling preserved; parent DeleteChild rejected. Elevated service identity not tested.'
