@@ -202,7 +202,14 @@ impl StdoutTransport {
             if changed {
                 set_fd_flags(fd, original_flags | libc::O_NONBLOCK)?;
             }
-            match tokio::io::unix::AsyncFd::new(StdoutFd { fd, _owned: owned }) {
+            // SAFETY: StdoutFd always returns the same immutable descriptor.
+            // Owned test descriptors stay open in _owned until AsyncFd drops.
+            // Production borrows fd 1, which limpid never closes or replaces
+            // after initialization; the process-wide OnceLock retains its
+            // transport. The descriptor was checked and made nonblocking above.
+            match unsafe { tokio::io::unix::AsyncFd::register(StdoutFd { fd, _owned: owned }) }
+                .map_err(io::Error::from)
+            {
                 Ok(async_fd) => StdoutBackend::Async(async_fd),
                 Err(error) => {
                     if changed {
@@ -968,10 +975,14 @@ mod metrics_registration_tests {
     fn async_owned_fd(fd: OwnedFd) -> tokio::io::unix::AsyncFd<StdoutFd> {
         let raw = fd.as_raw_fd();
         set_nonblocking(raw).unwrap();
-        tokio::io::unix::AsyncFd::new(StdoutFd {
-            fd: raw,
-            _owned: Some(fd),
-        })
+        // SAFETY: The immutable raw descriptor comes from the OwnedFd moved
+        // into StdoutFd, so it remains open and unchanged until AsyncFd drops.
+        unsafe {
+            tokio::io::unix::AsyncFd::register(StdoutFd {
+                fd: raw,
+                _owned: Some(fd),
+            })
+        }
         .unwrap()
     }
 
