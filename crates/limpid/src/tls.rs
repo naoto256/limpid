@@ -171,7 +171,7 @@ impl ClientTlsConfig {
 /// should be a deliberate edit here, not a silent inheritance.
 /// The reqwest-based sinks (`output http`, `output otlp_http`) don't
 /// go through this module's builders; they pin the same floor via
-/// `ClientBuilder::min_tls_version`. (Security audit Low 4-3.)
+/// `ClientBuilder::min_tls_version`.
 static TLS_PROTOCOL_VERSIONS: &[&rustls::SupportedProtocolVersion] =
     &[&rustls::version::TLS13, &rustls::version::TLS12];
 
@@ -284,7 +284,6 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     // Warn (don't refuse) on a group/other-readable key file: refusing
     // would brick existing deployments on upgrade, but a private key
     // readable by other local users defeats the point of TLS/mTLS.
-    // (Security audit Low 4-3.)
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

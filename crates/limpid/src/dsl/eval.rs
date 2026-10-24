@@ -104,10 +104,10 @@ pub fn eval_expr_with_scope<'bump>(
         ExprKind::Template(fragments) => {
             // Render template fragments against the current event.
             // Interpolated values are coerced to string via
-            // value_to_string; Bytes interpolation is rejected per
-            // Bytes design §3 — users must convert explicitly via
-            // `to_string()`. The composed result lands in the arena
-            // so subsequent assignments stay arena-local.
+            // value_to_string; Bytes interpolation is rejected —
+            // users must convert explicitly via `to_string()`. The
+            // composed result lands in the arena so subsequent
+            // assignments stay arena-local.
             let mut out = String::new();
             for frag in fragments {
                 match frag {
@@ -200,9 +200,9 @@ pub fn eval_expr_with_scope<'bump>(
                         .find(|(k, _)| *k == field.as_str())
                         .map(|(_, v)| *v)
                         .unwrap_or(Value::Null),
-                    // Per Bytes design §13, property traversal through
-                    // a scalar (Bytes / String / number / bool) is an
-                    // error — the analyzer flags it statically; at
+                    // Property traversal through a scalar (Bytes /
+                    // String / number / bool) is an error — the
+                    // analyzer flags it statically; at
                     // runtime we surface the same condition so dynamic
                     // data shapes don't silently return Null.
                     Value::Bytes(_) => bail!("cannot access field `{}` on a bytes value", field),
@@ -739,7 +739,7 @@ fn eval_unary_op<'bump>(op: UnaryOp, val: &Value<'bump>) -> Result<Value<'bump>>
 /// Value equality used for both the `==`/`!=` binary operators and
 /// `switch` pattern matching. Numbers compare by their numeric value so
 /// `1 == 1.0` agrees; Bytes compares byte-wise but never matches a
-/// String of the same UTF-8 spelling (per Bytes design §1).
+/// String of the same UTF-8 spelling.
 pub fn values_match(left: &Value<'_>, right: &Value<'_>) -> bool {
     match (left, right) {
         (Value::Int(a), Value::Int(b)) => a == b,
@@ -824,8 +824,8 @@ fn compare_values(left: &Value<'_>, right: &Value<'_>) -> Option<std::cmp::Order
     }
 }
 
-/// `+` operator. String concat (existing behaviour), Bytes concat (new
-/// for v0.5.0 Bytes design §2), numeric otherwise. Mixed-type Bytes
+/// `+` operator. String concat (existing behaviour), Bytes concat
+/// (added in v0.5.0), numeric otherwise. Mixed-type Bytes
 /// participation is an error.
 fn add_values<'bump>(
     left: &Value<'bump>,

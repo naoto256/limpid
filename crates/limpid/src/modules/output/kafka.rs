@@ -1049,7 +1049,7 @@ mod tests {
 
     #[test]
     fn pre_check_plain_requires_tls_fires_before_password_file_read() {
-        // Regression guard for the audit finding A2: if both the
+        // Regression guard for the pre-check ordering: if both the
         // password_file path is broken AND the operator wrote
         // `mechanism plain` without a tls block, the pre-check
         // surfaces the TLS requirement *first*. Without the pre-
