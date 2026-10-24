@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn equality_int_float_cross_compares() {
-        // Decision §1: numeric cross-type equality holds at the
+        // Numeric cross-type equality holds at the
         // structural level so `1 == 1.0` agrees inside containers.
         assert_eq!(Value::Int(1), Value::Float(1.0));
         assert_eq!(Value::Float(2.0), Value::Int(2));
@@ -755,7 +755,7 @@ mod tests {
 
     #[test]
     fn equality_bytes_string_disagree() {
-        // Decision §1: Bytes vs String is always unequal.
+        // Bytes vs String is always unequal.
         with_arena(|arena| {
             let s = Value::String(arena.alloc_str("hi"));
             let b = Value::Bytes(arena.alloc_bytes(b"hi"));

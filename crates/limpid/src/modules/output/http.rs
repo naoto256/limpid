@@ -2825,11 +2825,11 @@ def output o {{
         server.abort();
     }
 
-    /// Audit-identified leak (2026-06-27 follow-up): the flusher actor
-    /// was mid-`send().await` against a stalled peer when
-    /// `shutdown()` signalled. The previous fix collapsed retry sleeps
-    /// but not the transport call itself, so the actor sat on its
-    /// stack-local `shippable` Vec until the runtime aborted it,
+    /// Regression for a shutdown leak: the flusher actor was
+    /// mid-`send().await` against a stalled peer when `shutdown()`
+    /// signalled. Collapsing retry sleeps alone did not cancel the
+    /// transport call itself, so the actor sat on its stack-local
+    /// `shippable` Vec until it was aborted,
     /// dropping every parked `QueueAckHandle` unresolved (debug:
     /// panic; release: silent loss).
     ///

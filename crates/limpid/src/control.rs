@@ -641,7 +641,7 @@ impl ControlServer {
 
         // Restrict socket permissions to owner + group (0o660).
         //
-        // TOCTOU note (security audit Low 3-3): between `bind` above
+        // TOCTOU note: between `bind` above
         // and this chmod, the socket briefly carries umask-derived
         // permissions (typically 0o755 under umask 022) — a local
         // attacker who can reach the inode could connect in that
