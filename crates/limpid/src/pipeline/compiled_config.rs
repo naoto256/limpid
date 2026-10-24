@@ -230,16 +230,23 @@ mod tests {
                 "capacity",
             ),
             (
-                r#"table { cache { ttl 9223372036854775807 } }"#,
-                "Instant range",
-            ),
-            (
                 r#"def output o { type stdout queue { type disk max_size "18014398509481984KB" } }"#,
                 "u64 byte range",
             ),
         ] {
             let error = compile(source).unwrap().validate().unwrap_err().to_string();
             assert!(error.contains(expected), "{source}: {error}");
+        }
+        let ttl = std::time::Duration::from_secs(i64::MAX as u64);
+        let representable = std::time::Instant::now().checked_add(ttl).is_some();
+        let result = compile(r#"table { cache { ttl 9223372036854775807 } }"#)
+            .unwrap()
+            .validate();
+        if representable {
+            result.expect("TTL representable by this platform must validate");
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("Instant range"), "{error}");
         }
         compile(
             r#"def output o { type stdout queue { capacity 1 } }
