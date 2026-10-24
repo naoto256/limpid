@@ -26,6 +26,9 @@ use crate::tap::TapRegistry;
 mod lifecycle;
 use lifecycle::*;
 
+/// Event slots per input before its pipeline dispatcher; not a byte budget.
+const INPUT_DISPATCH_CHANNEL_CAPACITY: usize = 4096;
+
 pub struct Runtime {
     shutdown_progress: crate::shutdown_progress::ShutdownProgress,
     shutdown_tx: watch::Sender<bool>,
@@ -2391,9 +2394,14 @@ def pipeline second { input i; output sink; finish }
             production.find("PipelineWorker::from_bound").unwrap() < guard,
             "pipeline identity workers must be planned before the guard",
         );
+        let input_lookup = production.find("\"input '{}' not found\"").unwrap();
+        let ltp_build = production
+            .find("modules::input::ltp::LtpInput::build(")
+            .unwrap();
+        let ltp_prepared = production.find("prepared_ltp_inputs.insert").unwrap();
         assert!(
-            production.find("input_queue_sizes.insert").unwrap() < guard,
-            "input existence and queue-size parsing must stay pre-spawn",
+            input_lookup < ltp_build && ltp_build < ltp_prepared && ltp_prepared < guard,
+            "input existence checks and fallible LTP construction must stay pre-spawn",
         );
         let output_factory = production.find(".create_output(").unwrap();
         assert!(guard < output_factory, "guard must own output resources");

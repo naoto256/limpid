@@ -59,7 +59,7 @@ request_rate_limit 1000        # sustained RPS, smooths bursts
 rate_limit 100000              # pipeline send rate (events/sec)
 ```
 
-Decoded data and split events can be much larger than the received body: Resource and Scope metadata are copied into every LogRecord event. Emitted events remain in the input channel and pipeline after the request releases its permit. `queue_size` and downstream backpressure control queued event counts and progress; they do not establish a fixed byte or total-memory bound.
+Decoded data and split events can be much larger than the received body: Resource and Scope metadata are copied into every LogRecord event. Emitted events remain in the input channel and pipeline after the request releases its permit. The fixed 4096-event input channel and downstream backpressure control queued event counts and progress; they do not establish a fixed byte or total-memory bound.
 
 Omitting these properties keeps the 16 MiB body cap and 30s body receive deadline, with no concurrency or rate cap.
 

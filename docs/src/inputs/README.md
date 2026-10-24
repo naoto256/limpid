@@ -23,6 +23,14 @@ Each `def input` block declares its type via the `type <name>` clause; see the p
 
 `rate_limit` (maximum events per second) is supported per input — see the per-input pages for which inputs expose it (currently `raw_udp`, the `syslog_*` receivers, and the `otlp_*` receivers).
 
+Each input feeds its pipeline dispatcher through a fixed buffer of 4096
+events. This is an internal event count, not a configurable property or a
+byte budget. A full channel makes input sends wait. This buffer absorbs
+short bursts while pipeline CPU or downstream enqueueing catches up; its
+depth can affect burst loss on UDP, where paused reads can overflow the
+kernel receive buffer. It does not bound pending acknowledgements, which
+can accumulate until an input drains its ACK receiver.
+
 ## Usage in pipelines
 
 An input is referenced by name in a pipeline definition:

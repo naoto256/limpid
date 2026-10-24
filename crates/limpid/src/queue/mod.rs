@@ -228,7 +228,8 @@ impl QueueConfig {
                 }
                 _ => QueueType::Memory,
             };
-            let capacity = props::get_positive_int(block, "capacity")?.unwrap_or(65536) as usize;
+            let capacity =
+                props::get_strictly_positive_int(block, "capacity")?.unwrap_or(65536) as usize;
             Ok(QueueConfig {
                 queue_type,
                 capacity,

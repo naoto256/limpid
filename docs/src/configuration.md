@@ -112,7 +112,7 @@ table {
 |----------|-------------|
 | `load` | Load initial data from a JSON or CSV file. Loaded entries have no TTL. |
 | `max` | Maximum number of entries. Oldest evicted when exceeded. Default: no limit. |
-| `ttl` | Default TTL in seconds for `table_upsert`. Default: no expiry. |
+| `ttl` | Non-negative default TTL in seconds for `table_upsert`, bounded by the platform monotonic clock (`Instant`) range. Larger values fail startup and `--check`. Default: no expiry. |
 
 Tables are in-memory only. There is no `table_save` — files are initial seeds, and dynamic data is lost on restart.
 
