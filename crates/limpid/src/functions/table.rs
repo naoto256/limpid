@@ -324,9 +324,16 @@ pub(crate) fn parse_table_configs(
                 {
                     anyhow::bail!("table '{}': ttl exceeds the platform Instant range", name);
                 }
+                let max = props::get_strictly_positive_int(properties, "max")?;
+                if max.is_none()
+                    && (props::get_expr(properties, "max").is_some()
+                        || props::get_block(properties, "max").is_some())
+                {
+                    anyhow::bail!("table '{}': 'max' must be >= 1 (an integer)", name);
+                }
                 configs.push(TableConfig {
                     name: name.clone(),
-                    max: props::get_positive_int(properties, "max")?.map(|n| n as usize),
+                    max: max.map(|n| n as usize),
                     default_ttl: ttl,
                     load_path: props::get_string(properties, "load").map(std::path::PathBuf::from),
                 });

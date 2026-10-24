@@ -251,6 +251,59 @@ mod tests {
     }
 
     #[test]
+    fn configured_capacities_and_table_max_obey_resource_bounds() {
+        let limit = crate::queue::MAX_QUEUE_CAPACITY;
+        for capacity in [1, limit] {
+            let source = format!(
+                "def output o {{ type stdout queue {{ capacity {capacity} }} }}
+                table {{ cache {{ max 1 }} }}"
+            );
+            let config = compile(&source).unwrap();
+            config.validate().unwrap();
+            let output = config.outputs.get("o").unwrap();
+            let queue = crate::queue::QueueConfig::from_output_properties(
+                "o",
+                output.properties.user_properties(),
+            )
+            .unwrap();
+            assert_eq!(queue.capacity, capacity);
+        }
+        for capacity in [0, limit + 1] {
+            let source = format!("def output o {{ type stdout queue {{ capacity {capacity} }} }}");
+            let error = compile(&source)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("capacity must be in 1..={limit}")),
+                "{error}"
+            );
+        }
+        for capacity in ["-1", "1.5", "\"1\""] {
+            let source = format!("def output o {{ type stdout queue {{ capacity {capacity} }} }}");
+            let error = compile(&source)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("integer in 1..={limit}")),
+                "{error}"
+            );
+        }
+        for max in [0, -1] {
+            let source = format!("table {{ cache {{ max {max} }} }}");
+            let error = compile(&source)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("'max' must be >= 1"), "{error}");
+        }
+    }
+
+    #[test]
     fn check_analyzer_rejects_overflowing_duration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("overflow.limpid");

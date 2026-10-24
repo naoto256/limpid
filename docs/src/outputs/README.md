@@ -111,8 +111,12 @@ The `"full"` value restores the pre-0.7.9 shape (full JSONL on the tracing line)
 > not send `SIGKILL` directly to the daemon; keep systemd's
 > `KillSignal=SIGTERM` default in place.
 
-Queue `capacity` must be an integer of at least `1`; zero and negative
-values are rejected at startup and by `--check`. Size strings such as
+Queue `capacity` must be an integer from `1` through Tokio's
+`Semaphore::MAX_PERMITS` (`usize::MAX >> 3`): `2305843009213693951` on
+64-bit platforms, or `536870911` on 32-bit platforms. Out-of-range values
+are rejected at startup and by `--check`, before channel construction.
+This is a channel representation limit, not a recommended buffer size or
+a memory budget. Size strings such as
 `max_size` must fit in an unsigned 64-bit byte count after expanding the
 binary `KB`/`MB`/`GB` suffix. Duration strings must fit in an unsigned
 64-bit second count after expanding minutes; out-of-range values are
