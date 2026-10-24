@@ -209,6 +209,9 @@ impl Default for QueueConfig {
     }
 }
 
+/// Tokio's bounded channel uses a semaphore; larger capacities panic.
+pub(crate) const MAX_QUEUE_CAPACITY: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
 impl QueueConfig {
     /// Parse from an output definition's `queue { ... }` block.
     pub fn from_output_properties(
@@ -229,7 +232,36 @@ impl QueueConfig {
                 _ => QueueType::Memory,
             };
             let capacity =
-                props::get_strictly_positive_int(block, "capacity")?.unwrap_or(65536) as usize;
+                props::get_strictly_positive_int(block, "capacity").map_err(|error| {
+                    anyhow::anyhow!(
+                        "output '{}': queue capacity must be in 1..={}: {}",
+                        output_name,
+                        MAX_QUEUE_CAPACITY,
+                        error,
+                    )
+                })?;
+            let capacity = match capacity {
+                Some(capacity) => capacity,
+                None if props::get_expr(block, "capacity").is_some()
+                    || props::get_block(block, "capacity").is_some() =>
+                {
+                    anyhow::bail!(
+                        "output '{}': queue capacity must be an integer in 1..={}",
+                        output_name,
+                        MAX_QUEUE_CAPACITY,
+                    );
+                }
+                None => 65536,
+            };
+            if capacity > MAX_QUEUE_CAPACITY as u64 {
+                anyhow::bail!(
+                    "output '{}': queue capacity must be in 1..={}, got {}",
+                    output_name,
+                    MAX_QUEUE_CAPACITY,
+                    capacity,
+                );
+            }
+            let capacity = capacity as usize;
             Ok(QueueConfig {
                 queue_type,
                 capacity,
