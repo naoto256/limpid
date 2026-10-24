@@ -300,17 +300,12 @@ impl Runtime {
             }
         }
 
-        let mut input_queue_sizes = HashMap::new();
         let mut prepared_ltp_inputs = HashMap::new();
         for input_name in input_pipelines.keys() {
             let input_def = blueprint
                 .inputs()
                 .get(input_name)
                 .ok_or_else(|| anyhow::anyhow!("input '{}' not found", input_name))?;
-            let queue_size =
-                props::get_positive_int(input_def.properties.user_properties(), "queue_size")?
-                    .unwrap_or(4096) as usize;
-            input_queue_sizes.insert(input_name.clone(), queue_size);
             if input_def.properties.type_name() == "ltp" {
                 let input = modules::input::ltp::LtpInput::build(
                     input_name,
@@ -435,10 +430,7 @@ impl Runtime {
                 .inputs()
                 .get(&input_name)
                 .expect("input preflight");
-            let queue_size = input_queue_sizes
-                .remove(&input_name)
-                .expect("input queue-size preflight");
-            let (event_tx, event_rx) = mpsc::channel::<Event>(queue_size);
+            let (event_tx, event_rx) = mpsc::channel::<Event>(INPUT_DISPATCH_CHANNEL_CAPACITY);
             let input_queue_timer =
                 match crate::metrics::InputQueueTimer::register(&metrics_registry, &input_name) {
                     Ok(timer) => timer,
@@ -659,35 +651,9 @@ pub(crate) fn init_tables(config: &CompiledConfig) -> Result<crate::functions::t
 fn init_tables_from_globals(
     global_blocks: &HashMap<String, Vec<Property>>,
 ) -> Result<crate::functions::table::TableStore> {
-    use crate::dsl::ast::Property;
-    use crate::functions::table::{TableConfig, TableStore};
-    use std::time::Duration;
-
-    let mut configs = Vec::new();
-
-    if let Some(props) = global_blocks.get("table") {
-        for prop in props {
-            if let Property::Block {
-                key: table_name,
-                properties: inner_props,
-                ..
-            } = prop
-            {
-                let load_path = props::get_string(inner_props, "load").map(PathBuf::from);
-                let max = props::get_positive_int(inner_props, "max")?.map(|n| n as usize);
-                let ttl = props::get_positive_int(inner_props, "ttl")?.map(Duration::from_secs);
-
-                configs.push(TableConfig {
-                    name: table_name.clone(),
-                    max,
-                    default_ttl: ttl,
-                    load_path,
-                });
-            }
-        }
-    }
-
-    TableStore::from_configs(configs)
+    crate::functions::table::TableStore::from_configs(crate::functions::table::parse_table_configs(
+        global_blocks,
+    )?)
 }
 
 #[cfg(test)]

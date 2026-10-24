@@ -142,9 +142,11 @@ pub struct AckHandle {
     position: std::sync::Mutex<Option<AckPosition>>,
     /// `tokio::sync::mpsc::UnboundedSender` — unbounded because the ack
     /// channel must never apply backpressure on the pipeline worker; if it
-    /// did, a slow ack-reader could deadlock the whole pipeline. Memory
-    /// growth is bounded by the input → pipeline channel queue depth, which
-    /// is already a configurable backpressure point (`queue_size`).
+    /// did, a slow ack-reader could deadlock the whole pipeline. ACK backlog
+    /// depends on when the input drains its receiver, independently of the
+    /// bounded event channel. For example, tail can accumulate ACKs while
+    /// reading to EOF before it drains them; the event channel depth does
+    /// not bound this backlog.
     tx: tokio::sync::mpsc::UnboundedSender<AckPosition>,
 }
 

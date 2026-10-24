@@ -95,6 +95,7 @@ impl CompiledConfig {
         {
             bail!("module type 'ltp' requires top-level node_key");
         }
+        crate::functions::table::parse_table_configs(&self.global_blocks)?;
         for (name, input) in &self.inputs {
             if input.properties.type_name() == "ltp" {
                 crate::modules::input::ltp::validate_static_properties(
@@ -110,6 +111,10 @@ impl CompiledConfig {
                 .map(|(name, input)| (name.as_str(), input.properties.user_properties())),
         )?;
         for (name, output) in &self.outputs {
+            crate::queue::QueueConfig::from_output_properties(
+                name,
+                output.properties.user_properties(),
+            )?;
             if output.properties.type_name() == "ltp" {
                 crate::modules::output::ltp::validate_static_properties(
                     name,
@@ -215,6 +220,88 @@ mod tests {
 
     fn compile(source: &str) -> Result<CompiledConfig> {
         CompiledConfig::from_config(parse_config(source)?)
+    }
+
+    #[test]
+    fn validates_queue_capacities_and_table_ttl_without_starting_resources() {
+        for (source, expected) in [
+            (
+                r#"def output o { type stdout queue { capacity 0 } }"#,
+                "capacity",
+            ),
+            (
+                r#"table { cache { ttl 9223372036854775807 } }"#,
+                "Instant range",
+            ),
+            (
+                r#"def output o { type stdout queue { type disk max_size "18014398509481984KB" } }"#,
+                "u64 byte range",
+            ),
+        ] {
+            let error = compile(source).unwrap().validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{source}: {error}");
+        }
+        compile(
+            r#"def output o { type stdout queue { capacity 1 } }
+            table { cache { ttl 3600 load "not-opened-during-validation.json" } }"#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn check_analyzer_rejects_overflowing_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overflow.limpid");
+        for source in [
+            r#"def output o {
+                type otlp_grpc
+                peer { endpoint "http://collector.example:4317" }
+                batch_timeout "307445734561825861m"
+            }"#,
+            r#"def input i {
+                type otlp_http
+                bind "127.0.0.1:0"
+                body_timeout "307445734561825861m"
+            }"#,
+        ] {
+            std::fs::write(&path, source).unwrap();
+            let (config, sources) = crate::config::load_config_with_source_map(&path).unwrap();
+            let compiled = CompiledConfig::from_config(config).unwrap();
+            compiled.validate().unwrap();
+            let diagnostics = crate::check::analyze(&compiled, &sources);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| matches!(d.level, crate::check::Level::Error)
+                        && d.message.contains("expects a duration")),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_keeps_queue_size_out_of_the_input_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown-property.limpid");
+        for value in [0, 1] {
+            std::fs::write(
+                &path,
+                format!("def input i {{ type syslog_udp queue_size {value} }}"),
+            )
+            .unwrap();
+            let (config, sources) = crate::config::load_config_with_source_map(&path).unwrap();
+            let compiled = CompiledConfig::from_config(config).unwrap();
+            compiled.validate().unwrap();
+            let diagnostics = crate::check::analyze(&compiled, &sources);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| matches!(d.level, crate::check::Level::Error)
+                        && d.message.contains("unknown property 'queue_size'"))
+            );
+        }
     }
 
     #[test]

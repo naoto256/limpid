@@ -111,6 +111,13 @@ The `"full"` value restores the pre-0.7.9 shape (full JSONL on the tracing line)
 > not send `SIGKILL` directly to the daemon; keep systemd's
 > `KillSignal=SIGTERM` default in place.
 
+Queue `capacity` must be an integer of at least `1`; zero and negative
+values are rejected at startup and by `--check`. Size strings such as
+`max_size` must fit in an unsigned 64-bit byte count after expanding the
+binary `KB`/`MB`/`GB` suffix. Duration strings must fit in an unsigned
+64-bit second count after expanding minutes; out-of-range values are
+configuration errors instead of wrapping.
+
 ## Usage in pipelines
 
 `output` is **non-terminal** — it deep-copies the event to the output queue and pipeline execution continues:

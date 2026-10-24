@@ -303,6 +303,39 @@ pub struct TableConfig {
     pub load_path: Option<std::path::PathBuf>,
 }
 
+/// Parse operator config, validated at startup and in configuration checks.
+/// This does not open seed files or create mutable table state.
+pub(crate) fn parse_table_configs(
+    globals: &HashMap<String, Vec<crate::dsl::ast::Property>>,
+) -> Result<Vec<TableConfig>> {
+    use crate::dsl::{ast::Property, props};
+    let mut configs = Vec::new();
+    if let Some(properties) = globals.get("table") {
+        for property in properties {
+            if let Property::Block {
+                key: name,
+                properties,
+                ..
+            } = property
+            {
+                let ttl = props::get_positive_int(properties, "ttl")?.map(Duration::from_secs);
+                if let Some(ttl) = ttl
+                    && Instant::now().checked_add(ttl).is_none()
+                {
+                    anyhow::bail!("table '{}': ttl exceeds the platform Instant range", name);
+                }
+                configs.push(TableConfig {
+                    name: name.clone(),
+                    max: props::get_positive_int(properties, "max")?.map(|n| n as usize),
+                    default_ttl: ttl,
+                    load_path: props::get_string(properties, "load").map(std::path::PathBuf::from),
+                });
+            }
+        }
+    }
+    Ok(configs)
+}
+
 // ---------------------------------------------------------------------------
 // File loading (reused from the old lookup module)
 // ---------------------------------------------------------------------------

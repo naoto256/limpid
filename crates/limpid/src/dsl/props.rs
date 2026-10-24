@@ -230,13 +230,11 @@ pub fn get_string_map(props: &[Property], key: &str) -> Vec<(String, String)> {
 pub fn parse_size(s: &str) -> anyhow::Result<u64> {
     let s = s.trim().to_uppercase();
     let parse = |num_str: &str, unit: &str, multiplier: u64| -> anyhow::Result<u64> {
-        num_str
-            .trim()
-            .parse::<u64>()
-            .map(|n| n * multiplier)
-            .map_err(|_| {
-                anyhow::anyhow!("invalid size '{}': expected a number before '{}'", s, unit)
-            })
+        let n = num_str.trim().parse::<u64>().map_err(|_| {
+            anyhow::anyhow!("invalid size '{}': expected a number before '{}'", s, unit)
+        })?;
+        n.checked_mul(multiplier)
+            .ok_or_else(|| anyhow::anyhow!("invalid size '{}': exceeds u64 byte range", s))
     };
     if s.ends_with("GB") {
         parse(&s[..s.len() - 2], "GB", 1024 * 1024 * 1024)
@@ -271,7 +269,10 @@ pub fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
         let n: u64 = num.trim().parse().map_err(|_| {
             anyhow::anyhow!("invalid duration '{}': expected a number before 'm'", s)
         })?;
-        Ok(std::time::Duration::from_secs(n * 60))
+        let seconds = n
+            .checked_mul(60)
+            .ok_or_else(|| anyhow::anyhow!("invalid duration '{}': exceeds u64 second range", s))?;
+        Ok(std::time::Duration::from_secs(seconds))
     } else {
         let n: u64 = s.parse().map_err(|_| {
             anyhow::anyhow!(
@@ -295,6 +296,32 @@ mod tests {
             value: Expr::spanless(kind),
             value_span: None,
         }
+    }
+
+    #[test]
+    fn size_and_duration_scaling_rejects_overflow() {
+        for (suffix, multiplier) in [
+            ("KB", 1024),
+            ("MB", 1024 * 1024),
+            ("GB", 1024 * 1024 * 1024),
+        ] {
+            let max = u64::MAX / multiplier;
+            assert_eq!(
+                parse_size(&format!("{max}{suffix}")).unwrap(),
+                max * multiplier
+            );
+            assert!(parse_size(&format!("{}{suffix}", max + 1)).is_err());
+        }
+        let max_minutes = u64::MAX / 60;
+        assert_eq!(
+            parse_duration(&format!("{max_minutes}m"))
+                .unwrap()
+                .as_secs(),
+            max_minutes * 60
+        );
+        assert!(parse_duration("307445734561825861m").is_err());
+        assert_eq!(parse_duration("30s").unwrap().as_secs(), 30);
+        assert_eq!(parse_size("0GB").unwrap(), 0);
     }
 
     #[test]
