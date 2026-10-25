@@ -299,7 +299,7 @@ conventions are:
   native KV are different wire shapes; OpenSSH is one file because
   sshd's wire is one shape across syslog and journald.
 - **Canonical file header** follows the per-kind schema documented in the
-  [pack README](https://github.com/naoto256/limpid/blob/main/packaging/snippets/README.md#authoring-conventions):
+  [pack README](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions):
   parser files declare `Summary`, `Reads`, `Writes`, `Category`, and
   `Test corpus`; composers and shared functions use their corresponding
   schemas. The header is the source for generated inventory. Keep sample
