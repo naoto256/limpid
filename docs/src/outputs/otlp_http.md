@@ -145,11 +145,18 @@ Resource / Scope equality is order-insensitive on attributes — proto3 does not
 
 The merging modes are wire-efficiency optimisations; if your batch sizes are modest (hundreds of Events), `none` is fine. For collector → SaaS hops where every byte counts, `scope` is usually the right choice.
 
+Reaching `batch_size` wakes the flusher immediately; a current send or retry
+backoff completes before the next batch is sent. Otherwise, partial batches
+are sent when the current `batch_timeout` wait ends. Arrivals do not restart
+the wait.
+Failures retry the prepared batch; see [Queue and retry](./README.md#queue-and-retry)
+for recovery and duplicate-delivery limits.
+
 ## Notes
 
 - `http_protobuf` is the canonical OTLP wire form; `http_json` serializes per the OTLP/JSON canonical mapping (camelCase, u64-as-string, bytes-as-hex).
-- `verify false` skips certificate verification — development only. limpid emits a `tracing::warn!` once per `https://` peer at startup when `verify false` is in effect so the misconfiguration is greppable in the daemon log. Has no effect on `http://` endpoints (no TLS to verify).
-- On **graceful shutdown** (`SIGTERM`, `SIGHUP` reload, `systemctl stop`, or an explicit `shutdown()` API call), a bounded final drain runs — one flush attempt per parked payload bounded by `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` (3 s) plus the per-actor in-flight cancel. The disposition of each drained event depends on where its failure fired: a per-event render failure (proved pre-boundary) or a retry-exhausted terminal drop routes as `Recovered`, while an in-flight cancel or the 3-second attempt timeout leaves the wire state ambiguous and routes through the ambiguous DLQ path — `Dropped` on a disk queue (fail-stop wedge holds the cursor for next-start reconciliation against the DLQ record) and folded to `Recovered` on a memory queue (no replay path exists). In every case the DLQ record — `event.source`, `event.received_at`, `event.ingress`, and `event.egress` reflect the original per-event provenance because the batched output parks the source `Event` alongside its `QueueAckHandle` until the flush resolves. Without `error_log` configured, the daemon emits a one-line `tracing::error!` summary per drain-failure event (site + reason, no payload) — the payload is not persisted anywhere by default. To attach metadata or the full JSONL to the tracing line, set `control { error_log_fallback "meta" | "full" }` alongside `error_log` (see the [tracing fallback ladder](../operations/error-log.md#tracing-fallback-ladder-error_log_fallback)). **`SIGKILL` (`kill -9`) does not run this path** — actor tasks are aborted and the stack-local buffer is lost; do not send `SIGKILL` directly to the daemon. See [Queue and retry → Recovery (error_log)](./README.md#recovery-error_log).
+- `verify false` skips certificate verification — development only. limpid emits a warning once per `https://` peer at startup when `verify false` is in effect so the misconfiguration is greppable in the daemon log. Has no effect on `http://` endpoints (no TLS to verify).
+- Graceful shutdown uses a bounded final drain; see the common [disposition contract](./README.md#disposition-contract) and [shutdown guarantees and recovery limits](../operations/error-log.md#graceful-shutdown-guarantees-and-known-limitations).
 - **`partial_success.rejected_log_records` attribution is approximate.** The OTLP response reports a rejected *count* for the batch, not the identity of each rejected log record. When the rejected count is non-zero, limpid splits the batch into Delivered + Recovered along the trailing N entries (where N = `rejected_log_records`) and routes the Recovered tail to `control { error_log "..." }`. Treat those DLQ entries as a batch-level rejection split into per-event records for replay, not as proof that the collector selected those exact events — the collector did not identify them. Metric totals (`events_written`, `events_failed`) are accurate; per-event attribution is not.
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).
 - For gRPC transport see [otlp_grpc](./otlp_grpc.md).

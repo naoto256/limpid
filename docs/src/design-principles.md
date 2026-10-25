@@ -91,7 +91,7 @@ Typical parsing patterns — OTLP normalization, OCSF mapping, Windows Snare par
 
 - Users can include them as-is, modify them, ignore them, or replace them
 - A specification change (e.g. OTLP version update) is a DSL edit, not a Rust release
-- Adding support for a new vendor format is a pull request to a snippet, not a feature in the daemon
+- Support for a new vendor format belongs in a snippet rather than a daemon feature
 - The daemon itself ships only **primitives**: the wire-speaking inputs / outputs, the generic functions (`parse_kv`, `regex_extract`, `table_lookup`), and the runtime
 
 This is Principle 1 (zero hidden behavior) applied to the vendor axis: a format change should not surprise anyone with a hidden Rust release-cycle dependency. It is also Principle 2 (I/O is dumb transport) extending into "domain shape is dumb transport": the daemon does not pretend to know what your logs mean.
@@ -118,7 +118,7 @@ Instead, **workspace is global across the Event's lifecycle**: each process writ
 
 **Why:** the message-passing model (downstream takes upstream's return as an argument) only sees "the stage immediately upstream", which doesn't match real wire structure — for example, openssh's vocabulary parser frequently needs to know "what transport was this vocabulary wrapped in?" to OCSF-normalise correctly (for instance, when journald carries an application log, deciding how to map journald's `__REALTIME_TIMESTAMP` vs. the app body's `event_time` into OCSF's `time` is the vocabulary parser's job). Keeping `workspace.journald.__REALTIME_TIMESTAMP` directly addressable lets the vocabulary parser apply its own precedence and override.
 
-**Consequence:** parser/composer contracts are expressed in terms of `workspace.*` field names (`@requires` / `@produces` tag conventions). The DSL does not need an object-type design for what flows through the pipe; the syntax stays minimal. Instead, each snippet's header comment carries the responsibility of declaring "I read `workspace.<here>` and write `workspace.<there>`" (see the "Writing for a snippet library" section of the [Process Design Guide](processing/design-guide.md)).
+**Consequence:** parser/composer contracts are expressed in terms of `workspace.*` field names (public facade member `Reads` / `Writes` contracts; leaf `@requires` / `@produces` comments are explanatory only). The DSL does not need an object-type design for what flows through the pipe; the syntax stays minimal. Instead, each snippet's header comment carries the responsibility of declaring "I read `workspace.<here>` and write `workspace.<there>`" (see the "Writing for a snippet library" section of the [Process Design Guide](processing/design-guide.md)).
 
 #### Where this design draws the line
 

@@ -55,8 +55,8 @@ struct Cli {
     #[arg(long)]
     check: bool,
 
-    /// Treat analyzer warnings as errors. Implies `--check`. With this
-    /// flag set, any warning bumps the exit code to 2; without it,
+    /// Exit with status 2 if analyzer warnings remain, without changing
+    /// their diagnostic level. Implies `--check`. Without this flag,
     /// warnings are reported but only errors fail the check.
     #[arg(long)]
     strict_warnings: bool,
@@ -513,7 +513,9 @@ fn run_check(
             path.display(),
             warnings,
         );
-        eprintln!("note: --strict-warnings is promoting warnings to errors");
+        eprintln!(
+            "note: --strict-warnings exits with status 2 because warnings remain; diagnostic levels are unchanged"
+        );
         std::process::exit(2);
     }
 

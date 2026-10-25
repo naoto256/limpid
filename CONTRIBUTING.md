@@ -220,3 +220,9 @@ alongside medians. Fix the comparison margin before measuring. An interval
 that crosses that margin is inconclusive; do not turn its median alone into
 a regression or no-overhead claim. Keep diagnostic profiles separate from
 the comparison used for release qualification.
+
+## Optional Kafka build
+
+```bash
+cargo build --release -p limpid --features kafka
+```

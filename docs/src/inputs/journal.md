@@ -26,7 +26,7 @@ def input system {
 |----------|----------|---------|-------------|
 | `match` | no | none | Journal match filter (`FIELD=value`, e.g. `SYSLOG_FACILITY=10`). Repeatable — see [match combining rules](#match-combining-rules) for AND / OR semantics. |
 | `state_file` | no | none | Path to persist journal cursor (survives restarts) |
-| `poll_interval` | no | `1s` | How often to poll for new entries |
+| `poll_interval` | no | `1s` | Maximum wait for new entries, capped at 100ms (minimum 1µs). Error backoff uses the configured interval; zero uses 100ms for wait errors. |
 
 ### `match` combining rules
 
@@ -64,7 +64,7 @@ Conventions matching `journalctl`:
   `[104, 101, 108, 108, 111]`
 - numeric-looking fields like `PRIORITY` remain JSON **strings** (`"6"`);
   convert with `to_int(...)` if you need arithmetic
-- absent fields: omitted (no nulls)
+- fields absent from an entry are omitted; an enumerated field without a value is JSON `null`
 
 `workspace` stays empty on input — all parsing happens in the process layer.
 

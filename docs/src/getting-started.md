@@ -85,7 +85,7 @@ control {
 > snippet under `processes/`. The same applies to any other empty
 > directory.
 
-`error_log` is the daemon-wide recovery sink: payloads that retry-exhaust or fail the shutdown flush are persisted there as JSONL instead of being silently dropped. Recommended whenever a pipeline uses retry or batched outputs; `limpid --check --strict-warnings` will warn if a recovery-dependent config omits it. See [Error Log (DLQ)](./operations/error-log.md) for the format and rotation guidance.
+`error_log` is the daemon-wide recovery sink: payloads that retry-exhaust or fail the shutdown flush are persisted there as JSONL instead of being silently dropped. Recommended whenever a pipeline uses retry or batched outputs; `limpid --check` warns if a recovery-dependent config omits it; adding `--strict-warnings` exits with status 2 for that warning. See [Error Log (DLQ)](./operations/error-log.md) for the format and rotation guidance.
 
 **/etc/limpid/inputs/syslog.limpid:**
 ```

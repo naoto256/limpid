@@ -556,7 +556,7 @@ def pipeline p { input i; output o }
 }
 
 #[test]
-fn check_strict_warnings_promotes_to_exit_two() {
+fn check_strict_warnings_exits_two_without_promoting_diagnostics() {
     let dir = TempDir::new().unwrap();
     let conf = dir.path().join("strict.conf");
     fs::write(
@@ -585,6 +585,17 @@ def pipeline p {
 
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("--strict-warnings"), "stderr: {}", stderr);
+    assert!(
+        stderr.contains("diagnostic levels are unchanged"),
+        "stderr: {}",
+        stderr
+    );
+    assert!(stderr.contains("warning"), "stderr: {}", stderr);
+    assert!(
+        !stderr.contains("promoting warnings to errors"),
+        "stderr: {}",
+        stderr
+    );
 }
 
 #[test]

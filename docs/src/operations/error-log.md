@@ -244,7 +244,7 @@ jq -c 'select(.kind == "output") | "\(.output.name)\t\(.event | @json)"' \
     done
 ```
 
-The `event` sub-object for Output records carries `egress` (the pre-rendered wire bytes the sink had tried to deliver). `inject output --json` hands this straight to the output — no re-rendering, no pipeline re-run. The sink applies its current peer/retry/batching configuration as if the event had just been enqueued normally.
+The `event` sub-object for Output records carries `egress` (the pre-rendered wire bytes the sink had tried to deliver). `inject output --json` hands this straight to the output — no pipeline re-run; the output still applies its transport framing. The sink applies its current peer/retry/batching configuration as if the event had just been enqueued normally.
 
 ### Archive after replaying
 
@@ -525,13 +525,21 @@ than synthesising one independently.
 
 ## Schema migration v1 → v2
 
-The 0.7.8 release introduces `schema_version: 2` as a **hard break**. v1 records (no `schema_version`, top-level `process` string field as the discriminator, no `kind`, no per-kind block) are not readable by v2 tooling, and v2 records are not readable by v1 tooling.
+Format v2 introduced `schema_version: 2`, the `kind` discriminator, and
+per-kind blocks. Current records use `schema_version: 3` and additionally
+preserve the immutable event key. Current replay accepts v2 event objects
+without a key and assigns one when they are read. Legacy v1 records have no
+`schema_version` or `kind` and use a top-level `process` string; translate
+them before using the current replay recipes.
 
 The break was necessary because v1 conflated two unrelated failure shapes into one `process` field — pipeline-side failures (`wrap_journal`, `(inline)`, `(pipeline body)`, `(pipeline)`) and sink-side failures (`(output mysink)`, `(output mysink shutdown)`, and the special enqueue form `(output enqueue)` whose output name lived only inside the `reason` string). Operators replaying the file had to special-case the `(output ...)` prefix and pick a different `limpidctl inject` flag for each, with no machine-readable signal — just an in-band string convention. v2 lifts the flavor into a `kind` discriminator and gives each flavor its own block, so replay tooling can `select(.kind == "output")` and route to `inject output` deterministically.
 
-### What to do with pre-0.7.8 captures
+### What to do with v1 captures
 
-The recommended path is **archive, don't migrate**. v1 capture files predate the recovery-readiness gates, the unified `event.egress` carry, and (for Output-flavor records) the `inject output` replay command itself — so replaying them under the new daemon is operationally weaker than letting the 0.7.8 daemon re-fail any still-affected events into the new v2 file.
+Archive v1 files separately before enabling current recovery logging. Their
+legacy shape cannot be fed directly to the current replay recipes. Keep the
+archive for incident-specific translation and recovery; new failures are
+written in the current format.
 
 ```bash
 # At upgrade time: rotate the existing v1 file aside.
@@ -539,7 +547,9 @@ mv /var/log/limpid/errored.jsonl \
    /var/log/limpid/errored.jsonl.v1.archived-$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
-The 0.7.8 daemon recreates `errored.jsonl` on the first v2 failure.
+The daemon creates `errored.jsonl` on the next failure and writes format v3.
+The translations below produce format v2, which current replay also accepts;
+missing event keys are assigned on read.
 
 ### If you must replay a v1 capture
 
