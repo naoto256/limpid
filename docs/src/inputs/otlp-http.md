@@ -84,7 +84,7 @@ Each LogRecord in the incoming `ExportLogsServiceRequest` becomes one Event. The
 | `ingress` | singleton ResourceLogs (1 Resource + 1 Scope + 1 LogRecord) encoded as protobuf wire bytes |
 | `egress` | identical to `ingress` (process layer rewrites if needed) |
 | `source` | TCP peer address |
-| `received_at` | `Utc::now()` at request handling time |
+| `received_at` | The host wall clock at request handling time |
 | `workspace` | empty |
 
 To structure the LogRecord into workspace fields, decode it explicitly in a process:
@@ -128,7 +128,7 @@ def pipeline otlp_relay {
 ## TLS
 
 Native HTTPS is served via the [`tls` block](#tls-block) at the
-top of this page (since v0.7.6) — `tls { cert key }` for plain server TLS, plus
+top of this page — `tls { cert key }` for plain server TLS, plus
 optional `ca` for mTLS (client-cert verification at handshake). The
 same shape is shared with [`input syslog_tcp`](./syslog-tcp.md) and
 [`input otlp_grpc`](./otlp-grpc.md). Without the block, the listener

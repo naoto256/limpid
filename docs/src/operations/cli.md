@@ -80,9 +80,9 @@ All keys except `ingress` are optional. `source` is the canonical `{ip, port}` o
 | `source: {port: 5140}` | `{ip: "127.0.0.1", port: 5140}` |
 | `source: {ip, port}` | exact |
 
-When `source` is present but malformed (legacy `"ip:port"` string, wrong types, port out of range), `--test-pipeline` errors out loudly — operators migrating from the 0.5.5 form should see the failure, not silently get a wrong default. The Event has no facility / severity fields — the `<PRI>` byte lives inside `ingress` / `egress`, and pipelines that need its numeric value call `syslog.extract_pri(...)`.
+When `source` is present but malformed (legacy `"ip:port"` string, wrong types, port out of range), `--test-pipeline` errors out loudly — operators migrating from the legacy string form should see the failure, not silently get a wrong default. The Event has no facility / severity fields — the `<PRI>` byte lives inside `ingress` / `egress`, and pipelines that need its numeric value call `syslog.extract_pri(...)`.
 
-`received_at` in the input JSON is **ignored** in test mode — `--test-pipeline` constructs the Event with `Event::new`, which stamps `received_at` to the current wall-clock. Only `ingress`, `source`, and `workspace` are honoured. When piping `tap --json` output into `--test-pipeline`, be aware that the captured timestamp will not be reproduced.
+`received_at` in the input JSON is **ignored** in test mode — `--test-pipeline` sets `received_at` to the current host wall clock. Only `ingress`, `source`, and `workspace` are honoured. When piping `tap --json` output into `--test-pipeline`, be aware that the captured timestamp will not be reproduced.
 
 ## limpidctl
 

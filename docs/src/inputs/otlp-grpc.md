@@ -38,7 +38,7 @@ Identical to [`otlp_http`](./otlp-http.md): one LogRecord becomes one Event with
 | `ingress` | singleton ResourceLogs proto bytes |
 | `egress` | identical to `ingress` |
 | `source` | TCP peer address |
-| `received_at` | `Utc::now()` when the RPC arrived |
+| `received_at` | The host wall clock when the RPC arrived |
 | `workspace` | empty |
 
 ## Reply

@@ -47,7 +47,7 @@
 //           - Per-log JSONL tail:
 //                 process { workspace.zeek = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_zeek_default | compose_ocsf | ocsf_to_egress
 //
-// Coverage scope (v0.7.1): verified against the elastic/integrations
+// Coverage — verified against the elastic/integrations
 // zeek corpus (61 events across the 8 default streams), with the
 // corpus pre-unflattened to native nested form for the verify run.
 

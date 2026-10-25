@@ -110,8 +110,7 @@ def function postfix_status_id(s) {
 // program-specific shape; the leaf's `error` arm fires when the
 // expected shape doesn't match (e.g. `postfix/smtp[]: warning: ...`
 // instead of a delivery line) and propagates correctly to the
-// pipeline boundary thanks to the v0.7.0
-// process-call error-propagation fix.
+// pipeline boundary.
 
 // Process: parse_postfix
 // Summary: Postfix mail-flow log bodies (postfix/<program>[pid]: tag included) → LSIS Email Activity.

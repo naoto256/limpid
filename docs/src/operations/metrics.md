@@ -157,7 +157,7 @@ The three process-only counter families use the labels `pipeline`, `step`,
 `process_path`, and `process_name`:
 
 - `limpid_process_events_in_total` counts frame entry.
-- `limpid_process_events_out_total` counts frames that return `Continue`.
+- `limpid_process_events_out_total` counts frames that pass the event on (neither dropped nor errored).
 - `limpid_process_events_errored_total` counts frames terminated by an error.
 
 These are invocation counters, not event counters. `step` is the root process
@@ -564,30 +564,8 @@ text conversion above belong entirely to `limpid-prometheus`.
 ## Operational scrape checkpoint
 
 Prometheus defaults to a one-minute scrape interval and a 10-second scrape
-timeout. The release checkpoint therefore measures sequential end-to-end
-scrapes for stable per-scrape observations; it is not a load, concurrency, or
-scrapes-per-second benchmark.
-
-The canonical harness runs the real sidecar through both production boundaries
-(schema-v1 control socket and HTTP `/metrics`) at three deterministic payload
-scales:
-
-| Profile | Families | Series per family | Histogram finite buckets |
-| --- | ---: | ---: | ---: |
-| P0 | current 16 counters | 1 | none |
-| P1 | 48 (16 each counter/gauge/histogram) | 8 | 8 |
-| P2 | 96 (32 each counter/gauge/histogram) | 32 | 16 |
-
-For each profile it parses text format 0.0.4 and requires complete ordered
-semantic equivalence with the source snapshot: HELP, TYPE, sample namespaces,
-labels, values, histogram buckets, sum, and count must all match. It records
-response bytes, sample count, median/p95/max end-to-end latency, process CPU
-time, and peak RSS when the platform can report it. It also reports the maximum
-latency as a fraction of and margin to the 10-second timeout. Correctness is
-mandatory and any scaling cliff is reviewed; there is no arbitrary throughput
-or latency threshold. A separate one-request P0 smoke uses a real daemon control
-socket as an integration check. Machine-specific results remain in the
-canonical harness receipt and PR evidence, not in this product contract.
+timeout. Choose a timeout and scrape interval that allow the control request
+and HTTP response to finish for your configured metrics payload.
 
 ## Interpreting the counters
 

@@ -1,6 +1,6 @@
 # Windows ZIP package
 
-The Windows 0.9.0 package contains ZIP files and PowerShell installation scripts.
+The Windows 0.9.0 package is a ZIP archive with PowerShell installation scripts.
 
 Tests of earlier Windows 11 ARM64 builds covered installation, the virtual
 service account, Event Log resume, control and exporter access, reload, upgrade,

@@ -10,8 +10,7 @@ the daemon. Copy an installed snippet into an operator-owned path
 before customising it; package upgrades replace files under
 `/usr/share/limpid/snippets/`.
 
-> **Status:** the snippet library was introduced in v0.7.0 and has
-> expanded across the 0.7.x line. It currently ships 32 parser files
+> **Contents:** the snippet library ships 32 parser files
 > (source / vocabulary parsers — FortiGate / ASA / Checkpoint / Palo Alto /
 > Sysmon / CloudTrail / Zeek / Suricata / OCSF / Juniper SRX / ... — plus the
 > transport / format parsers `parse_syslog`, `parse_journald`, and
@@ -20,8 +19,7 @@ before customising it; package upgrades replace files under
 > and replay-shape composers, one filter, and several reusable functions.
 > The inbound `parse_ocsf` compatibility parser is the sole parser without
 > an OTLP adapter. See the table below
-> for the full current inventory; coverage continues to grow on the
-> 0.7.x cadence.
+> for the full current inventory.
 
 ## Snippet library
 
@@ -125,7 +123,7 @@ Private dispatch leaves remain unlisted and need no public header.
   `severity` text rather than an invented OTel number.
 
 - `functions/parse_datetime_rfc3164.limpid` —
-  `parse_datetime_rfc3164(String, String) → Timestamp | Null`. LPL
+  `parse_datetime_rfc3164(String, String) → Timestamp | Null`. DSL helper
   counterpart to the built-in `parse_datetime_rfc3339` primitive.
   RFC 3164 wire carries neither year nor timezone, so the helper
   applies the current-year + future-clamp policy after the calling
@@ -299,7 +297,7 @@ conventions are:
   native KV are different wire shapes; OpenSSH is one file because
   sshd's wire is one shape across syslog and journald.
 - **Canonical file header** follows the per-kind schema documented in the
-  [pack README](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions):
+  [authoring guide](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions):
   parser files declare `Summary`, `Reads`, `Writes`, `Category`, and
   `Test corpus`; composers and shared functions use their corresponding
   schemas. The header is the source for generated inventory. Keep sample

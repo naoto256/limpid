@@ -72,11 +72,11 @@ Each `peer` block configures one target endpoint:
 | `tls.ca` | no | Custom CA certificate file (PEM) for this peer. Falls back to the system root store if omitted. |
 | `tls.cert`, `tls.key` | no (paired) | Client certificate and private key for mTLS, as separate PEM files (chmod 600 the key). Both must be present together. |
 
-On each send the rotation picks the next available peer (cooldown expired) and tries it. On failure that peer is marked cooled-down for ~5 s and subsequent sends rotate past it until the cooldown expires. When every peer is currently cooled the rotation falls back to the cursor start — the output's per-flush retry loop (driven inside the flush actor's `flush_events`) then handles re-delivery without dropping the drained batch.
+On each send the rotation picks the next available peer (cooldown expired) and tries it. On failure that peer is marked cooled-down for ~5 s and subsequent sends rotate past it until the cooldown expires. When every peer is currently cooled the rotation falls back to the cursor start — the output's per-flush retry loop then handles re-delivery without dropping the drained batch.
 
 ### headers block
 
-From 0.8.4, headers use a static string object, for example
+Headers use a static string object, for example
 `"DD-API-KEY": "your-api-key"`. Keys and values are literal strings;
 interpolation, variables, function calls, and non-string values are rejected.
 Literal escapes follow string-value decoding (`\"`,

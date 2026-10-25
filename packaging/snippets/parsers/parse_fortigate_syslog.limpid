@@ -17,8 +17,8 @@
 // Why a separate file from parse_fortigate_cef.limpid:
 //   FortiGate's native syslog and its CEF export are different schemas
 //   (different field names: `srcip` vs `src`, `sentbyte` vs `in`,
-//   `subtype` ext vs `subtype` field, etc.). Per the v0.6.0 plan,
-//   schema = vendor × format, and FortiGate has two formats so it gets
+//   `subtype` ext vs `subtype` field, etc.).
+//   Schema = vendor × format, and FortiGate has two formats so it gets
 //   two parser files.
 //
 // Vendor-specific def function helpers in this file have a `_syslog_`

@@ -65,7 +65,7 @@ Every process has an implicit contract with its neighbours in the pipeline: *wha
 The shipped snippet pack declares its public surface in the canonical header
 schema: a file-level `Facade` plus adjacent per-member `Summary`, `Reads`,
 `Writes`, or `Signature` contracts described
-in the [pack README](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions).
+in the [authoring guide](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions).
 Inside a large file, private leaf-local `@requires` / `@produces` comments may
 add useful detail, but they do not replace a facade member block and the
 analyzer does not consume them.
@@ -295,7 +295,7 @@ ingress
 ```
 
 - **Format primitives** (`syslog.parse`, `cef.parse`, `parse_kv`, `parse_json`, `csv_parse`) capture raw bytes into a format-specific namespace (`workspace.syslog`, `workspace.cef`, …). They know nothing about vendors or downstream schemas.
-- **Vendor parsers** (`parse_fortigate_cef`, `parse_paloalto_cef`, `parse_cloudtrail`, `parse_ocsf`, …) read the format namespace and write facts under `workspace.lsis.parsed.*`. This is the only layer that knows both the vendor's quirks and the canonical shape. (The shipped set grows on the 0.7.x cadence — see [Snippet Library](../snippets/README.md) for the current inventory.)
+- **Vendor parsers** (`parse_fortigate_cef`, `parse_paloalto_cef`, `parse_cloudtrail`, `parse_ocsf`, …) read the format namespace and write facts under `workspace.lsis.parsed.*`. This is the only layer that knows both the vendor's quirks and the canonical shape. (See [Snippet Library](../snippets/README.md) for the current inventory.)
 - **Per-source target adapters** live in the same parser file. They own non-obvious target placement and construction, such as OTLP Resource/Scope/LogRecord attributes and the Body AnyValue variant. They write `workspace.lsis.shed.<target>.*`; deployment-specific adjustments may replace those slots only after the adapter.
 - **Composers** read canonical facts for source-independent scalar mappings and target shed slots for adapter-owned structure. They serialise to `workspace.lsis.composed.<slot>` (OCSF JSON, RFC 5424 record, OTLP proto bytes, …). A companion one-line process, `<slot>_to_egress`, moves the slot to `egress` when the pipeline emits that shape as its wire form. Composers are vendor-unaware on purpose: they never decide whether a FortiGate or Palo Alto fact belongs in OTLP Resource, Scope, Body, or LogRecord attributes.
 

@@ -234,7 +234,7 @@ switch workspace.cef.device_vendor {
 
 Arm bodies are statements valid in the surrounding body, same rule as `if`. There is no fall-through and no need for an explicit `break`.
 
-Position rule: `default` must be the last arm and may appear at most once; `--check` rejects otherwise (since 0.7.8). For example, the following is rejected:
+Position rule: `default` must be the last arm and may appear at most once; `--check` rejects otherwise. For example, the following is rejected:
 
 ```limpid
 // NG — `default` is not last

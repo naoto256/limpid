@@ -42,7 +42,7 @@ def output reliable {
 }
 ```
 
-`retry` is accepted by every output type. Retry-exhausted payloads are persisted to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below) when configured. When `error_log` is unset, the runtime emits a one-line `tracing::error!` summary per failure with no payload (a confidentiality-preserving default) and the event resolves as `Recovered` — `events_failed` counts every terminal failure once, disk vs memory queue agnostic, via `resolve_ack_from_dlq_outcome`. An operator who wants payload metadata or the full JSONL on the tracing side opts in explicitly via `control { error_log_fallback "meta" | "full" }`; that setting only takes effect when `error_log` is also configured (see [Recovery (error_log)](#recovery-error_log) for the ladder).
+`retry` is accepted by every output type. Retry-exhausted payloads are persisted to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below) when configured. When `error_log` is unset, the runtime emits a one-line error summary per failure with no payload (a confidentiality-preserving default) and the event resolves as `Recovered` — `events_failed` counts every terminal failure once, disk vs memory queue agnostic. An operator who wants payload metadata or the full JSONL on the tracing side opts in explicitly via `control { error_log_fallback "meta" | "full" }`; that setting only takes effect when `error_log` is also configured (see [Recovery (error_log)](#recovery-error_log) for the ladder).
 
 ### Disposition contract
 
@@ -78,7 +78,7 @@ The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) bloc
 
 Each line is one per-event record carrying `event.egress` — the **pipeline-produced payload** at the moment it was handed to the sink (`egress` starts as a clone of `ingress` and is overwritten as the pipeline's process bodies run). Replay via `limpidctl inject output <name> --json` re-injects the event into the named sink's `consume()` path — the pipeline is **bypassed**, but the sink's own transport-level rendering (batched encode, HTTP body framing, OTLP `ResourceLogs` packing, etc.) **does** re-run. See [Error Log → Output flavor](../operations/error-log.md#output-flavor) for the full record shape and producer-site catalog.
 
-When `error_log` is unset, Output-flavor records fall back to a one-line `tracing::error!` summary (site + reason, no payload) and the event resolves as `Recovered`. The payload is not persisted anywhere by default — operators who want the metadata or the full JSONL on the tracing side must explicitly opt in with `control { error_log_fallback "meta" | "full" }`, and that opt-in only takes effect when `error_log` is also configured (see the ladder table below). `limpid --check` emits a recovery-readiness warning so operators notice the missing configuration before the first failure, plus a separate warning when `error_log_fallback` is set while `error_log` is unset (the fallback is inert in that combination).
+When `error_log` is unset, Output-flavor records fall back to a one-line error summary (site + reason, no payload) and the event resolves as `Recovered`. The payload is not persisted anywhere by default — operators who want the metadata or the full JSONL on the tracing side must explicitly opt in with `control { error_log_fallback "meta" | "full" }`, and that opt-in only takes effect when `error_log` is also configured (see the ladder table below). `limpid --check` emits a recovery-readiness warning so operators notice the missing configuration before the first failure, plus a separate warning when `error_log_fallback` is set while `error_log` is unset (the fallback is inert in that combination).
 
 **`error_log_fallback` ladder.** The tracing fallback line carries different fields depending on the operator's confidentiality choice. All rows preserve the same ack disposition — only the tracing emission differs.
 
@@ -91,25 +91,16 @@ When `error_log` is unset, Output-flavor records fall back to a one-line `tracin
 
 The `"full"` value restores the pre-0.7.9 shape (full JSONL on the tracing line) for operators who want a journald-based recovery trail; it exposes the pipeline egress bytes to the tracing subscriber, so treat it as an opt-in for environments where the journald boundary is trusted.
 
-> **Graceful shutdown vs. SIGKILL.** The shutdown-drain path above
-> only fires on **graceful** shutdown — `SIGTERM`, `SIGHUP` reload,
-> `systemctl stop`, or an explicit `shutdown()` call. The bounded
-> final drain runs one attempt per parked payload with a 3-second
-> `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` (plus the per-actor in-flight
-> cancel). Drain failures whose wire state can be proved
-> pre-boundary (e.g. render failure, permission drop before any
-> byte hit the transport) land in the error log as Output-flavor
-> `Recovered` records; drain failures where the wire state is
-> ambiguous (batched send cancelled mid-flight by shutdown, or
-> the 3-second attempt timeout firing after the first request
-> byte already left the kernel) route through the ambiguous DLQ
-> path and force `Dropped` on a disk queue so the fail-stop wedge
-> reconciles against the DLQ record on next start, while memory
-> queues fold to `Recovered` for lack of a replay path. **`SIGKILL`
-> (`kill -9`) cannot run either path** — actor tasks are aborted
-> and their stack-local buffers go with them. Operators should
-> not send `SIGKILL` directly to the daemon; keep systemd's
-> `KillSignal=SIGTERM` default in place.
+> **Graceful shutdown vs. SIGKILL.** `SIGTERM`, `SIGHUP` reload, and
+> `systemctl stop` run a final drain with one shared 3-second send deadline
+> per output, within the overall shutdown budget. The preceding actor join
+> has its own maximum wait of 3 seconds. Rendering failures and terminal
+> send errors use the normal recovery disposition. Cancelling an in-flight
+> send or timing it out leaves delivery ambiguous: disk queues hold their
+> cursor (`Dropped`), while memory queues advance (`Recovered`). Inspect
+> the DLQ and destination before replaying. `SIGKILL` bypasses the drain
+> and loses in-memory work. Keep systemd's `KillSignal=SIGTERM` default.
+> See [shutdown limits](../operations/error-log.md#graceful-shutdown-guarantees-and-known-limitations).
 
 Queue `capacity` must be an integer from `1` through Tokio's
 `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`): `2305843009213693951` on
