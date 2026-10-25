@@ -1,6 +1,6 @@
 # Process Design Guide
 
-This page is for people writing processes — your own `def process` blocks in a production config, or snippets intended for wider reuse (OCSF composers, SIEM-specific parsers, vendor normalizers shipping under `processes/*.limpid`).
+This page is for people writing processes — your own `def process` blocks in a production config, or snippets intended for wider reuse (OCSF composers, SIEM-specific parsers, vendor normalizers shipping under `parsers/`, `composers/`, `filters/`, and `functions/`).
 
 It is a **style guide**, not a reference. The reference for what a process can express is [User-defined Processes](./user-defined.md); the reference for functions is [Built-in Functions](../functions/expression-functions.md). The principles the guide rests on are in [Design Principles](../design-principles.md).
 
@@ -210,7 +210,7 @@ The rule of thumb: **a process should not make an event look successful when it 
 limpid has three layers of reusable logic:
 
 - **Built-in functions** (`parse_json`, `regex_extract`, `syslog.parse`, `cef.parse`, …) are primitives. Implemented in Rust, signature fixed, no pipeline context — no `ingress`, no `egress`, no `drop`. See [Built-in Functions](../functions/expression-functions.md).
-- **User-defined functions** (`def function`) are pure value-returning helpers in the DSL. Body is one expression. No Event reads, no side effects, no recursion. Composable in any expression context — HashLit values, function args, binary operands. See [User-defined Functions](../functions/user-defined.md).
+- **User-defined functions** (`def function`) are pure value-returning helpers in the DSL. The body contains zero or more `let` bindings followed by a final expression. No Event reads, no side effects, no recursion. Composable in any expression context — HashLit values, function args, binary operands. See [User-defined Functions](../functions/user-defined.md).
 - **User-defined processes** (`def process`) are the DSL's compositional unit *with* pipeline context: they can assign to `egress`, `drop`, `try`, branch, chain with `|`.
 
 The question "function or process?" has a clean answer:
@@ -330,21 +330,27 @@ timestamp from. That binding is invisible from the dispatcher body, so
 state it explicitly in a header block at the top of the file:
 
 ```text
-// Vendor:   OpenSSH
-// Wire:     sshd application body (Accepted publickey for ... / Failed
-//           password for ... / Disconnected from ... etc.)
-// Upstream: parse_syslog | parse_openssh
-//             body  ← workspace.syslog.msg
-//             pid   ← workspace.syslog.pid
-//           parse_journald | parse_openssh
-//             body  ← workspace.journald.MESSAGE
-//             pid   ← coalesce(workspace.journald._PID,
-//                              workspace.journald.SYSLOG_PID)
-//           (no upstream — falls back to parse_syslog inline on `ingress`)
-// Output:   workspace.lsis.parsed.* (OCSF Authentication, class_uid 3002)
+// Facade: process parse_example
+// Category: Vendor-neutral
+// Test corpus: synthetic (contract example)
+//
+// Wire — application message already separated from its wrapper.
+// Typical pipeline — process parse_syslog
+//                    | { workspace.example = { body: workspace.syslog.msg } }
+//                    | parse_example
+
+// Process: parse_example
+// Summary: Extract canonical facts from an example message.
+// Reads: workspace.example.*
+//        .body (required, String)
+// Writes: workspace.lsis.parsed.*
+//         .message (required, String)
+def process parse_example {
+    workspace.lsis.parsed.message = workspace.example.body
+}
 ```
 
-Stacks not listed are out of scope. If your wire is `openssh` over
+Inputs outside the documented `Reads` contract are out of scope. If your wire is `openssh` over
 `CEF` over `syslog` over `JSON` over `OCSF` over `OTLP` (or any other
 permutation a library author would not reasonably anticipate), the
 correct response is to write your own vocabulary parser that reads
@@ -363,7 +369,7 @@ For a worked example of this across multiple hosts, see [Multi-host Pipeline Exa
 ## Summary
 
 - One process, one responsibility. If you need `and` in the name, split it.
-- Document contracts as `@requires` / `@produces` comments.
+- Declare the public facade and each member's `Reads` / `Writes` contract; optional `@requires` / `@produces` comments on leaf processes are explanatory only.
 - Do not put state, schema-dispatch, or silent error-swallowing in a process.
 - Pick `def process` for anything with pipeline context; pick a function (or contribute one) for pure computation.
 - Snippets destined for a library stay small, canonical, and testable with `inject` + `tap`.

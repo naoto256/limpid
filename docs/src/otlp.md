@@ -262,7 +262,7 @@ Some bespoke senders do pure concat (smallest CPU). limpid offers
 all three as `batch_level = none | resource | scope` and documents
 that they are semantically identical at the wire. See [§ batch_level
 on the output reference page](./outputs/otlp_http.md#batch_level) for the
-operational tradeoff and §5.1 above for the underlying wire ↔ CPU
+operational tradeoff and §5.1 for the underlying wire ↔ CPU
 trade that motivates the choice.
 
 The reason this is in §4 (ambiguous) rather than §3 (clear) is that
@@ -291,8 +291,8 @@ applied to OTLP.
 
 **Why one-record granularity.** Every other limpid input does the
 same: a syslog UDP packet is one Event, a CEF line is one Event, a
-journal entry is one Event. Pipelines, snippets, the queue, the
-WAL, `tap --json` — all assume one Event = one record. Treating an
+journal entry is one Event. Pipelines, snippets, the queue, and
+`tap --json` — all assume one Event = one record. Treating an
 OTLP envelope as a single Event would create a second mode of
 operation that none of the rest of limpid speaks. The DSL would
 need envelope-aware semantics; the queue would need envelope-or-record
@@ -339,7 +339,7 @@ bytes as `ingress` and can either pass them through unchanged
 (pure relay) or decode them with `otlp.decode_resourcelog_protobuf`
 to inspect / mutate the contents.
 
-**Why bytes, not a structured value.** Principle 4 of limpid's
+**Why bytes, not a structured value.** Principle 3 of limpid's
 design says "only `egress` crosses hop boundaries." The bytes are
 already the canonical wire form; storing the decoded struct *and*
 re-encoding at every hop wastes work and creates a chance of

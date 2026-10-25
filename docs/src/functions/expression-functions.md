@@ -19,7 +19,7 @@ This page is the reference for every built-in. Operators can also declare their 
 
 ## Call syntax
 
-Errors raised by these primitives (a `parse_json` on malformed input, a `to_int` overflow, a `regex_*` compile failure, …) propagate to the surrounding `try` block when one is in scope; without `try`, the error flows through the pipeline's error path and the event lands in the configured [error log](../operations/error-log.md) (DLQ), with `events_errored` incremented. The same routing applies to errors raised from inside user-defined functions and processes — primitive failure, [`error` statement](../processing/user-defined.md#error), or analyzer-detected runtime fault all share the one path.
+Errors raised by these primitives (a `parse_json` on malformed input, a `regex_*` compile failure, …) propagate to the surrounding `try` block when one is in scope; without `try`, the error flows through the pipeline's error path and the event lands in the configured [error log](../operations/error-log.md) (DLQ), with `events_errored` incremented. The same routing applies to errors raised from inside user-defined functions and processes — primitive failure, [`error` statement](../processing/user-defined.md#error), or analyzer-detected runtime fault all share the one path.
 
 ### Bare statements vs assignments
 
@@ -701,12 +701,13 @@ workspace.lsis.parsed.src_endpoint.port = to_int(workspace.cef.extension.spt)  /
 | Input | Result |
 |-------|--------|
 | `Int` | Pass-through |
-| `Float` | Truncated toward zero |
-| `String` | `str::parse::<i64>` after trimming whitespace; otherwise `null` |
+| `Float` | Finite values within the signed 64-bit range truncate toward zero; finite out-of-range values saturate at the nearest endpoint. NaN and infinities return `null`. |
+| `String` | A signed 64-bit integer after trimming whitespace; invalid or out-of-range text returns `null` |
 | `Bool` | `1` or `0` |
-| `Timestamp` | unix nanoseconds (matches OTLP `time_unix_nano`). `to_int(received_at)` is the natural epoch-ns cast. |
+| `Timestamp` | Unix nanoseconds (matching OTLP `time_unix_nano`), or `0` if the nanosecond count cannot fit a signed 64-bit integer. |
 | `Null` | `Null` |
 | Array / Object | `Null` |
+| `Bytes` | Error |
 
 Motivation: CEF extension values and CSV column values arrive as strings even when carrying numeric content. OCSF schemas commonly require `Integer` for those same fields (ports, session IDs, byte counts). `to_int` is the schema-agnostic cast used by SIEM parser snippets.
 
@@ -1009,7 +1010,7 @@ See [Configuration](../configuration.md#table) for table definition options.
 
 ### geoip(ip_str)
 
-Returns a GeoIP lookup result as an object with `country`, `city`, `latitude`, and `longitude` fields.
+Returns a GeoIP lookup result as an object. Available `country`, `city`, `latitude`, and `longitude` fields are included; unavailable fields are omitted rather than filled with `null`.
 
 ```limpid
 workspace.geo = geoip(workspace.src)

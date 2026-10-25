@@ -281,26 +281,21 @@ This is a bigger change than anything we have done so far — a new global block
 
 ```bash
 $ limpid --check --config /etc/limpid/limpid.conf
-error: unknown process 'dedup_fortigate_trafic' referenced in pipeline 'main'
-  --> /etc/limpid/pipelines/main.limpid:5:30
-   |
- 5 |     process parse_syslog | parse_cef | parse_fortigate_cef | dedup_fortigate_trafic
-   |                                                              ^^^^^^^^^^^^^^^^^^^^^^^ no such process is defined
-   |
-   = help: did you mean `dedup_fortigate_traffic`?
+checking /etc/limpid/limpid.conf: 10 file(s), 1 input(s), 2 output(s), 24 process(es), 1 pipeline(s)
+Error: pipeline 'main': references unknown process 'dedup_fortigate_trafic'. Built-in processes were removed in v0.3.0 — use a DSL function (e.g. `syslog.parse(ingress)` as a statement) or define your own with `def process { ... }`.
 ```
 
 Caught it. The pipeline reference is missing an `f` in `traffic`. Fix the typo in `pipelines/main.limpid`, run `--check` again:
 
 ```bash
 $ limpid --check --config /etc/limpid/limpid.conf
-checking /etc/limpid/limpid.conf: 7 file(s), 1 input(s), 2 output(s), 2 process(es), 1 pipeline(s)
-/etc/limpid/limpid.conf: Configuration OK (1 pipeline(s), 2 process(es); dataflow check passed)
+checking /etc/limpid/limpid.conf: 10 file(s), 1 input(s), 2 output(s), 24 process(es), 1 pipeline(s)
+/etc/limpid/limpid.conf: Configuration OK (1 pipeline(s), 24 process(es); dataflow check passed)
 ```
 
 Now reload — `sudo systemctl reload limpid`. limpid validates the new config first; if it had failed to parse or start, the existing runtime would have stayed up untouched. On a successful validate, the old runtime is torn down and the new one rebinds — expect brief downtime for new connections while the old runtime drains established ones. Persistent disk queues survive the cycle; memory queues and in-flight events are best-effort drained. There is no half-loaded state to recover from.
 
-Run `--check` in CI on every config change. Type errors, unknown identifiers, unreachable pipelines, and similar mistakes are all surfaced here with line and column before they ever reach the daemon.
+Run `--check` in CI on every config change. It catches type errors, unknown references, unreachable switch arms, and similar configuration mistakes before startup. Analyzer diagnostics include source locations where available.
 
 ## Step 8 — Replay yesterday's traffic against today's config
 

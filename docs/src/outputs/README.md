@@ -54,7 +54,7 @@ Every event handed to an output resolves to one of three dispositions:
 | `Recovered` | Send failed, and either the failure record was durably written to `error_log`, or `error_log` is unset so the operator has declared no durable recovery is required (the tracing fallback runs per the `error_log_fallback` ladder and is best-effort, not load-bearing). | advances | advances | `events_failed++` |
 | `Dropped` | Send failed *and* no durable failure record was written (configured DLQ-file write failure, bug / panic in the sink, runtime task abort past shutdown budget, or an ambiguous shutdown-drain failure where the wire state cannot be proved and a `Recovered` disposition would fabricate at-least-once). | **holds — fail-stop wedge; consumer stops accepting new events and replays on next daemon start** | advances (memory queues cannot replay) | `events_failed++`, `events_wedged++` on disk queues |
 
-The **fail-stop wedge** on disk queues is intentional. Holding the cursor guarantees that no event is silently lost on a durable queue; the trade-off is that the affected output's pipeline halts until an operator investigates and restarts the daemon. Both **unbatched sinks** (`file`, `stdout`, `unix_socket`, `syslog_tcp`, `syslog_udp`, `kafka`) and **batched sinks** (`http`, `otlp_http`, `otlp_grpc`) exit the wedge cleanly — unbatched sinks resolve each ack synchronously inside `consume`, so `in-flight == 0` at wedge time; batched sinks take a separate wedge-exit path that resolves parked buffer entries as ambiguous DLQ records without attempting any further send. See [Error Log → Disposition contract and fail-stop wedge on disk queues](../operations/error-log.md#disposition-contract-and-fail-stop-wedge-on-disk-queues) for the operator runbook.
+The **fail-stop wedge** on disk queues is intentional. Holding the cursor preserves the replay position; the trade-off is that the affected output's pipeline halts until an operator investigates and restarts the daemon. Both **unbatched sinks** (`file`, `stdout`, `unix_socket`, `syslog_tcp`, `syslog_udp`, `kafka`) and **batched sinks** (`http`, `otlp_http`, `otlp_grpc`) exit the wedge cleanly — unbatched sinks complete each event before accepting another; batched sinks take a separate wedge-exit path that resolves parked buffer entries as ambiguous DLQ records without attempting any further send. See [Error Log → Disposition contract and fail-stop wedge on disk queues](../operations/error-log.md#disposition-contract-and-fail-stop-wedge-on-disk-queues) for the operator runbook.
 
 ### Memory queue (default)
 
@@ -62,11 +62,31 @@ Fast, but events are lost on process restart.
 
 ### Disk queue
 
-Events are persisted to a Write-Ahead Log (WAL) on disk. Survives process restarts.
+Events are persisted to a Write-Ahead Log (WAL) and survive process restarts.
+Segments rotate at 16 MiB; the acknowledgement cursor is saved atomically.
+`max_size` removes only fully acknowledged segments, oldest first. Unread or
+unacknowledged records are retained, so a backlog can exceed the configured
+size. Zero or an omitted `max_size` disables size-based cleanup, and even a
+non-zero value is not an upper bound on disk usage in this release. Appends
+do not wait for a byte-size budget.
 
-- Segments are rotated at 16 MiB
-- `max_size` limits total disk usage (oldest consumed segments are deleted)
-- Cursor position is saved atomically
+For either queue type, `capacity` must be an integer from `1` through
+`2305843009213693951` on 64-bit platforms, or `536870911` on 32-bit platforms.
+Out-of-range values are rejected at startup and by `--check`. This is a channel
+representation limit, not a recommended buffer size or a memory budget.
+Disk queues validate `capacity` but do not use it to limit the WAL backlog.
+Size strings such as `max_size` must fit an unsigned 64-bit byte count after
+expanding binary `KB`/`MB`/`GB` suffixes. Duration strings must fit an unsigned
+64-bit second count after expanding minutes; overflow is a configuration error.
+
+### Response failures and replay
+
+A connection failure may occur before or after request bytes reach the peer. An HTTP
+non-2xx response (including 3xx) is a failure after the request has reached
+the peer; `bytes_written` increases before classifying that response.
+Replaying a terminal failure from the DLQ can therefore duplicate delivery.
+`Recovered` records recovery handling, not proof that the receiver stored
+nothing. See [output recovery](../operations/error-log.md#output-flavor).
 
 ### Recovery (error_log)
 
@@ -76,7 +96,7 @@ The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) bloc
 - a batched output (`http`, `otlp_http`, `otlp_grpc`) failed to flush its remaining buffer during **graceful shutdown** (one record per still-parked event; see the shutdown caveat below), or exited through the fail-stop wedge with parked buffer entries (one ambiguous-disposition record per parked event),
 - the runtime could not hand an event to the output's queue at the pipeline → output boundary (queue closed, disk-queue write error, unknown output).
 
-Each line is one per-event record carrying `event.egress` — the **pipeline-produced payload** at the moment it was handed to the sink (`egress` starts as a clone of `ingress` and is overwritten as the pipeline's process bodies run). Replay via `limpidctl inject output <name> --json` re-injects the event into the named sink's `consume()` path — the pipeline is **bypassed**, but the sink's own transport-level rendering (batched encode, HTTP body framing, OTLP `ResourceLogs` packing, etc.) **does** re-run. See [Error Log → Output flavor](../operations/error-log.md#output-flavor) for the full record shape and producer-site catalog.
+Each line is one per-event record carrying `event.egress` — the **pipeline-produced payload** at the moment it was handed to the sink (`egress` starts as a clone of `ingress` and is overwritten as the pipeline's process bodies run). Replay via `limpidctl inject output <name> --json` re-injects the event into the named output — the pipeline is **bypassed**, but the sink's own transport-level rendering (batched encode, HTTP body framing, OTLP `ResourceLogs` packing, etc.) **does** re-run. See [Error Log → Output flavor](../operations/error-log.md#output-flavor) for the full record shape and producer-site catalog.
 
 When `error_log` is unset, Output-flavor records fall back to a one-line error summary (site + reason, no payload) and the event resolves as `Recovered`. The payload is not persisted anywhere by default — operators who want the metadata or the full JSONL on the tracing side must explicitly opt in with `control { error_log_fallback "meta" | "full" }`, and that opt-in only takes effect when `error_log` is also configured (see the ladder table below). `limpid --check` emits a recovery-readiness warning so operators notice the missing configuration before the first failure, plus a separate warning when `error_log_fallback` is set while `error_log` is unset (the fallback is inert in that combination).
 
@@ -89,7 +109,7 @@ When `error_log` is unset, Output-flavor records fall back to a one-line error s
 | set         | `"meta"`             | structured metadata (`kind`, `fallback`, `reason`, `timestamp`, `size`, `position`); no payload |
 | set         | `"full"`             | `event_record = <full JSONL>` — payload may reach journald / log aggregation                    |
 
-The `"full"` value restores the pre-0.7.9 shape (full JSONL on the tracing line) for operators who want a journald-based recovery trail; it exposes the pipeline egress bytes to the tracing subscriber, so treat it as an opt-in for environments where the journald boundary is trusted.
+The `"full"` value includes full JSONL in the daemon error message for operators who want a journald-based recovery trail; it exposes the pipeline egress bytes to the tracing subscriber, so treat it as an opt-in for environments where the journald boundary is trusted.
 
 > **Graceful shutdown vs. SIGKILL.** `SIGTERM`, `SIGHUP` reload, and
 > `systemctl stop` run a final drain with one shared 3-second send deadline
@@ -101,17 +121,6 @@ The `"full"` value restores the pre-0.7.9 shape (full JSONL on the tracing line)
 > the DLQ and destination before replaying. `SIGKILL` bypasses the drain
 > and loses in-memory work. Keep systemd's `KillSignal=SIGTERM` default.
 > See [shutdown limits](../operations/error-log.md#graceful-shutdown-guarantees-and-known-limitations).
-
-Queue `capacity` must be an integer from `1` through Tokio's
-`Semaphore::MAX_PERMITS` (`usize::MAX >> 3`): `2305843009213693951` on
-64-bit platforms, or `536870911` on 32-bit platforms. Out-of-range values
-are rejected at startup and by `--check`, before channel construction.
-This is a channel representation limit, not a recommended buffer size or
-a memory budget. Size strings such as
-`max_size` must fit in an unsigned 64-bit byte count after expanding the
-binary `KB`/`MB`/`GB` suffix. Duration strings must fit in an unsigned
-64-bit second count after expanding minutes; out-of-range values are
-configuration errors instead of wrapping.
 
 ## Usage in pipelines
 

@@ -68,7 +68,7 @@ A few we have already covered:
 
 - **Composable pieces.** Pipelines are chains of small named processes — `parse_cef | parse_fortigate_cef | compose_ocsf | route_by_severity`. Each piece is one responsibility, swappable, and reusable across pipelines.
 
-- **Durable recovery sink, built in.** `control { error_log "..." }` persists payloads that retry-exhaust or fail the shutdown flush — operators get the recovery guarantee without writing their own DLQ wiring. `--check --strict-warnings` enforces it on configs that need it.
+- **Durable recovery sink, built in.** `control { error_log "..." }` persists payloads that retry-exhaust or fail the shutdown flush — operators get the recovery guarantee without writing their own DLQ wiring. `--check` warns when recovery-dependent configurations omit it; `--strict-warnings` exits with status 2 if warnings remain.
 
 - **Visible flow.** Read the config and you know what the pipeline does. No implicit parsers that fire because input "looks like JSON". No magic defaults. No plugin runtime layer that translates between versions.
 
@@ -124,7 +124,7 @@ cargo build --release -p limpid --features journal,kafka
 
 Other useful flags during config development:
 
-- `--check --strict-warnings` — promote analyzer warnings to errors (for example, missing `control { error_log }` on configs that depend on recovery).
+- `--check --strict-warnings` — exit with status 2 if analyzer warnings remain, without changing their diagnostic level (for example, missing `control { error_log }` on recovery-dependent configs).
 - `--check --ultra-strict` — promote unknown-identifier warnings to errors. This is the only opt-in lint upgrade today; it is *not* a generic style-level fail-on-warn. For "any warning fails CI" use `--strict-warnings`.
 - `--graph[=mermaid|dot|ascii]` — render the resolved pipeline graph for review or for pasting into a PR description.
 - `--test-pipeline <name> --input '<json>'` — run a single Event through one named pipeline without binding any sockets.

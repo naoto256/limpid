@@ -586,6 +586,6 @@ Investigate these signals:
   `finished + dropped + discarded + errored` may mean pipeline work is in flight
   or backed up.
 - `output.received > output.written + output.failed`: events remain pending,
-  commonly under disk-queue backpressure.
+  in the memory channel or disk WAL backlog, or held in an in-flight batch or retry. The disk `max_size` setting does not block appends in this release.
 - `errored_unwritable > 0` or `wedged > 0`: treat as an alarm and restore DLQ or
   disk-queue health before assuming replay coverage is complete.

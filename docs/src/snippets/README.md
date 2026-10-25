@@ -296,13 +296,12 @@ conventions are:
   (`parse_fortigate_cef` + `parse_fortigate_syslog`) because CEF and
   native KV are different wire shapes; OpenSSH is one file because
   sshd's wire is one shape across syslog and journald.
-- **Canonical file header** follows the per-kind schema documented in the
-  [authoring guide](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions):
-  parser files declare `Summary`, `Reads`, `Writes`, `Category`, and
-  `Test corpus`; composers and shared functions use their corresponding
-  schemas. The header is the source for generated inventory. Keep sample
-  wires in the header and anonymise them with documentation domains and
-  RFC 5737 addresses.
+- **Canonical headers:** parser files declare `Facade`, `Category`, and
+  `Test corpus`; composer, filter, and function files declare `Facade` and
+  `Test corpus`. Each public process declares `Process`, `Summary`, `Reads`,
+  and `Writes`; each public function declares `Function`, `Summary`, and
+  `Signature`. See [authoring conventions](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions).
+  Keep samples anonymised with documentation domains and RFC 5737 addresses.
 - **Two-tier dispatch**: the top-level `def process parse_<vendor>`
   strips the wrapper and routes by header field (`switch
   workspace.<vendor>.<key>`); per-leaf `def process` re-parses the

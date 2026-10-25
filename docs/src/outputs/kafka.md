@@ -2,11 +2,7 @@
 
 Produces events to an Apache Kafka topic. Uses librdkafka internally for batching, compression, retries, and connection management.
 
-Requires the `kafka` feature at build time:
-
-```bash
-cargo build --release -p limpid --features kafka
-```
+Requires a limpid package built with Kafka support.
 
 ## Configuration
 

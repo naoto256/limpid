@@ -14,17 +14,20 @@ rsyslog configs are cryptic. syslog-ng is verbose. fluentd needs plugins for eve
 - **Non-terminal outputs** — send to multiple destinations without copy-plugin hacks
 - **Fan-out by design** — multiple pipelines can share the same input, each with independent processing
 - **Hot reload** — `SIGHUP` reloads configuration with automatic rollback on failure
-- **Instant shutdown** — graceful SIGTERM handling with a fixed 10s shutdown deadline
+- **Graceful shutdown** — graceful SIGTERM handling with a fixed 10s shutdown deadline
 
 ## Architecture
 
 ```
-Input → Process → Process → ... → output(copy) → Process → output(copy) → finish
-                                       ↓                        ↓
-                                    [Queue]                  [Queue]
-                                       ↓                        ↓
-                                    Output                   Output
+Input → Process → Process → ... → output <name> → Process → output <name> → finish
+                                        ↓                         ↓
+                                     [Queue]                   [Queue]
+                                        ↓                         ↓
+                                     Output                    Output
 ```
+
+`output <name>` is non-terminal: it deep-copies the current event into the
+named output queue and processing continues.
 
 - **Input** modules receive log messages (syslog, file tailing, journal, unix socket)
 - **Process** modules transform events (parse, filter, enrich, rewrite)
