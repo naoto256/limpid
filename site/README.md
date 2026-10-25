@@ -94,3 +94,7 @@ x64/ARM64 builds and ZIP packaging alongside Debian, then verifies the complete
 asset set and checksums before a single tag-only publish job. mdBook is retained
 for migration comparison until the site is accepted; it is not a second content
 source. Remove its renderer/config only as part of the approved cutover.
+
+Recipe Markdown links use the book-relative paths under `docs/src`, resolved
+as though the recipe were `docs/src/pipelines/examples.md`, rather than
+paths relative to the `site/src` source file.
