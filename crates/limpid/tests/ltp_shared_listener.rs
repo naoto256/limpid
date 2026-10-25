@@ -92,13 +92,13 @@ fn single_logical_input_keeps_repeatable_peer_syntax() {
 def input shared {{
     type ltp
     bind "127.0.0.1:27514"
-    peer {{ node_id "jump01" pubkey "{}" }}
-    peer {{ node_id "jump02" pubkey "{}" }}
+    peer {{ node_id "relay_a" pubkey "{}" }}
+    peer {{ node_id "relay_b" pubkey "{}" }}
 }}
 def pipeline receive {{ input shared; finish }}
 "#,
-        write_identity(&TempDir::new().unwrap().path().join("jump01.pem")),
-        write_identity(&TempDir::new().unwrap().path().join("jump02.pem")),
+        write_identity(&TempDir::new().unwrap().path().join("relay_a.pem")),
+        write_identity(&TempDir::new().unwrap().path().join("relay_b.pem")),
     );
     let output = run_check(&source);
     assert!(
@@ -137,8 +137,8 @@ fn listener_group_rejects_duplicate_spki() {
     let bind = "127.0.0.1:27514";
     let source = format!(
         "node_key \"not-read-by-check.pem\"\n{}{}",
-        ltp_input("from_a", bind, "jump01", &shared, 8),
-        ltp_input("from_b", bind, "jump02", &shared, 8),
+        ltp_input("from_a", bind, "relay_a", &shared, 8),
+        ltp_input("from_b", bind, "relay_b", &shared, 8),
     );
     let output = run_check(&source);
     assert!(!output.status.success(), "duplicate group SPKI must fail");
@@ -160,8 +160,8 @@ fn listener_group_rejects_overlapping_nonidentical_binds() {
     ] {
         let source = format!(
             "node_key \"not-read-by-check.pem\"\n{}{}",
-            ltp_input("wildcard", wildcard, "jump01", &first, 8),
-            ltp_input("specific", specific, "jump02", &second, 8),
+            ltp_input("wildcard", wildcard, "relay_a", &first, 8),
+            ltp_input("specific", specific, "relay_b", &second, 8),
         );
         let output = run_check(&source);
         assert!(!output.status.success(), "{wildcard} overlaps {specific}");
@@ -179,8 +179,8 @@ fn listener_group_accepts_distinct_specific_addresses() {
     let second = write_identity(&TempDir::new().unwrap().path().join("second.pem"));
     let source = format!(
         "node_key \"not-read-by-check.pem\"\n{}{}",
-        ltp_input("loopback_one", "127.0.0.1:27514", "jump01", &first, 8),
-        ltp_input("loopback_two", "127.0.0.2:27514", "jump02", &second, 8),
+        ltp_input("loopback_one", "127.0.0.1:27514", "relay_a", &first, 8),
+        ltp_input("loopback_two", "127.0.0.2:27514", "relay_b", &second, 8),
     );
     let output = run_check(&source);
     assert!(
@@ -197,8 +197,8 @@ fn identical_bind_requires_matching_listener_settings() {
     let bind = "127.0.0.1:27514";
     let matching = format!(
         "node_key \"not-read-by-check.pem\"\n{}{}",
-        ltp_input("from_a", bind, "jump01", &first, 8),
-        ltp_input("from_b", bind, "jump02", &second, 8),
+        ltp_input("from_a", bind, "relay_a", &first, 8),
+        ltp_input("from_b", bind, "relay_b", &second, 8),
     );
     let output = run_check(&matching);
     assert!(
@@ -209,8 +209,8 @@ fn identical_bind_requires_matching_listener_settings() {
 
     let mismatched = format!(
         "node_key \"not-read-by-check.pem\"\n{}{}",
-        ltp_input("from_a", bind, "jump01", &first, 8),
-        ltp_input("from_b", bind, "jump02", &second, 9),
+        ltp_input("from_a", bind, "relay_a", &first, 8),
+        ltp_input("from_b", bind, "relay_b", &second, 9),
     );
     let output = run_check(&mismatched);
     assert!(
@@ -233,35 +233,35 @@ fn write_receiver_config(
     dir: &Path,
     bind: SocketAddr,
     server_key: &Path,
-    jump01_spki: &str,
-    jump02_spki: &str,
+    relay_a_spki: &str,
+    relay_b_spki: &str,
 ) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let config = dir.join("receiver.limpid");
     let control = dir.join("receiver.sock");
-    let out01 = dir.join("jump01.log");
-    let out02 = dir.join("jump02.log");
+    let out01 = dir.join("relay_a.log");
+    let out02 = dir.join("relay_b.log");
     fs::write(
         &config,
         format!(
             r#"node_id "receiver"
 node_key {server_key:?}
 control {{ socket {control:?} }}
-def input ltp_jump01 {{
+def input ltp_relay_a {{
     type ltp
     bind "{bind}"
-    peer {{ node_id "jump01" pubkey {jump01_spki:?} }}
+    peer {{ node_id "relay_a" pubkey {relay_a_spki:?} }}
     max_connections 8
 }}
-def input ltp_jump02 {{
+def input ltp_relay_b {{
     type ltp
     bind "{bind}"
-    peer {{ node_id "jump02" pubkey {jump02_spki:?} }}
+    peer {{ node_id "relay_b" pubkey {relay_b_spki:?} }}
     max_connections 8
 }}
 def output out01 {{ type file path {out01:?} }}
 def output out02 {{ type file path {out02:?} }}
-def pipeline p01 {{ input ltp_jump01; output out01 }}
-def pipeline p02 {{ input ltp_jump02; output out02 }}
+def pipeline p01 {{ input ltp_relay_a; output out01 }}
+def pipeline p02 {{ input ltp_relay_b; output out02 }}
 "#
         ),
     )
@@ -317,17 +317,17 @@ fn stop_daemon(child: &mut Child) {
 fn identical_bind_starts_one_listener_without_partial_eaddrinuse() {
     let dir = secure_tempdir();
     let server_key = dir.path().join("server.pem");
-    let jump01_key = dir.path().join("jump01.pem");
-    let jump02_key = dir.path().join("jump02.pem");
+    let relay_a_key = dir.path().join("relay_a.pem");
+    let relay_b_key = dir.path().join("relay_b.pem");
     let _server_spki = write_identity(&server_key);
-    let jump01_spki = write_identity(&jump01_key);
-    let jump02_spki = write_identity(&jump02_key);
+    let relay_a_spki = write_identity(&relay_a_key);
+    let relay_b_spki = write_identity(&relay_b_key);
     let (config, control, _, _) = write_receiver_config(
         dir.path(),
         free_tcp_addr(),
         &server_key,
-        &jump01_spki,
-        &jump02_spki,
+        &relay_a_spki,
+        &relay_b_spki,
     );
     let log = dir.path().join("receiver.stderr");
     let mut child = spawn_daemon(&config, &log);
@@ -374,7 +374,7 @@ fn spec_fixture_pins_connection_and_listener_lifecycle_fail_closed_cases() {
     assert_eq!(spec["e2e"]["binds"], 1);
     assert_eq!(
         spec["e2e"]["logical_inputs"],
-        serde_json::json!(["ltp_jump01", "ltp_jump02"])
+        serde_json::json!(["ltp_relay_a", "ltp_relay_b"])
     );
     assert_eq!(spec["e2e"]["independent_input_metrics"], true);
     assert_eq!(spec["e2e"]["independent_pipeline_delivery"], true);
@@ -414,17 +414,17 @@ fn metric_value(stats: &Value, family: &str, labels: &[(&str, &str)]) -> u64 {
 fn shared_listener_prepopulates_independent_logical_input_metrics() {
     let dir = secure_tempdir();
     let server_key = dir.path().join("server.pem");
-    let jump01_key = dir.path().join("jump01.pem");
-    let jump02_key = dir.path().join("jump02.pem");
+    let relay_a_key = dir.path().join("relay_a.pem");
+    let relay_b_key = dir.path().join("relay_b.pem");
     let _server_spki = write_identity(&server_key);
-    let jump01_spki = write_identity(&jump01_key);
-    let jump02_spki = write_identity(&jump02_key);
+    let relay_a_spki = write_identity(&relay_a_key);
+    let relay_b_spki = write_identity(&relay_b_key);
     let (config, control, _, _) = write_receiver_config(
         dir.path(),
         free_tcp_addr(),
         &server_key,
-        &jump01_spki,
-        &jump02_spki,
+        &relay_a_spki,
+        &relay_b_spki,
     );
     let log = dir.path().join("receiver.stderr");
     let mut child = spawn_daemon(&config, &log);
@@ -436,7 +436,7 @@ fn shared_listener_prepopulates_independent_logical_input_metrics() {
         metric_value(
             &stats,
             "limpid_input_events_received_total",
-            &[("input", "ltp_jump01")]
+            &[("input", "ltp_relay_a")]
         ),
         0
     );
@@ -444,7 +444,7 @@ fn shared_listener_prepopulates_independent_logical_input_metrics() {
         metric_value(
             &stats,
             "limpid_input_events_received_total",
-            &[("input", "ltp_jump02")]
+            &[("input", "ltp_relay_b")]
         ),
         0
     );
@@ -513,49 +513,49 @@ fn wait_for_exact_file(path: &Path, expected: &[u8]) -> bool {
 fn two_peers_on_one_port_route_to_independent_inputs_pipelines_and_metrics() {
     let dir = secure_tempdir();
     let server_key = dir.path().join("server.pem");
-    let jump01_key = dir.path().join("jump01.pem");
-    let jump02_key = dir.path().join("jump02.pem");
+    let relay_a_key = dir.path().join("relay_a.pem");
+    let relay_b_key = dir.path().join("relay_b.pem");
     let server_spki = write_identity(&server_key);
-    let jump01_spki = write_identity(&jump01_key);
-    let jump02_spki = write_identity(&jump02_key);
+    let relay_a_spki = write_identity(&relay_a_key);
+    let relay_b_spki = write_identity(&relay_b_key);
     let ltp_addr = free_tcp_addr();
-    let jump01_source = free_tcp_addr();
-    let jump02_source = free_tcp_addr();
+    let relay_a_source = free_tcp_addr();
+    let relay_b_source = free_tcp_addr();
     let (receiver_config, receiver_control, out01, out02) = write_receiver_config(
         dir.path(),
         ltp_addr,
         &server_key,
-        &jump01_spki,
-        &jump02_spki,
+        &relay_a_spki,
+        &relay_b_spki,
     );
-    let (jump01_config, jump01_control) = write_sender_config(
+    let (relay_a_config, relay_a_control) = write_sender_config(
         dir.path(),
-        "jump01",
-        &jump01_key,
+        "relay_a",
+        &relay_a_key,
         &server_spki,
-        jump01_source,
+        relay_a_source,
         ltp_addr,
     );
-    let (jump02_config, jump02_control) = write_sender_config(
+    let (relay_b_config, relay_b_control) = write_sender_config(
         dir.path(),
-        "jump02",
-        &jump02_key,
+        "relay_b",
+        &relay_b_key,
         &server_spki,
-        jump02_source,
+        relay_b_source,
         ltp_addr,
     );
 
     let mut receiver = spawn_daemon(&receiver_config, &dir.path().join("receiver.stderr"));
     wait_for_path(&receiver_control);
-    let mut jump01 = spawn_daemon(&jump01_config, &dir.path().join("jump01.stderr"));
-    let mut jump02 = spawn_daemon(&jump02_config, &dir.path().join("jump02.stderr"));
-    wait_for_path(&jump01_control);
-    wait_for_path(&jump02_control);
+    let mut relay_a = spawn_daemon(&relay_a_config, &dir.path().join("relay_a.stderr"));
+    let mut relay_b = spawn_daemon(&relay_b_config, &dir.path().join("relay_b.stderr"));
+    wait_for_path(&relay_a_control);
+    wait_for_path(&relay_b_control);
 
-    let marker01 = b"<13>shared-listener-jump01";
-    let marker02 = b"<13>shared-listener-jump02";
-    send_one_syslog_frame(jump01_source, marker01);
-    send_one_syslog_frame(jump02_source, marker02);
+    let marker01 = b"<13>shared-listener-relay_a";
+    let marker02 = b"<13>shared-listener-relay_b";
+    send_one_syslog_frame(relay_a_source, marker01);
+    send_one_syslog_frame(relay_b_source, marker02);
     let mut expected01 = marker01.to_vec();
     expected01.push(b'\n');
     let mut expected02 = marker02.to_vec();
@@ -564,13 +564,19 @@ fn two_peers_on_one_port_route_to_independent_inputs_pipelines_and_metrics() {
     let delivered02 = wait_for_exact_file(&out02, &expected02);
     let stats = read_stats(&receiver_control);
 
-    stop_daemon(&mut jump01);
-    stop_daemon(&mut jump02);
+    stop_daemon(&mut relay_a);
+    stop_daemon(&mut relay_b);
     stop_daemon(&mut receiver);
 
-    assert!(delivered01, "jump01 event did not reach its bound pipeline");
-    assert!(delivered02, "jump02 event did not reach its bound pipeline");
-    for (input, pipeline) in [("ltp_jump01", "p01"), ("ltp_jump02", "p02")] {
+    assert!(
+        delivered01,
+        "relay_a event did not reach its bound pipeline"
+    );
+    assert!(
+        delivered02,
+        "relay_b event did not reach its bound pipeline"
+    );
+    for (input, pipeline) in [("ltp_relay_a", "p01"), ("ltp_relay_b", "p02")] {
         assert_eq!(
             metric_value(
                 &stats,
