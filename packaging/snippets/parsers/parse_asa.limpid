@@ -134,12 +134,12 @@ def process validate_asa_severity_number {
 
 // Process: parse_asa
 // Summary: Cisco ASA / FTD (ASA-syslog-compatibility) %ASA syslog messages → LSIS Authentication + Network Activity.
-// Reads: workspace.syslog.* (transport intake — populated by
-//        .msg (required, String) — syslog body carrying the
+// Reads: workspace.syslog.*
+//        .msg (required, String) — ASA syslog message body
 //        .timestamp (optional, String) — RFC 3164 wire timestamp
-//        .hostname (optional, String) — originating device, retained
+//        .hostname (optional, String) — originating hostname
 //        workspace.asa.*
-//        .timezone (optional, String) — source device
+//        .timezone (optional, String) — source timezone
 // Writes: workspace.lsis.parsed.*
 //         .class_uid (required, Int)
 def process parse_asa {
@@ -150,12 +150,9 @@ def process parse_asa {
     )
     // Two-tier dispatch: the top-level guard rejects non-ASA syslog
     // bodies, then `parse_asa_dispatch` routes by message ID. The
-    // nested form was historically broken (sub-process `error` was
-    // swallowed at the ProcessCall boundary, so unsupported message
-    // IDs would silently flow into compose_ocsf with an empty
-    // workspace.lsis.parsed); the v0.7.0 propagation fix
-    // (`fix/process-call-error-propagation`) made the nested form
-    // work as written.
+    // nested error propagates to the pipeline boundary, so an
+    // unsupported message ID cannot reach the composer as a
+    // successfully parsed event.
     switch true {
         workspace.asa == null { error "parse_asa: not an ASA syslog body: ${workspace.syslog.msg}" }
         default {

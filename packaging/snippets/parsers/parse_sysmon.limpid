@@ -37,7 +37,7 @@
 //           - Direct JSON-line tail (when the forwarder writes a JSONL file):
 //                 process { workspace.sysmon = { body: parse_json(ingress), hostname: hostname() } } | parse_sysmon | compose_ocsf | ocsf_to_egress
 //
-// Coverage scope (v0.7.1):
+// Coverage —
 //
 //   | EventID | Sysmon name        | OCSF class                     |
 //   |---------|--------------------|--------------------------------|

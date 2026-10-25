@@ -27,14 +27,14 @@ read that and explains the OTLP-specific reading on top.
 | Aspect | Support |
 |---|---|
 | Signal | **logs** only — no traces, no metrics, no profiles |
-| Transports | HTTP/JSON, HTTP/protobuf, gRPC (all three; output side split into `output otlp_http` / `output otlp_grpc` introduced in 0.7.6; in 0.7.8 plaintext `http://` with `tls { ... }` is now rejected at parse time — see CHANGELOG 0.7.8) |
+| Transports | HTTP/JSON, HTTP/protobuf, gRPC; HTTP output uses `otlp_http`, gRPC output uses `otlp_grpc`. A plaintext `http://` URL with a `tls` block is rejected during configuration checks. |
 | Direction | input *and* output (so collector-to-collector relay works) |
-| TLS | server-side TLS / mTLS on every input (`otlp_http`, `otlp_grpc`); client-side TLS / mTLS on every output (per-peer `tls { ca cert key }` on both `output otlp_http` and `output otlp_grpc`; introduced in 0.7.6, with 0.7.8 adding fail-fast rejection of plaintext `http://` URLs that pair a `tls { ... }` block) |
+| TLS | Server TLS / mTLS on both inputs; per-peer `tls { ca cert key }` on both outputs. Plaintext URLs cannot be combined with a `tls` block. |
 | Versioning | OTLP 1.10 wire (the proto3 schema as of opentelemetry-proto 0.32) |
 
 Traces and metrics share the same wire envelope shape but use different
 proto messages, so the input / output skeleton from logs is reusable.
-The 0.5.x line shipped logs first because that is where limpid's existing
+limpid supports logs because that is where its
 pipeline identity lives — every other limpid module produces or consumes
 log records.
 
@@ -356,8 +356,7 @@ re-encodes on the way out if the configured protocol is `http_json`.
 The answer to 4.3 follows the parser/adapter/composer split. The input
 does not parse a payload, but the semantic parser does:
 
-- **Input** sets `Event.received_at = Utc::now()` (wall-clock,
-  always present).
+- **Input** sets `received_at` from the host wall clock (always present).
 - **Parser snippet** extracts source-claimed time and normalizes it to
   `workspace.lsis.parsed.time` as epoch nanoseconds.
 - **Source adapter** may set an explicit target override only when the
@@ -380,10 +379,7 @@ timezone (the device most likely shares the host's zone). Parsers
 that accept local timestamps expose a source-specific timezone override;
 their headers document the exact default and accepted values.
 
-This is also why the `Event.timestamp` → `Event.received_at` rename
-that landed in v0.5.0 was made: a forwarder must not silently conflate
-wall-clock and source-clock semantics. See the breaking change entry in
-[CHANGELOG.md](https://github.com/naoto256/limpid/blob/main/CHANGELOG.md).
+A forwarder must keep host observation time distinct from source event time.
 
 ### 5.4 Resource attributes are source-adapter-owned
 
@@ -421,8 +417,7 @@ fallback for canonical severity. limpid does not bake source mappings
 into Rust; parser snippets carry exact tables and reject unknown
 non-null source values.
 
-The reference snippet library that landed in v0.7.0 (and was expanded
-across the 0.7.x line) ships opinionated mappings for common vendors — see
+The reference snippet library ships opinionated mappings for common vendors — see
 [Snippet Library](./snippets/README.md). Authors of new snippets
 follow the table conventions documented there.
 
@@ -448,7 +443,7 @@ to the same receiver and get the same rejection. A "selective
 retry" mechanism would imply the rejection was transient, which the
 spec does not say.
 
-**What limpid does today.** In 0.7.8 the rejected subset is split out
+**What limpid does today.** The rejected subset is split out
 into `events_failed` (separate from `events_written`) so the loss is
 visible on dashboards, **and the trailing N events (N =
 `rejected_log_records`) are routed to `control { error_log }` as
@@ -461,8 +456,7 @@ trailing N entries; see the per-output notes in
 [`otlp_grpc`](./outputs/otlp_grpc.md) /
 [`otlp_http`](./outputs/otlp_http.md) for the caveat). Selective
 *automatic* re-send of only the rejected records on a
-`partial_success` reply remains future work (tracked in `send_once`
-doc comments) — today the rejected count drives metrics and DLQ
+`partial_success` reply is not supported — today the rejected count drives metrics and DLQ
 routing, not in-pipeline retry shape.
 
 ### 5.7 Body format is the snippet's call
@@ -501,9 +495,7 @@ string.
 
 ## 6. What limpid intentionally does *not* do
 
-These are not "queued for a later 0.x release" — they are out of scope for
-limpid's identity as a forwarder. Issues asking for them will be
-closed with a link here.
+These features are outside the scope of a forwarder.
 
 ### 6.1 SDK semantics
 
@@ -523,18 +515,14 @@ does not synthesise them and does not maintain a trace context.
 ### 6.3 Service identity auto-detection
 
 Restated for clarity: see §5.4. No composer-side
-`hostname()`-as-`host.name`, `cargo_pkg_version()`-as-`service.version`,
+`hostname()`-as-`host.name`, the daemon version as `service.version`,
 or `$HOSTNAME` fallback. The per-source adapter places source-backed
 identity; otherwise the attribute is absent.
 
 ### 6.4 Schema URL inference
 
-`ResourceLogs.schema_url` and `ScopeLogs.schema_url` are optional
-fields pointing at an OpenTelemetry Schema URL (e.g.,
-`https://opentelemetry.io/schemas/1.27.0`). Most backends ignore
-them. limpid leaves them empty. A future config-level
-`schema_url "..."` directive is plausible if it becomes a real
-ask; it is not part of the 0.5.0 → 0.7.x cycle.
+OTLP Resource and Scope schema URLs are optional. limpid has no
+`schema_url` configuration property.
 
 ---
 
@@ -569,11 +557,8 @@ identity, add it through the post-adapter adjustment seam.
 
 ### *"Why is `received_at` not the event time?"*
 
-Because the event time is what the source claimed, not what the
-forwarder observed. The two are not the same thing, and conflating
-them motivated the `Event.timestamp` → `Event.received_at` rename
-that landed in v0.5.0. See §5.3 and the
-[CHANGELOG entry](https://github.com/naoto256/limpid/blob/main/CHANGELOG.md) for v0.5.0.
+Event time is what the source claimed; `received_at` is when the input
+observed the event. See [timestamp semantics](#53-source-time-vs-received_at).
 
 ### *"Can I send Resource attributes from the input layer?"*
 
@@ -603,4 +588,3 @@ section reference and the wire trace.
 | How do I configure the input / output? | [otlp_http](./inputs/otlp-http.md), [otlp_grpc](./inputs/otlp-grpc.md), [otlp_http output](./outputs/otlp_http.md), [otlp_grpc output](./outputs/otlp_grpc.md) |
 | What primitives are in the `otlp.*` namespace? | [Built-in Functions](./functions/expression-functions.md#otlp--opentelemetry-protocol-logs-signal) |
 | What are the design principles this builds on? | [Design Principles](./design-principles.md) |
-| What changed in v0.5.0 specifically? | [CHANGELOG](https://github.com/naoto256/limpid/blob/main/CHANGELOG.md) (covers the `Event.timestamp` → `Event.received_at` rename that landed in v0.5.0) |

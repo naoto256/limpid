@@ -171,8 +171,8 @@ Routing decisions stay in the pipeline body; the output configs stay static and 
 ## Notes
 
 - rdkafka handles batching and compression internally — no manual batch configuration needed (unlike [http](./http.md)).
-- On graceful shutdown (`SIGTERM`, `SIGHUP` reload, `systemctl stop`), the producer hands each pending message to librdkafka via `try_send`; the pending-envelope wait is bounded by librdkafka's own `queue_timeout` and `message.timeout.ms` (there is no additional outer 5-second wrapper — a previous version had one and it was removed because it cut librdkafka's delivery attempt short at the wire boundary, producing ambiguous outcomes). A message whose `try_send` cannot complete before shutdown routes through the ambiguous DLQ path — `Dropped` on a disk queue so the fail-stop wedge holds the cursor for next-start reconciliation, folded to `Recovered` on a memory queue for lack of a replay path. A DLQ record is written for reconciliation in either case.
-- The internal delivery timeout (`message.timeout.ms`) is 30 seconds. If a message can't be delivered within that time, it's returned as an error and the output's `retry { ... }` budget (driven inside `consume()`) handles re-delivery. On retry exhaustion the payload routes to `control { error_log "..." }` as an Output-flavor DLQ record; see [Outputs → Recovery (error_log)](./README.md#recovery-error_log).
+- During graceful shutdown, pending messages wait according to librdkafka's `queue_timeout` and `message.timeout.ms` (30 seconds); there is no additional outer five-second limit. Undelivered messages use the ambiguous DLQ path: a disk queue holds its cursor (`Dropped`), while a memory queue advances (`Recovered`). When `error_log` is configured, both retain a record for reconciliation.
+- The internal delivery timeout (`message.timeout.ms`) is 30 seconds. If a message can't be delivered within that time, it's returned as an error and the output's `retry { ... }` budget handles re-delivery. On retry exhaustion the payload routes to `control { error_log "..." }` as an Output-flavor DLQ record; see [Outputs → Recovery (error_log)](./README.md#recovery-error_log).
 
 ## Example
 

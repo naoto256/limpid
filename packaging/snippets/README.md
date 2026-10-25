@@ -330,9 +330,9 @@ The library follows four contracts:
    extend the snippet or update the upstream allow-list.
 
 3. **egress single-writer invariant.** A composer never assigns
-   `egress` directly. Composers write to `workspace.lsis.composed.
-   <slot>`; the companion `<slot>_to_egress` one-line process is the
-   sole writer of `egress` per pipeline.
+   `egress` directly. Composers write to
+   `workspace.lsis.composed.<slot>`; the companion `<slot>_to_egress`
+   one-line process is the sole writer of `egress` per pipeline.
 
 4. **Adapters own target placement.** Every OTLP-capable raw-source parser
    carries a sibling `<source>_to_otlp` adapter. It chooses the OTLP

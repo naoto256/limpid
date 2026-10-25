@@ -8,13 +8,7 @@ This page covers the on-disk format, the `control { error_log "..." }` opt-in, a
 
 ## Why a DLQ instead of forwarding or discarding
 
-Three behaviours were considered:
-
-| Behaviour | Pre-0.5 | 0.5.1 | 0.5.2+ |
-|-----------|---------|-------|--------|
-| Forward original `ingress` | ✅ | — | — |
-| Discard (data loss) | — | ✅ | — |
-| **Write to DLQ + counter** | — | — | ✅ |
+Writing to the DLQ preserves a recovery copy and an error signal:
 
 - **Forward original `ingress`** turns wrap / enrichment bugs into data-shape regressions at the receiving SIEM (rsyslog-style "best effort"). The bug is silent until something downstream complains.
 - **Discard** makes the bug visible (counter goes up) but is itself a strong failure mode: a security telemetry pipeline that drops events to a config typo is the wrong default.
@@ -33,7 +27,7 @@ control {
 }
 ```
 
-When `error_log` is unset, the daemon emits a one-line `tracing::error!` summary per failure — site + reason, no payload. Both flavors (Process and Output) behave the same on the unset path: the operator has declared no durable recovery is required, and the tracing side stays payload-free by default. To attach metadata or the full JSONL to the tracing line, opt in via `control { error_log_fallback "meta" | "full" }` — the ladder is documented in [Tracing fallback ladder](#tracing-fallback-ladder-error_log_fallback) below.
+When `error_log` is unset, the daemon emits a one-line error summary per failure — site + reason, no payload. Both flavors (Process and Output) behave the same on the unset path: the operator has declared no durable recovery is required, and the tracing side stays payload-free by default. To attach metadata or the full JSONL to the tracing line, opt in via `control { error_log_fallback "meta" | "full" }` — the ladder is documented in [Tracing fallback ladder](#tracing-fallback-ladder-error_log_fallback) below.
 
 For any pipeline that uses `retry { ... }` or a batched output (`http`, `otlp_http`, `otlp_grpc`), `limpid --check` raises a recovery-readiness warning when `error_log` is not configured; see [Recovery readiness check](#recovery-readiness-check---check) below. A separate `--check` warning fires when `error_log_fallback` is set but `error_log` is unset (the fallback is inert in that combination).
 
@@ -45,9 +39,9 @@ The `error_log` file is a 0o600 confidentiality boundary the operator has alread
 |----------|------------------------------------------------------------------------------------------------------------|
 | `"off"`  | (default) one-line failure summary — `kind`, `output` / `pipeline` name, `site`, `reason`. No payload, no metadata. |
 | `"meta"` | structured metadata — adds `fallback = "meta"`, `timestamp`, `size` (bytes of the recoverable payload), and `position` (queue kind + numeric offset/seq only, no filesystem path). Still no payload bytes, no full JSONL, no headers, no operator-populated labels. |
-| `"full"` | pre-0.7.9 shape — adds `event_record` carrying the full JSONL (ingress / egress bytes included). This exposes the pipeline egress bytes to the tracing subscriber; use only in environments where the journald boundary is trusted. |
+| `"full"` | Adds `event_record` carrying the full JSONL (ingress / egress bytes included). This exposes the pipeline egress bytes to the tracing subscriber; use only in environments where the journald boundary is trusted. |
 
-**Row-A rule.** When `error_log` is unset the fallback value is ignored — the operator has declared "no durable recovery needed" by omitting `error_log`, and honouring a stray `error_log_fallback "full"` on that path would contradict the declaration. Runtime, startup, and `--check` all enforce this ordering; startup and `--check` emit a warning surfacing the inert combination.
+When `error_log` is unset the fallback value is ignored — the operator has declared "no durable recovery needed" by omitting `error_log`, and honouring a stray `error_log_fallback "full"` on that path would contradict the declaration. Runtime, startup, and `--check` all enforce this ordering; startup and `--check` emit a warning surfacing the inert combination.
 
 **Disposition invariance.** The ladder shapes the *tracing emission* only. The ack disposition (Delivered / Recovered / Dropped), the disk-queue fail-stop wedge, and the memory-queue fold to Recovered are unchanged by the fallback value — an operator can move up or down the ladder without altering queue cursor semantics.
 
@@ -111,7 +105,7 @@ A pipeline-side failure (process body raised, pipeline-skeleton eval failed, exp
 
 ### Output flavor
 
-A sink-side failure (retry budget exhausted, batched-output shutdown drain, runtime-side enqueue failure) emits an Output record. The serialised `event.egress` is the **pipeline-produced payload** — the value `egress` held at the moment the sink was handed the event, after any process bodies overwrote the initial `ingress` clone. Replay hands the event back to the named output's `consume()` path: the pipeline is **bypassed**, but the sink's transport-level rendering (batched encode, HTTP body framing, OTLP packing, …) still re-runs.
+A sink-side failure (retry budget exhausted, batched-output shutdown drain, runtime-side enqueue failure) emits an Output record. The serialised `event.egress` is the **pipeline-produced payload** — the value `egress` held at the moment the sink was handed the event, after any process bodies overwrote the initial `ingress` clone. Replay hands the event back to the named output: the pipeline is **bypassed**, but the sink's transport-level rendering (batched encode, HTTP body framing, OTLP packing, …) still re-runs.
 
 ```json
 {
@@ -157,7 +151,7 @@ A sink-side failure (retry budget exhausted, batched-output shutdown drain, runt
 
 | Field | Meaning |
 |-------|---------|
-| `output` | `{ "name": "<output_name>" }` block. `name` is the `def output` name. The flavor is intentionally address-free — no peer, endpoint, partition, topic, path, URL, target, or workspace fragment leaks into the record. Replay hands the event back to the sink via `limpidctl inject output <name>`, and the sink re-routes via its own `consume()` path. |
+| `output` | `{ "name": "<output_name>" }` block. `name` is the `def output` name. The flavor is intentionally address-free — no peer, endpoint, partition, topic, path, URL, target, or workspace fragment leaks into the record. Replay hands the event back to the sink via `limpidctl inject output <name>`, and the sink re-routes using its current transport settings. |
 | `event.egress` | Pre-rendered wire bytes (= what the sink attempted to deliver). Same UTF-8 / `$bytes_b64` encoding rules as `ingress`. The sink interprets `egress` as already-encoded payload (no re-render). |
 
 `workspace` is intentionally **not** serialised on Output records — sink-side routing state is forbidden from the recovery record by design. See [Address-free Output records](#address-free-output-records) below for the rationale.
@@ -175,17 +169,17 @@ Process flavor (4 sites — replay via `inject input`):
 
 Output flavor (3 sites — replay via `inject output`):
 
-5. **`<output_name>`** — the output exhausted its `retry { ... }` budget against the destination. A batched output's per-event render failure inside `flush()` is also routed here with `reason = "render failed during batch flush: ..."`. `pipeline` is empty.
-6. **`<output_name> shutdown`** — a batched output (`http`, `otlp_http`, `otlp_grpc`) was **gracefully shut down** (`SIGTERM`, `SIGHUP` reload, `systemctl stop`, or an explicit `shutdown()` API call) with events still buffered and the bounded final drain failed. The drain runs one flush attempt per payload bounded by `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` (3 s) plus a per-actor in-flight cancel; transport timeout, in-flight cancel, or retry exhaustion all route here. The `shutdown()` impl walks the remaining `(Event, QueueAckHandle)` buffer entries (one record per parked event) through this writer. `pipeline` is empty. The per-event `key`, `source`, `received_at`, `ingress`, and `egress` come from the original `Event` that was parked in the buffer at `consume()` time; nothing is synthesised. (Earlier 0.7.7 drafts of this flavor carried synthetic shutdown-time metadata; the 0.7.8 ack-lifecycle work parks the source `Event` alongside the ack handle so each shutdown-drain record now reflects the real per-event provenance.) **`SIGKILL` (`kill -9`) cannot reach this path** — actor tasks are aborted and the stack-local buffer is lost without an error_log write. Production deployments must not send `SIGKILL` directly to the daemon; keep systemd's `KillSignal=SIGTERM` default.
-7. **`<output_name> enqueue`** — `runtime.rs` could not hand an event to the named output's queue (queue closed, disk-queue write error, unknown output). `pipeline` is the name of the originating pipeline — the only Output-flavor site that keeps it populated. Per-failed-output split: a single pipeline-eval result with N failed-output enqueues produces N records (one per failing output).
+5. **`<output_name>`** — the output exhausted its `retry { ... }` budget against the destination. A batched output's per-event render failure during a batch flush is also routed here with `reason = "render failed during batch flush: ..."`. `pipeline` is empty.
+6. **`<output_name> shutdown`** — a batched output (`http`, `otlp_http`, `otlp_grpc`) stopped with buffered events that could not be delivered during the bounded final drain. The output shares one 3-second send deadline across its entire final drain; an in-flight send may also be cancelled. The preceding actor join has a separate maximum wait of 3 seconds. `pipeline` is empty. Each record preserves the original event's `key`, `source`, `received_at`, `ingress`, and `egress`; shutdown does not synthesize replacement event times. See [graceful shutdown guarantees and known limitations](#graceful-shutdown-guarantees-and-known-limitations) for dispositions and recovery. `SIGKILL` bypasses the drain; use `SIGTERM` for graceful shutdown.
+7. **`<output_name> enqueue`** — the pipeline could not hand an event to the named output's queue (queue closed, disk-queue write error, or unknown output). `pipeline` is the originating pipeline name. A single pipeline evaluation with N failed output enqueues produces N records, one for each failing output.
 
-The `reason` field distinguishes sites 5 / 6 / 7 within a single output name: retry exhaustion uses `"output write failed after N attempts: ..."`, shutdown drain uses `"shutdown flush failed: ..."`, enqueue failure uses `"output enqueue failed (queue closed, disk write error, or unknown output)"`. A batched output's per-event render failure inside `flush()` uses `"render failed during batch flush: ..."`. The runbook's [root-cause heuristics table](#2-triage-flow) lists the full patterns.
+The `reason` field distinguishes sites 5 / 6 / 7 within a single output name: retry exhaustion uses `"output write failed after N attempts: ..."`, shutdown drain uses `"shutdown flush failed: ..."`, enqueue failure uses `"output enqueue failed (queue closed, disk write error, or unknown output)"`. A batched output's per-event render failure during a batch flush uses `"render failed during batch flush: ..."`. The runbook's [root-cause heuristics table](#2-triage-flow) lists the full patterns.
 
 ### Address-free Output records
 
 The Output record carries `output: { name }` and nothing more. No peer address, endpoint URL, partition, topic, path, target, routing key, or workspace fragment leaks into the recovery record.
 
-Why: replay calls `limpidctl inject output <name>`, which hands the event back to the sink. The sink re-routes via the same `consume()` path it uses for live traffic — round-robin peer selection, retry budget, batching, headers, all of it. There is no "send this exact record to this exact peer" mode; the sink owns routing. Carrying address details on the record would create two failure modes: (a) replay vs. live diverging when the operator updates the sink config between failure and replay, and (b) sensitive routing metadata (peer hostnames, internal endpoint URLs) leaking into the DLQ file.
+Why: replay calls `limpidctl inject output <name>`, which hands the event back to the sink. The sink re-routes using the same transport configuration as live events — round-robin peer selection, retry budget, batching, headers, all of it. There is no "send this exact record to this exact peer" mode; the sink owns routing. Carrying address details on the record would create two failure modes: (a) replay vs. live diverging when the operator updates the sink config between failure and replay, and (b) sensitive routing metadata (peer hostnames, internal endpoint URLs) leaking into the DLQ file.
 
 The trade-off: an operator who needs to know *which peer failed* for an `<output_name>` retry-exhaustion record reads the daemon log (`journalctl -u limpid` around the timestamp), not the DLQ record.
 
@@ -193,15 +187,15 @@ The trade-off: an operator who needs to know *which peer failed* for an `<output
 
 `schema_version: 3` is the operator-visible discriminator. Pre-1.0, the schema may add fields to existing kinds, or add new kinds, both of which bump `schema_version`. Field renames within an existing kind also bump it. After 1.0 the format will be locked under semantic versioning.
 
-`event.source` changed shape from a flat `"ip:port"` string to a `{ip, port}` object in v0.5.6 (independent of `schema_version`, but worth knowing if you're reading captures from that era).
+Legacy captures may contain `event.source` as a flat `"ip:port"` string. Current replay expects a `{ip, port}` object; translate legacy source fields before replaying.
 
 ### Recovery readiness check (`--check`)
 
-Since 0.7.8, `limpid --check` emits a recovery-readiness warning when any output declares `retry` or is a batched OTLP/HTTP output and `control { error_log }` is unset. Without `error_log`, every Output-flavor recovery path (retry exhausted, shutdown drain, enqueue failure) emits only a one-line `tracing::error!` summary — the payload is not persisted anywhere unless `error_log` is set and `error_log_fallback` is opted up the [ladder](#tracing-fallback-ladder-error_log_fallback). The warning catches the missing configuration before the first failure.
+`limpid --check` emits a recovery-readiness warning when any output declares `retry` or is a batched OTLP/HTTP output and `control { error_log }` is unset. Without `error_log`, every Output-flavor recovery path (retry exhausted, shutdown drain, enqueue failure) emits only a one-line error summary — the payload is not persisted anywhere unless `error_log` is set and `error_log_fallback` is opted up the [ladder](#tracing-fallback-ladder-error_log_fallback). The warning catches the missing configuration before the first failure.
 
 A separate `--check` warning fires when `control { error_log_fallback "..." }` is set while `control { error_log "..." }` is unset — the fallback is a confidentiality opt-in for the tracing side of a *configured* DLQ path, and has no effect on its own. Either add `error_log` to activate the fallback, or drop `error_log_fallback` to silence the warning.
 
-Since 0.7.8, the cursor a `tail` / `journal` input persists to its `state_file` advances on **pipeline-worker completion**, not on channel hand-off. A crash mid-processing now leaves the on-disk cursor pointing to the last *processed* line, so the next start re-reads any events that were in flight — closing the previous at-most-once gap and moving recovery toward at-least-once.
+The cursor a `tail` / `journal` input persists to its `state_file` advances on **pipeline-worker completion**, not on channel hand-off. After a crash, the next start reads again from the persisted cursor; entries whose processing had not completed may be read again.
 
 The seven producer sites above are not a full safety net for output-side in-flight loss. Sites 5 / 6 only cover the events the output explicitly resolved as failures; an event that was *successfully* enqueued to a memory queue and is still sitting in that queue (or being processed by the output worker) at the moment the process crashes is **not** recovered by any of them — memory queues are not a durability layer. For full at-least-once across a process restart with in-flight queued events, configure a per-output **disk queue** — disk queues survive the crash and replay on restart. Memory-queue events in flight at crash time are lost.
 
@@ -232,7 +226,7 @@ jq -c 'select(.kind == "process" and (.reason | test("parse_json"))) | .event' \
     | limpidctl inject input <input_name> --json
 ```
 
-The `event` sub-object is exactly what `Event::from_json` (and therefore `inject input --json`) needs to reconstruct a fresh Event: `egress` defaults to `ingress`, `workspace` starts empty. Replay is "as if the event just arrived for the first time" — no risk of partial-state confusion.
+The `event` sub-object is exactly what `inject input --json` needs to reconstruct a fresh Event: `egress` defaults to `ingress`, `workspace` starts empty. Replay is "as if the event just arrived for the first time" — no risk of partial-state confusion.
 
 ### Output flavor — replay via `inject output`
 
@@ -250,7 +244,7 @@ jq -c 'select(.kind == "output") | "\(.output.name)\t\(.event | @json)"' \
     done
 ```
 
-The `event` sub-object for Output records carries `egress` (the pre-rendered wire bytes the sink had tried to deliver). `inject output --json` hands this straight to the sink's `consume()` — no re-rendering, no pipeline re-run. The sink applies its current peer/retry/batching configuration as if the event had just been enqueued normally.
+The `event` sub-object for Output records carries `egress` (the pre-rendered wire bytes the sink had tried to deliver). `inject output --json` hands this straight to the output — no re-rendering, no pipeline re-run. The sink applies its current peer/retry/batching configuration as if the event had just been enqueued normally.
 
 ### Archive after replaying
 
@@ -330,7 +324,7 @@ A flat curve over the last 5 minutes means the upstream issue resolved itself �
 |---|---|---|---|---|
 | `output` | `<output_name>` | `output write failed after N attempts: …` | backend down, network partition, auth expired, sustained backpressure | downstream health, `events_failed` / `retries` on the output ([Metrics](./metrics.md)) |
 | `output` | `<output_name>` | `render failed during batch flush: …` | render bug, missing workspace key the renderer depended on (rare; deterministic) | the failing process / template, not the output |
-| `output` | `<output_name>` | `shutdown flush failed: …` | **graceful** shutdown (`SIGTERM` / `SIGHUP` / `systemctl stop`) while a batched output (`otlp_*`, `http`) still had buffered events and the bounded 3 s drain attempt did not succeed. Note: `SIGKILL` (`kill -9`) does **not** reach this path — it leaves no DLQ record at all. | `journalctl -u limpid` around the shutdown window |
+| `output` | `<output_name>` | `shutdown flush failed: …` | **graceful** shutdown (`SIGTERM` / `SIGHUP` / `systemctl stop`) while a batched output (`otlp_*`, `http`) still had buffered events and the final drain did not succeed within its shared 3-second send deadline. Note: `SIGKILL` (`kill -9`) does **not** reach this path — it leaves no DLQ record at all. | `journalctl -u limpid` around the shutdown window |
 | `output` | `<output_name>` | `output enqueue failed (queue closed, disk write error, or unknown output)` | output queue full, output task stopped, disk-backed queue write error, unknown output name in the pipeline body | output `events_received` vs `events_written`, disk space, queue config |
 | `process` | `(pipeline body)` | varies | typo in an `if` condition / `switch` discriminant, undefined workspace key referenced from an `error <expr>` slot | the `reason` string + the pipeline DSL around the failing expression |
 | `process` | `<process_name>` / `(inline)` / `(pipeline)` | varies | DSL bug, parser blowup on a new input shape, missing-required-field contract violation | the `reason` string + the offending `event.ingress` payload |
@@ -363,7 +357,7 @@ jq -c 'select(.kind == "process" and (.reason | test("parse_json"))) | .event' \
     | limpidctl inject input <input_name> --json
 ```
 
-**Shutdown-drain caveat.** Output-flavor records with `reason` starting with `shutdown flush failed: ...` are *per-event* records, not per-batch — the batched output's shutdown helper walks every still-buffered `(Event, QueueAckHandle)` entry and writes one record per parked event, so `event.key`, `event.source`, `event.received_at`, `event.ingress`, and `event.egress` all reflect the original per-event provenance (no synthetic shutdown-time metadata). `event.egress` carries the per-event pre-rendered payload (= the bytes the output had built for the wire on each event, before the unsent batch wrapper was applied), so `inject output <name>` is the correct replay path — the sink takes the per-event pre-rendered bytes and re-routes via its `consume()` path, applying the current batch wrapper / headers / compression as if the event had just been enqueued. Do **not** route shutdown-drain records through `inject input <name>`: doing so feeds the per-event pre-rendered payload back into the pipeline as raw `ingress`, which is almost never what you want.
+**Shutdown-drain caveat.** Output-flavor records with `reason` starting with `shutdown flush failed: ...` are *per-event* records, not per-batch — the batched output's shutdown helper walks every still-buffered event entry and writes one record per parked event, so `event.key`, `event.source`, `event.received_at`, `event.ingress`, and `event.egress` all reflect the original per-event provenance (no synthetic shutdown-time metadata). `event.egress` carries the per-event pre-rendered payload (= the bytes the output had built for the wire on each event, before the unsent batch wrapper was applied), so `inject output <name>` is the correct replay path — the sink takes the per-event pre-rendered bytes and re-routes via its output delivery path, applying the current batch wrapper / headers / compression as if the event had just been enqueued. Do **not** route shutdown-drain records through `inject input <name>`: doing so feeds the per-event pre-rendered payload back into the pipeline as raw `ingress`, which is almost never what you want.
 
 **OTLP `partial_success` attribution caveat.** For `output otlp_http` and `output otlp_grpc`, Output-flavor records with `reason == "collector reported partial_success rejection"` are an **approximate** attribution of a batch-level rejection: the OTLP response carries a rejected *count*, not the identity of each rejected log record. limpid splits the batch into Delivered + Recovered along the trailing N entries (where N = `rejected_log_records`) and writes one DLQ record per Recovered tail entry, but the collector did not identify those exact events. Metric totals (`events_written`, `events_failed`) are accurate; per-event provenance in `event.*` is correct (it is the original Event); the *attribution* — which specific event was rejected — is not. For replay purposes treat these records as a batch-level rejection split into per-event records, not as proof of which records the collector rejected. `inject output <name>` still works the same way; if the underlying cause is a payload-shape issue, the rejection will simply re-occur on the rejected subset of the replay (and the same approximate split will apply on the new response).
 
@@ -453,10 +447,10 @@ This is useful for confirming the JSONL shape, the `kind` / per-kind name discri
 
 `events_errored_unwritable` counts the cases where the daemon raised an error trying to write a DLQ record to the configured `error_log` file (disk full, permissions, NFS hiccup, rotation race). The counter is split across two labels that share the metric name; both must be watched:
 
-- **Pipeline-side** (`limpid_pipeline_events_errored_unwritable_total{pipeline=...}`) — the Process-flavor path and the output-enqueue subset of Output-flavor records failed to land in `error_log`. Both routed through `runtime::pipeline_worker::write_errored_to_dlq`.
-- **Output-side** (`limpid_output_events_errored_unwritable_total{output=...}`) — a sink-side Output-flavor DLQ write (retry exhaustion, shutdown drain, batched render failure, partial-success reject) failed to land in `error_log`. Routed through `modules::route_event_to_dlq`, which bumps the per-output counter and returns `Dropped`; on a disk queue that triggers the [fail-stop wedge](../outputs/README.md#disposition-contract) — the wedge holds the cursor for a replay on next daemon start rather than silently advancing past a DLQ-failed event.
+- **Pipeline-side** (`limpid_pipeline_events_errored_unwritable_total{pipeline=...}`) — the Process-flavor path and the output-enqueue subset of Output-flavor records failed to land in `error_log`.
+- **Output-side** (`limpid_output_events_errored_unwritable_total{output=...}`) — a sink-side Output-flavor DLQ write (retry exhaustion, shutdown drain, batched render failure, partial-success reject) failed to land in `error_log`. This increments the per-output counter and results in `Dropped`; on a disk queue that triggers the [fail-stop wedge](../outputs/README.md#disposition-contract) — the wedge holds the cursor for a replay on next daemon start rather than silently advancing past a DLQ-failed event.
 
-In both cases the daemon emits a `tracing::error!` line whose body is shaped by the operator's `error_log_fallback` [ladder](#tracing-fallback-ladder-error_log_fallback) — payload-free summary by default, structured metadata on `"meta"`, or the full JSONL on `"full"`. This is alarm-level regardless of the ladder state: a non-zero counter on either label means the replay path may be incomplete, and the next failure may not have a corresponding line in the file.
+In both cases the daemon logs an error whose body is shaped by the operator's `error_log_fallback` [ladder](#tracing-fallback-ladder-error_log_fallback) — payload-free summary by default, structured metadata on `"meta"`, or the full JSONL on `"full"`. This is alarm-level regardless of the ladder state: a non-zero counter on either label means the replay path may be incomplete, and the next failure may not have a corresponding line in the file.
 
 Investigate immediately:
 
@@ -469,21 +463,19 @@ Once the underlying issue is fixed, the next errored event lands in the file aga
 
 ## Disposition contract and fail-stop wedge on disk queues
 
-Every event handed to an output resolves to one of three `AckDisposition` values:
+Every event handed to an output resolves to one of three dispositions:
 
 - **`Delivered`** — the output confirmed the send. Cursor advances on both memory and disk queues; `events_written` ticks.
 - **`Recovered`** — the send failed and either the failure record was durably written to `error_log`, or `error_log` is unset so the operator has declared no durable recovery is required. The tracing-side fallback line runs per the `error_log_fallback` [ladder](#tracing-fallback-ladder-error_log_fallback) — payload-free summary by default, structured metadata on `"meta"`, full JSONL on `"full"` — and is best-effort, not load-bearing. Cursor advances on both memory and disk queues; `events_failed` ticks.
 - **`Dropped`** — the output could not confirm the send *and* could not durably record the failure. Cursor **holds** on a disk queue and **advances** on a memory queue; `events_failed` ticks.
 
-Three paths reach `Dropped`:
+`Dropped` can result from an output failing to complete an acknowledgement,
+a panic while an output owns an event, a failed DLQ write, or an ambiguous
+shutdown send whose completion cannot be established.
 
-- A bug in an output's `consume` implementation that returns before signalling the handle (the handle's `Drop` then fires `Dropped`, guarded by a `debug_assert!` in test builds).
-- A panic inside `consume` while it holds the handle.
-- An **intentional** `resolve_dropped()` call from a sink whose DLQ write failed — the failure has no durable trace, so cursor advancement would be a silent loss.
+On a **disk queue**, observing `Dropped` triggers the **fail-stop wedge**: the queue consumer stops accepting new events, holds the on-disk cursor at the offending position, logs an error, and bumps `events_wedged`. On the next daemon start the disk queue replays from the wedged position, giving the operator a chance to fix the underlying bug / DLQ health / etc. before the same event reaches a healthy output.
 
-On a **disk queue**, observing `Dropped` triggers the **fail-stop wedge**: the queue consumer stops accepting new events, holds the on-disk cursor at the offending position, emits a `tracing::error!` line, and bumps `events_wedged`. On the next daemon start the disk queue replays from the wedged position, giving the operator a chance to fix the underlying bug / DLQ health / etc. before the same event reaches a healthy output.
-
-**Scope of the wedge contract**: the fail-stop wedge covers both **unbatched sinks** (`file`, `stdout`, `unix_socket`, `syslog_tcp`, `syslog_udp`, `kafka`) and **batched sinks** (`http`, `otlp_http`, `otlp_grpc`). Unbatched sinks resolve each event's ack synchronously inside their `consume` call, so `in-flight == 0` at wedge time and the consumer drains cleanly on its own. Batched sinks accept events into their own internal `(Event, QueueAckHandle)` buffer before flushing; on wedge exit the queue consumer takes a separate `shutdown_wedged()` path that signals the flusher actor to exit, then routes every still-parked buffer entry through the shutdown-batch ambiguous DLQ path with the disposition forced to `Dropped` regardless of the DLQ write result. On a disk queue the ambiguous disposition keeps the wedged cursor at the batch's position for next-start replay; on a memory queue it folds to `Recovered` inside the disposition helper so the ack drain does not hang on messages that will never arrive. No further send is attempted on the wedged path — replaying a parked handle through the still-buggy sink would risk the same Dropped outcome and prolong the wedge.
+**Scope of the wedge contract:** it applies to both unbatched and batched outputs. An unbatched output resolves each event before accepting the next one. Batched outputs may retain buffered events; on a wedge they stop sending, record the remaining events through the ambiguous shutdown recovery path, and keep their disk-queue cursor for next-start replay even if those DLQ writes succeed. On a memory queue the disposition folds to `Recovered`, since there is no durable source for replay. No further send is attempted through the wedged output.
 
 On a **memory queue** the wedge does not fire — memory queues cannot replay on restart, so holding the cursor would only cause loss without a recovery path. The consumer bumps `events_failed` and moves on; when a DLQ write failure was the cause the event is actually lost, and `events_errored_unwritable` is the operator alarm signal for that loss rather than a durable trace of the event itself.
 
@@ -491,28 +483,28 @@ For operators, the practical implications:
 
 - **`events_wedged` is a fail-stop alarm.** Non-zero means a disk-queue consumer has stopped accepting new events. Investigate the output: check for panics (`panicked at ...` lines with `RUST_BACKTRACE=1`), DLQ health (`events_errored_unwritable`), and disk / permission errors on the DLQ file. **Restart the daemon after fixing the underlying issue** so the disk queue replays from the wedge point.
 - **`events_wedged` is not self-healing.** Poison-message bugs (a specific event that reliably panics one output) will replay the same event on every start and re-wedge. Fix or delete the underlying record before the restart, or operator intervention becomes a loop.
-- **`events_errored_unwritable` on the output pairs with the pipeline-side counter of the same name.** Both surface DLQ-write failure; the output-side counter fires on the sink-side path (`route_event_to_dlq` in `crates/limpid/src/modules/mod.rs`), the pipeline-side counter fires on the pipeline runtime path (`write_errored_to_dlq` in `crates/limpid/src/runtime/pipeline_worker.rs`). Alarm on both.
+- **`events_errored_unwritable` on the output pairs with the pipeline-side counter of the same name.** Both surface DLQ-write failure; the output-side counter fires on the output-side path; the pipeline-side counter fires when pipeline error handling cannot write the record. Alarm on both.
 - **`events_failed` remains the aggregate failure counter.** A step increase without a matching increase in `events_errored`, DLQ file size, or `events_wedged` means events are failing at the send stage but recovering successfully — expected under transient network trouble, worth watching under a healthy DLQ.
 
-Shutdown fallthrough — the runtime SIGTERM budget elapsing while a send is still in flight — falls into the same `Dropped` path: the task is aborted, the parked handle drops, and on a disk queue the position holds for replay on next start. Network unbatched sinks (`kafka`, `syslog_tcp`, `syslog_udp`, `unix_socket`) narrow the shutdown race to the pre-send phase (connect / handshake / rotation); the send phase itself runs to completion or times out via its per-write timeout (`PEER_WRITE_TIMEOUT` / `message.timeout.ms`), and only that timeout — or a runtime task abort — can cut a send short. The `file` output remains deliberately shutdown-unaware end-to-end for the same reason: partial-append duplication on retry is worse than a Dropped-then-replayed event.
+Shutdown fallthrough — the runtime SIGTERM budget elapsing while a send is still in flight — falls into the same `Dropped` path: the task is aborted, the parked handle drops, and on a disk queue the position holds for replay on next start. Network unbatched sinks (`kafka`, `syslog_tcp`, `syslog_udp`, `unix_socket`) narrow the shutdown race to the pre-send phase (connect / handshake / rotation); the send phase itself runs to completion or times out via its per-write timeout (10 seconds per `syslog_tcp` peer write; 30 seconds for Kafka `message.timeout.ms`), and only that timeout — or a runtime task abort — can cut a send short. The `file` output remains deliberately shutdown-unaware end-to-end for the same reason: partial-append duplication on retry is worse than a Dropped-then-replayed event.
 
 ## Graceful shutdown guarantees and known limitations
 
-The runtime's graceful-shutdown sequence (`SIGTERM`, `SIGHUP` reload, `systemctl stop`, or an explicit `shutdown()` API call) is bounded by `runtime::lifecycle::SHUTDOWN_TIMEOUT` (10 s) and pipes every in-daemon event through a defined disposition — there is no silent-loss window inside the runtime's own channels.
+The runtime's graceful-shutdown sequence (`SIGTERM`, `SIGHUP` reload, `systemctl stop`, or an explicit shutdown request) is bounded by a 10-second graceful-shutdown budget and pipes every in-daemon event through a defined disposition — there is no silent-loss window inside the runtime's own channels.
 
 ### What the shutdown drain guarantees
 
-- **Output-queue backend-aware drain.** Memory-backed output queues are closed and drained via `recv().await`-until-`None`, the tokio-documented pattern for consuming every value already sent or being sent by a sender still holding a channel permit. A pipeline worker whose `send()` had reserved a permit but not yet written its value is not silently lost — the send still becomes visible before the drain terminates. Disk-backed output queues do not drain unread WAL entries into the 10 s shutdown window at all; the WAL cursor holds and the unread backlog replays on next start.
-- **Pipeline-worker channel drain.** The pipeline worker's input channel (`event_rx`) uses the same close + recv-until-None pattern, so an input task whose `send()` was mid-flight when shutdown fired lands on the worker. Late input sends that lose the race surface via `journalctl` at `info!` level rather than a silent stop.
+- **Output-queue backend-aware drain.** Memory-backed output queues are closed to new sends and drained, including a send that already reserved a channel slot before closure. Disk-backed output queues do not drain unread WAL entries into the 10 s shutdown window at all; the WAL cursor holds and the unread backlog replays on next start.
+- **Pipeline-worker channel drain.** Pipeline-worker input channels also drain accepted events and sends that had already reserved a slot. Late input sends that lose the race surface via `journalctl` at info level rather than a silent stop.
 - **Bounded batched-sink ownership.** Batched outputs (`http`, `otlp_http`, `otlp_grpc`) hold at most `batch_size × 2` events in memory via a per-sink permit pool. Queue backpressure survives a stalled downstream: a durable disk backlog cannot dissolve into shutdown-window RAM through an unbounded parked buffer.
-- **No fabricated at-least-once on ambiguous wire state.** Any sink whose drain-time failure may have partially reached the peer — stream-oriented singletons (`unix_socket`, `syslog_tcp`), the kafka broker after `producer.send(...)`, and batched sinks (`http`, `otlp_http`, `otlp_grpc`) whose in-flight `policy.send(...)` was cancelled by shutdown or hit the 3 s attempt timeout — routes its failure to `Dropped`, not `Recovered`. On a disk queue the fail-stop wedge holds the cursor for next-start reconciliation; on a memory queue the disposition folds to `Recovered` inside the disposition helper (no replay path exists). A DLQ record is written in every case for the operator's audit trail — the disposition change prevents the pattern where a partial-wire success is compounded by a DLQ-driven replay and the downstream receives the same batch twice.
+- **No fabricated at-least-once on ambiguous wire state.** Any sink whose drain-time failure may have partially reached the peer — stream-oriented singletons (`unix_socket`, `syslog_tcp`), the Kafka broker after a send, and batched sinks (`http`, `otlp_http`, `otlp_grpc`) whose in-flight send was cancelled by shutdown or exhausted the final drain's shared 3-second deadline — routes its failure to `Dropped`, not `Recovered`. On a disk queue the fail-stop wedge holds the cursor for next-start reconciliation; on a memory queue the disposition folds to `Recovered` inside the disposition helper (no replay path exists). A DLQ record is written in every case for the operator's audit trail — the disposition change prevents the pattern where a partial-wire success is compounded by a DLQ-driven replay and the downstream receives the same batch twice.
 
 ### Known limitations
 
 Two boundaries the shutdown drain does not cover. Both are protocol-level and both are called out here so operators know where the guarantees end.
 
 1. **Wire buffer between kernel and daemon.** Bytes that reached the kernel socket buffer for a limpid input (`syslog_udp`, `syslog_tcp`, `unix_socket`) but were not yet read by the daemon at the moment `SIGTERM` fired are outside the shutdown drain's reach. UDP has no protocol-level ack and cannot recover this class in principle; stream syslog cannot recover it without a per-connection application ack from the upstream, which is not part of the protocol. Operators who need the wire buffer to survive limpid restarts must run an ack-aware collector upstream (OTLP with retries, kafka with acks, or a queueing forwarder) rather than rely on plain syslog.
-2. **Delivery-completeness upgrade for the race window.** The current shutdown ordering routes any event that lost the shutdown-vs-send race to the DLQ. For singleton sinks that failed before crossing the wire boundary the disposition is `Recovered` — the operator can run `limpidctl inject output` to replay. For ambiguous-wire failures (both singleton and batched, described above) the disposition is `Dropped` on a disk queue; next-start replay reconciles the wedged position against the DLQ record. Either way the event is not silently lost, but the outcome is a downgrade from full "delivery" — reconciliation cost falls on the operator. A full phase-split of the shutdown ordering — inputs stop, pipeline workers drain, output senders close, output consumers drain — would upgrade the pre-boundary class to `Delivered`. It is queued for a follow-up release.
+2. **Delivery ambiguity during shutdown.** The current shutdown ordering routes any event that lost the shutdown-vs-send race to the DLQ. For singleton sinks that failed before crossing the wire boundary the disposition is `Recovered` — the operator can run `limpidctl inject output` to replay. For ambiguous-wire failures (both singleton and batched, described above) the disposition is `Dropped` on a disk queue; next-start replay reconciles the wedged position against the DLQ record. Either way the event is not silently lost, but the outcome is a downgrade from full "delivery" — reconciliation cost falls on the operator.
 
 Both limitations are surfaced deliberately. `events_failed` on the output ticks for every event that took the DLQ path; the DLQ record captures the payload. Neither is treated as an excuse for further silent gaps inside the runtime.
 

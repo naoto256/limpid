@@ -42,15 +42,10 @@ Format is validated at daemon startup / `--check` time — every match string mu
 
 ## Wire format
 
-`ingress` is shaped to be **journalctl-`-o json`-compatible for the
-fields libsystemd exposes** — limpid invents no format here (LOTL: Living
-Off The Land). One journal entry → one `Event`, with `ingress` carrying a
-single-line UTF-8 JSON object. The shape matches `journalctl -o json` on
-field set and values, with two known divergences: `__SEQNUM` /
-`__SEQNUM_ID` (newer `journalctl`) are **not surfaced** because the
-in-crate `journal_sys` FFI doesn't bind `sd_journal_get_seqnum`, and
-JSON object key order is libsystemd's insertion order — not guaranteed
-to byte-match `journalctl -o json`.
+Each journal entry becomes one event whose `ingress` is a single-line UTF-8
+JSON object, compatible with the fields exposed by `journalctl -o json`.
+`__SEQNUM` and `__SEQNUM_ID` are not emitted. Object key order is not
+guaranteed to byte-match `journalctl -o json`.
 
 ```
 {"__CURSOR":"s=abc...","__REALTIME_TIMESTAMP":"1714400000000000",
@@ -116,4 +111,4 @@ events instead.
 - The cursor is saved atomically (write-to-temp + rename).
 - The source address for journal events is `127.0.0.1:0` (placeholder; the
   meaningful host metadata lives inside the JSON as `_HOSTNAME`).
-- Since 0.7.8, the persisted cursor advances only after the pipeline worker finishes processing the corresponding entry. In-flight entries at the moment of a crash are re-read on the next start — the at-least-once recovery contract documented under [Recovery readiness](../operations/error-log.md#recovery-readiness-check---check).
+- The persisted cursor advances only after the pipeline worker finishes processing the corresponding entry. In-flight entries at the moment of a crash are re-read on the next start — the at-least-once recovery contract documented under [Recovery readiness](../operations/error-log.md#recovery-readiness-check---check).

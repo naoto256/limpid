@@ -56,7 +56,7 @@ Anywhere an expression is evaluated — there's no callsite restriction on the f
 
 The purity contract restricts the **body** of the function (no Event reads, no side effects). The call site is dispatch-wise unrestricted: it operates in the surrounding expression's evaluation context, which can read whatever that surface allows (full Event in process bodies / pipeline expressions; event-intrinsic only in output config templates) and pass concrete values into the function.
 
-The mental model is the same as built-in primitives: `lower()` and `regex_match()` don't care where they're called from. User-defined `normalize_proto()` is no different. Both are dispatched through `FunctionRegistry::call` with already-evaluated arguments. The only operator-visible difference is that `def function` lets you ship a vendor-agnostic mapping in the DSL itself, without touching Rust.
+The mental model is the same as built-in primitives: `lower()` and `regex_match()` don't care where they're called from. User-defined `normalize_proto()` is no different. Both use the same call path after their arguments are evaluated. The only operator-visible difference is that `def function` lets you ship a vendor-agnostic mapping in the DSL itself, without touching Rust.
 
 ## When to reach for it
 

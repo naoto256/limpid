@@ -1,6 +1,6 @@
 # Built-in Functions
 
-Built-in functions are primitives implemented in Rust and shipped with the daemon. They cover the parts that have to live close to the runtime — parsers, encoders, regex, hashing, GeoIP, table operations, OS helpers — and adding a new one means a Rust commit and a daemon rebuild.
+Built-in functions are primitives implemented in Rust and shipped with the daemon. They cover the parts that have to live close to the runtime — parsers, encoders, regex, hashing, GeoIP, table operations, OS helpers.
 
 ```limpid
 def process parse_cef_line {
@@ -15,8 +15,6 @@ Two call surfaces:
 - **Flat primitive** — `name(args...)`. Schema-agnostic helpers that don't depend on any particular log format. JSON / KV parsing, regex, hashing, timestamp formatting, table operations, GeoIP, and OS-level helpers all live here.
 - **Dot namespace** — `<schema>.<name>(args...)`. Schema-specific helpers declare the schema they bind to in their name: `syslog.parse(ingress)`, `cef.parse(ingress)`, `syslog.set_pri(egress, 16, 6)`. See the [*Schema-specific functions live under a schema namespace*](../design-principles.md#schema-specific-functions-live-under-a-schema-namespace) operating rule for the rationale.
 
-The judgement rule for whether a function is namespaced is a single question: does its behavior follow a specific schema specification (RFC 3164/5424, ArcSight CEF, OCSF, …)? If yes, the schema's name is part of the function's name. If no, it is a flat primitive.
-
 This page is the reference for every built-in. Operators can also declare their own pure DSL helpers — see [User-defined Functions](./user-defined.md) for `def function`; both surfaces register into the same dispatch table, so the call-site syntax is identical.
 
 ## Call syntax
@@ -25,7 +23,7 @@ Errors raised by these primitives (a `parse_json` on malformed input, a `to_int`
 
 ### Bare statements vs assignments
 
-A parser function returns a `Value::Object` whose keys are taken from the parse — `hostname`, `appname`, `msg` for `syslog.parse`; `version`, `name`, `severity`, `extension_raw`, plus nested CEF extension keys (`extension.src`, `extension.dst`, `extension.act`, …) for `cef.parse`; whatever the source JSON contains for `parse_json`. There are two ways to consume that object inside a process body.
+A parser function returns an object whose keys are taken from the parse — `hostname`, `appname`, `msg` for `syslog.parse`; `version`, `name`, `severity`, `extension_raw`, plus nested CEF extension keys (`extension.src`, `extension.dst`, `extension.act`, …) for `cef.parse`; whatever the source JSON contains for `parse_json`. There are two ways to consume that object inside a process body.
 
 **Bare statement** — the returned object's top-level keys are merged directly into `workspace`:
 
@@ -71,7 +69,7 @@ workspace.syslog = syslog.parse(ingress)   // recommended: capture under a names
 syslog.parse(ingress)                       // bare merge into workspace top-level (collision-prone)
 ```
 
-Returns a `Value::Object`:
+Returns an object:
 
 | key         | type   | meaning                                       |
 |-------------|--------|-----------------------------------------------|
@@ -154,7 +152,7 @@ When CEF arrives on transports without a syslog wrapper (HTTP body, file, …), 
 workspace.cef = cef.parse(ingress)
 ```
 
-Returns a `Value::Object`:
+Returns an object:
 
 | key              | type           | meaning                  |
 |------------------|----------------|--------------------------|
@@ -332,7 +330,7 @@ workspace.ip = regex_extract(egress, "(\\d+\\.\\d+\\.\\d+\\.\\d+)")
 
 ### regex_parse(str, pattern)
 
-Runs `pattern` against `str` and returns a `Value::Object` with one key per **named capture** group (`(?P<name>...)` or `(?<name>...)`). Positional groups are ignored. Use this when one regex extracts several fields at once; `regex_extract` remains the right tool for a single scalar.
+Runs `pattern` against `str` and returns an object with one key per **named capture** group (`(?P<name>...)` or `(?<name>...)`). Positional groups are ignored. Use this when one regex extracts several fields at once; `regex_extract` remains the right tool for a single scalar.
 
 Capture names containing `.` build a nested object, so `(?P<date.month>...)` populates `{ date: { month: "..." } }` and sibling dotted names merge under the same parent. Used as a bare statement, the returned object merges into `workspace` exactly like `parse_json` / `parse_kv` / `syslog.parse`.
 
@@ -358,7 +356,7 @@ Returns:
 | Pattern has zero named captures | Empty object (so a bare statement is a safe no-op) |
 | Pattern is invalid | Error |
 
-> **Implementation note.** `.` is not a legal capture-name character in the Rust regex engines, so the engine sees the name with `.` rewritten to the internal marker `__DOT__`. Capture names that literally contain `__DOT__` will be misinterpreted — avoid that token in your own names.
+> Do not use `__DOT__` literally in capture names; that reserved token is interpreted as a dot, so the returned field names will differ from the literal capture names.
 
 ### regex_replace(str, pattern, replacement)
 
@@ -429,7 +427,7 @@ Used as a bare statement, the returned object merges into `workspace` like other
 
 ## Timestamps
 
-Timestamps are a first-class DSL value type (`Value::Timestamp`). `received_at`, `timestamp()`, and `strptime` all return one; `strftime` accepts one. String coercion (e.g. `${received_at}`) renders RFC3339; `to_int(timestamp)` returns unix nanoseconds (matching OTLP `time_unix_nano`); `tap --json` serialises timestamps as integer unix nanoseconds.
+Timestamps are a first-class DSL value type (`Timestamp`). `received_at`, `timestamp()`, and `strptime` all return one; `strftime` accepts one. String coercion (e.g. `${received_at}`) renders RFC3339; `to_int(timestamp)` returns unix nanoseconds (matching OTLP `time_unix_nano`); `tap --json` serialises timestamps as integer unix nanoseconds.
 
 Because `to_int(timestamp)` returns an `Int`, integer unit conversion remains exact beyond f64's 2^53 exact-integer limit:
 
@@ -443,7 +441,7 @@ Timestamps and strings are distinct types. `contains(received_at, "2026")` is a 
 
 ### strftime(timestamp, format[, timezone])
 
-Formats a `Value::Timestamp` (such as `received_at`) according to a [`chrono` strftime](https://docs.rs/chrono/latest/chrono/format/strftime/) format string.
+Formats a `Timestamp` (such as `received_at`) according to a [`chrono` strftime](https://docs.rs/chrono/latest/chrono/format/strftime/) format string.
 
 ```limpid
 strftime(received_at, "%Y-%m-%d")          // 2026-04-19
@@ -455,7 +453,7 @@ strftime(received_at, "%H:%M", "+09:00")   // fixed offset
 
 | Argument | Description |
 |----------|-------------|
-| `timestamp` | a `Value::Timestamp` (from `received_at`, `timestamp()`, or `strptime`). Passing a string is a type error. |
+| `timestamp` | a `Timestamp` (from `received_at`, `timestamp()`, or `strptime`). Passing a string is a type error. |
 | `format` | `chrono` strftime format. |
 | `timezone` *(optional)* | `"local"` or `"UTC"` (case-insensitive), an IANA name such as `Asia/Tokyo` (case-sensitive), or `±HH:MM` / `±HHMM`. If omitted, output is UTC. |
 
@@ -463,7 +461,7 @@ An invalid timezone specifier is a loud error — `strftime` never silently retu
 
 ### strptime(value, format[, timezone])
 
-Inverse of `strftime`. Parses an arbitrary timestamp string with a `strftime`-style format and returns a `Value::Timestamp`.
+Inverse of `strftime`. Parses an arbitrary timestamp string with a `strftime`-style format and returns a `Timestamp`.
 
 ```limpid
 workspace.event_time = strptime(workspace.kv.date, "%Y-%m-%d %H:%M:%S", "UTC")
@@ -481,7 +479,7 @@ If the format includes an offset specifier (`%z`, `%:z`, `%#z`), the third argum
 
 ### parse_datetime_rfc3339(text) → Timestamp
 
-Atomic RFC 3339 datetime parser. Returns a `Value::Timestamp` (UTC-normalised).
+Atomic RFC 3339 datetime parser. Returns a `Timestamp` (UTC-normalised).
 
 ```limpid
 parse_datetime_rfc3339("2026-04-30T01:23:45Z")
@@ -503,7 +501,7 @@ For RFC 3164 syslog timestamps (`Apr 30 01:23:45`, no year, no timezone), there 
 
 ### parse_datetime_rfc2822(text) → Timestamp
 
-Atomic RFC 2822 / RFC 5322 datetime parser (the format used by email `Date:` headers and some legacy wire formats). Returns a `Value::Timestamp`.
+Atomic RFC 2822 / RFC 5322 datetime parser (the format used by email `Date:` headers and some legacy wire formats). Returns a `Timestamp`.
 
 ```limpid
 parse_datetime_rfc2822("Thu, 30 Apr 2026 01:23:45 +0000")
@@ -514,7 +512,7 @@ For modern internet datetimes (RFC 5424 syslog, OTLP, OCSF, cloud audit logs) us
 
 ### timestamp()
 
-Returns the current wall-clock instant as a `Value::Timestamp` (UTC). Matches the type of `received_at` and the input shape `strftime` / `strptime` expect.
+Returns the current wall-clock instant as a `Timestamp` (UTC). Matches the type of `received_at` and the input shape `strftime` / `strptime` expect.
 
 ```limpid
 workspace.processed_at = timestamp()
@@ -744,8 +742,7 @@ Equivalent to `compact` for null removal: `filter(arr) { |x| x != null }` drops 
 
 ### find(array) { |x| predicate } / find(object) { |key, value| predicate }
 
-First element where the block returns truthy, or `null` if no match. An earlier `find_by(arr, key, value)` shape was removed in the 0.7.x cycle; the block-arg form composes for arbitrary predicates:
-
+First element where the block returns truthy, or `null` if no match.
 ```limpid
 workspace.process = find(workspace.evidence) { |e| e.entityType == "Process" }
 workspace.user    = find(workspace.evidence) { |e| e.entityType == "User" }
@@ -801,8 +798,8 @@ workspace.distinct_users = distinct(map(workspace.events) { |e| e.user })
 
 Reduce a numeric array to a scalar.
 
-- `sum` — all-Int stays Int; any Float participant promotes the result to Float (decided up front by scanning the array, so `[i64::MAX, 1, 0.5]` returns a float total instead of spuriously overflowing on the second integer). Empty array → `Int(0)`. Integer-only sums that exceed the `i64` range surface a typed error (`sum() overflowed i64 …`) rather than silently wrapping in release builds — promote one element to float (e.g. wrap the input in `map(...) { |x| x * 1.0 }`) if you genuinely need to sum past `i64::MAX`. Float sums use IEEE 754 saturation (overflow yields ±Infinity) and propagate NaN unchanged.
-- `max` / `min` — compare through `f64`; empty array → `null`.
+- `sum` — all-Int stays Int; any Float participant promotes the result to Float (decided up front by scanning the array, so `[9223372036854775807, 1, 0.5]` returns a float total instead of spuriously overflowing on the second integer). Empty array → `0`. Integer-only sums that exceed the signed 64-bit range surface a typed error (`sum() overflowed i64 …`) rather than silently wrapping in release builds — promote one element to float (e.g. wrap the input in `map(...) { |x| x * 1.0 }`) if you genuinely need to sum past the maximum signed 64-bit integer. Float sums use IEEE 754 saturation (overflow yields ±Infinity) and propagate NaN unchanged.
+- `max` / `min` — compare as floating-point numbers; empty array → `null`.
 
 Non-numeric elements bail rather than silently coerce. Mixed numeric / null arrays also bail, because "skip the nulls" is a per-pipeline policy decision; use `filter(arr) { |x| x != null } |> sum` to opt in.
 
@@ -915,7 +912,7 @@ Sibling predicates (`is_object`, `is_string`, …) are deferred until repeated n
 
 ### to_json(value)
 
-Serializes a value to a JSON string. Errors if the value (or any nested value) contains `Value::Bytes` — convert explicitly via `to_string(b)` if you mean to embed bytes as text.
+Serializes a value to a JSON string. Errors if the value (or any nested value) contains `Bytes` — convert explicitly via `to_string(b)` if you mean to embed bytes as text.
 
 ```limpid
 egress = to_json(workspace)               // common: ship workspace as JSON downstream
@@ -1066,17 +1063,17 @@ Expressions support the following operators:
 When both operands are `Int`, `+`, `-`, `*`, `/`, and `%` use checked i64 arithmetic and return an `Int`. Integer division truncates toward zero, and remainder has the dividend's sign:
 
 ```limpid
-workspace.half = 5 / 2          // Int(2)
-workspace.negative = -5 / 2    // Int(-2)
-workspace.remainder = -7 % 3   // Int(-1)
+workspace.half = 5 / 2          // 2
+workspace.negative = -5 / 2    // -2
+workspace.remainder = -7 % 3   // -1
 ```
 
-Integer division and remainder by zero return `Int(0)` for compatibility. Overflow is an evaluation error; it never falls back to an approximate Float. This includes the signed edge cases `i64::MIN / -1` and `i64::MIN % -1`.
+Integer division and remainder by zero return `0` for compatibility. Overflow is an evaluation error; it never falls back to an approximate Float. Dividing the minimum signed 64-bit integer by `-1`, or taking its remainder modulo `-1`, also returns an overflow error.
 
 If either operand is a `Float`, or an operand uses an existing non-Int numeric coercion, evaluation follows the existing f64 path. Write a Float literal when fractional division is intended:
 
 ```limpid
-workspace.ratio = 5 / 2.0      // Float(2.5)
+workspace.ratio = 5 / 2.0      // 2.5
 ```
 
 ### `+` overloading

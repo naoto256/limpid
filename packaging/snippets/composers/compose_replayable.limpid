@@ -40,7 +40,7 @@
 // Writes: workspace.lsis.composed.*
 //         .replayable (required, String)
 def process compose_replayable {
-    // Since v0.5.6 the DSL `source` ident is the canonical
+    // The DSL `source` ident is the canonical
     // `{ip, port}` object — same shape `inject --json` expects — so
     // the composer can pass it straight through with no string
     // assembly and no port-placeholder fidelity loss.

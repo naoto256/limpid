@@ -124,7 +124,7 @@ success or extended on failure.
 
 If every peer is cooled-down (or fails within the same write call), the
 write returns an error and the output's `retry { ... }` budget (driven
-inside `consume()`) handles re-delivery. On retry exhaustion the payload
+by the output) handles re-delivery. On retry exhaustion the payload
 routes to `control { error_log "..." }` as an Output-flavor DLQ record;
 see [Outputs → Recovery (error_log)](../outputs/README.md#recovery-error_log).
 

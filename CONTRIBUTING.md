@@ -209,3 +209,14 @@ support alongside the Debian packages. Archives are named
 and Debian package, while the ZIP's own manifest covers its three binaries.
 The release is created only after all build jobs succeed. Native build checks
 do not replace the acceptance matrix above.
+
+## Performance qualification
+
+Compare release builds with identical workloads, event counts, receive/finish/
+write counts, and CPU allocation. Include a byte-identical control comparison
+before attributing a difference to a change. Alternate baseline and changed
+builds in ABBA/BAAB blocks to limit drift, and report uncertainty intervals
+alongside medians. Fix the comparison margin before measuring. An interval
+that crosses that margin is inconclusive; do not turn its median alone into
+a regression or no-overhead claim. Keep diagnostic profiles separate from
+the comparison used for release qualification.

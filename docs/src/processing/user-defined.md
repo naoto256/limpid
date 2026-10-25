@@ -1,6 +1,6 @@
 # User-defined Processes
 
-limpid ships a [Snippet Library](../snippets/README.md) of pre-built processes for common parsing / mapping work (introduced in v0.7.0, expanded across the 0.7.x line). Sooner or later you'll hit a situation the library doesn't cover — a vendor format we haven't shipped, a one-off enrichment, a dedup or rate-limit shape that's specific to your environment — and want to write your own. This page covers how.
+limpid ships a [Snippet Library](../snippets/README.md) of pre-built processes for common parsing / mapping work. Sooner or later you'll hit a situation the library doesn't cover — a vendor format we haven't shipped, a one-off enrichment, a dedup or rate-limit shape that's specific to your environment — and want to write your own. This page covers how.
 
 You define a process with `def process <name> { ... }`. Inside the body you call functions, assign to event slots and workspace, branch with `if` / `switch` / `try`, transform arrays and objects with the block-arg primitives (`map`, `filter`, `find`, `reduce`), and call other processes by name.
 
@@ -105,7 +105,7 @@ def process safe_parse_json {
 }
 ```
 
-`error` inside `catch` is a `Value::String` containing the bail message. It is scoped to the immediate `catch` body — not visible after the block ends, not visible inside a nested process call.
+`error` inside `catch` is a string containing the bail message. It is scoped to the immediate `catch` body — not visible after the block ends, not visible inside a nested process call.
 
 #### When to use `try` vs let the error propagate
 

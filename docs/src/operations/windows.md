@@ -4,9 +4,17 @@ limpid 0.9.0 uses a ZIP package with PowerShell installation scripts. MSI packag
 
 ## Platform status
 
-0.9.0 distributes Windows x64 and ARM64 ZIPs; availability of an architecture build is not a full OS/service support certification. Saved results from earlier Windows 11 ARM64 integration builds cover package installation, the virtual service account, Event Log collection and bookmark resume, the control pipe, Prometheus scraping, configuration reload, upgrade, and automatic start after reboot. These are not a full-matrix rerun on every subsequent candidate. The integrated candidate has also been exercised through SCM for a long-running shutdown with observable progress.
+Windows 0.9.0 provides x64 and ARM64 ZIP packages; availability alone does
+not establish full OS or service acceptance. Tests of earlier Windows 11
+ARM64 builds covered installation, the virtual service account, Event Log
+collection and bookmark resume, control and exporter access, reload, upgrade,
+and automatic start after reboot. These checks are not repeated in full for
+every build. A long-running shutdown with progress reporting was also tested.
+Windows 11 x64 and Windows Server 2022+ x64 have not completed the same
+service acceptance tests.
 
-Windows 11 x64 and Windows Server 2022 or later x64 are release targets, but they must complete the same native acceptance matrix before being advertised as tested combinations. The package requires the Microsoft Visual C++ runtime for its architecture (`VCRUNTIME140.dll`); the ZIP does not install it.
+The package requires the Microsoft Visual C++ runtime for its architecture
+(`VCRUNTIME140.dll`); the ZIP does not install it.
 
 ## Install
 
@@ -65,7 +73,9 @@ SCM control 6 (`PARAMCHANGE`) validates the candidate configuration and keeps th
 
 Shutdown retains tasks that must finish. Completed processing, successful delivery/recovery notifications, consumer bookkeeping, and completed task joins contribute to coalesced SCM checkpoints while stopping. Merely waiting does not advance a checkpoint; a notification does not prove that a bookmark has been durably persisted. The wait hint remains 30 seconds. An owner blocked without observable progress can exceed that hint; there is no periodic heartbeat or forced-abort guarantee.
 
-The integrated candidate was observed in `STOP_PENDING` for about 95.95 seconds with checkpoints advancing from 1 to 71, then reached `STOPPED` with both SCM exit codes zero. This was mixed delivery/recovery, not an all-delivery result. A no-progress stall and higher-level control-client timeout behavior were not tested. `sc.exe stop` request acceptance, used in that run, is distinct from waiting for completion in `Stop-Service` or another client.
+Acceptance of a stop request is distinct from completed shutdown. Wait for
+`STOPPED`; completion may include delivery and DLQ recovery. A stop with no
+observable progress has no tested completion guarantee.
 
 Diagnostic logs are written to `%ProgramData%\limpid\log\daemon.log`. In foreground mode, Ctrl-C and Ctrl-Break request graceful shutdown.
 
