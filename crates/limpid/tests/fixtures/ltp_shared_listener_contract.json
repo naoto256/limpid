@@ -25,7 +25,7 @@
   ],
   "e2e": {
     "binds": 1,
-    "logical_inputs": ["ltp_jump01", "ltp_jump02"],
+    "logical_inputs": ["ltp_relay_a", "ltp_relay_b"],
     "independent_input_metrics": true,
     "independent_pipeline_delivery": true
   }
