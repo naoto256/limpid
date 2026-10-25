@@ -358,7 +358,7 @@ for the underlying design choice.
 
 Every snippet that ships in a library needs a fixture: a line of realistic input and the expected `egress` (or `workspace`) after the process runs. `limpidctl inject input <name>` + `limpidctl tap process <name> --json` is the testing primitive. See [Debug Tap](../operations/tap.md).
 
-For examples of this in practice on a real multi-host deployment, see [Multi-host Pipeline Example](../pipelines/multi-host.md).
+For a worked example of this across multiple hosts, see [Multi-host Pipeline Example](../pipelines/multi-host.md).
 
 ## Summary
 

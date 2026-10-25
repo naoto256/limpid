@@ -497,7 +497,7 @@ YYYY-MM-DDTHH:MM:SS[.fractional](Z | ±HH:MM | ±HHMM)
 
 All three offset forms (`Z`, `+00:00`, `+0000`) are accepted — this is what `strptime` with `%z` cannot do alone (chrono rejects the bare `Z` literal under `%z`). Sub-second precision is preserved up to nanoseconds.
 
-For the wider ISO 8601 surface (basic format `20260430T012345`, week dates, ordinal dates), no atomic parser is provided — production wire is effectively all RFC 3339.
+For the wider ISO 8601 surface (basic format `20260430T012345`, week dates, ordinal dates), no atomic parser is provided. The supported timestamp form is RFC 3339.
 
 For RFC 3164 syslog timestamps (`Apr 30 01:23:45`, no year, no timezone), there is no atomic parser either; the missing year and timezone are policy decisions. Compose `strptime` + current-year fallback + future-clamp in LPL.
 

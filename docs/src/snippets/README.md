@@ -47,7 +47,7 @@ before customising it; package upgrades replace files under
 | `parsers/parse_okta_system.limpid` | Okta System Log events (JSON) | 3001 / 3002 / 3005 / 3006 |
 | `parsers/parse_juniper_srx_sd_syslog.limpid` | Juniper SRX RT_FLOW (RFC 5424 + Junos SD, `set security log format sd-syslog` mode) | 4001 Network Activity |
 | `parsers/parse_juniper_srx_syslog.limpid` | Juniper SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured, default `syslog` mode) | 2004 Detection Finding |
-| `parsers/parse_nsp.limpid` | Trellix / McAfee Network Security Platform IPS alerts (standard syslog KV template, real-traffic verified) | 2004 Detection Finding |
+| `parsers/parse_nsp.limpid` | Trellix / McAfee Network Security Platform IPS alerts (standard syslog KV template) | 2004 Detection Finding |
 | `parsers/parse_checkpoint_leef.limpid` | Check Point LEEF 2.0 (Accept / Drop / Reject / Block) — for QRadar bridges | 4001 Network Activity |
 | `parsers/parse_checkpoint_syslog.limpid` | Check Point Syslog Exporter (Junos-style SD with `:` separator; handles R81+ `Log [Fields@<EID> ...]` `=` variant) | 4001 / 2004 / 3002 |
 | **OSS NDR** | | |
@@ -63,7 +63,7 @@ before customising it; package upgrades replace files under
 | `parsers/parse_winevent_json.limpid` | Windows Security event log (NXLog / Vector / Winlogbeat JSON) | 3002 / 1007 / 3001 / 3006 |
 | `parsers/parse_sysmon.limpid` | Microsoft Sysmon (NXLog / Vector / Winlogbeat JSON) — EventID 1 / 3 / 11 | 1007 / 4001 / 1001 |
 | `parsers/parse_bind.limpid` | ISC BIND 9 querylog | 4003 DNS Activity |
-| `parsers/parse_auditd.limpid` | Linux auditd, ~45 type codes across 7 OCSF classes (auth / account change / process / file / network / vulnerability / detection), real-corpus verified | 3002 / 3001 / 1007 / 1001 / 4001 / 2002 / 2004 |
+| `parsers/parse_auditd.limpid` | Linux auditd, ~45 type codes across 7 OCSF classes (auth / account change / process / file / network / vulnerability / detection) | 3002 / 3001 / 1007 / 1001 / 4001 / 2002 / 2004 |
 | **Vendor-neutral** | | |
 | `parsers/parse_ocsf.limpid` | OCSF JSON inbound (any vendor's prior compose_ocsf output); normalizes root `time` from OCSF ms to LSIS ns and `severity_id` to OTel `SeverityNumber` | any class |
 
@@ -253,8 +253,8 @@ Every parser's docstring records:
 Highlights (security devices / cloud audit first, server / host
 systems below):
 
-- **PAN-OS** parsers were verified against live PAN-OS traffic,
-  with four wire-format quirks fixed vs. the legacy CEF docs
+- **PAN-OS** parsers account for four wire-format quirks
+  relative to the legacy CEF documentation
   (severity is 1-5 not 0-10, `cs1=Rule` not Threat Category,
   `signature_id` carries the threat name not `cs2`,
   `SourceLocation` is GeoIP not hostname).
@@ -276,7 +276,7 @@ systems below):
   modern pam_unix wire form and older variants;
   command-continuation lines (sudo's COMMAND= overflow handling)
   drop silently.
-- **Postfix** verified against a real production mail.log slice;
+- **Postfix** verified against a real Postfix mail.log slice;
   smtp delivery / qmgr accept / smtpd connect / NOQUEUE reject /
   bounce shapes covered.
 - **Windows Event Log JSON** verified against the OTRF / Mordor
