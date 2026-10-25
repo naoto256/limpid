@@ -33,7 +33,7 @@ Two observations follow:
 1. JSON Schema is the lingua franca for JSON instance validation, but **not every log schema reduces to a JSON Schema**. ASIM and CIM do not have portable schema files at all — their "schema" is expressed through ingestion-side query logic. A bundled validator cannot represent them without re-implementing the ingestion logic itself.
 2. Even between JSON-Schema-describable targets, "compatible" is not standardized. Schema-diff tools exist, but their definitions of subset / superset / equivalence disagree. A universal schema-comparison engine inside limpid is not a realistic goal.
 
-The conclusion is that any bundled validator would at best cover a subset of targets, and that subset would require continuous maintenance against every spec revision (OCSF event classes, ECS field additions, internal schema drift). That is a commitment limpid will not take — it pulls domain knowledge into the daemon, which conflicts directly with [Principle 3](../design-principles.md) (domain knowledge ships as DSL snippets, not Rust).
+The conclusion is that any bundled validator would at best cover a subset of targets, and that subset would require continuous maintenance against every spec revision (OCSF event classes, ECS field additions, internal schema drift). That is a commitment limpid will not take — it pulls domain knowledge into the daemon, which conflicts directly with [the domain-knowledge operating rule](../design-principles.md#domain-knowledge-ships-as-dsl-snippets-not-rust).
 
 ## Why `tap --json | validator` wins
 

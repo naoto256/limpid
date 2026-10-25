@@ -172,7 +172,7 @@ class ReleasePreflightTests(unittest.TestCase):
             preflight.check_repository_links({preflight.REPOSITORY_PREFIX + "main/CHANGELOG.md"}, fetch=unavailable)
 
     def test_repository_fragment_and_selected_destinations(self):
-        url = preflight.REPOSITORY_PREFIX + "main/packaging/snippets/README.md#authoring-conventions"
+        url = preflight.REPOSITORY_PREFIX + "main/CONTRIBUTING.md#authoring-conventions"
         preflight.check_repository_links({url}, fetch=lambda _: '<h2 id="user-content-authoring-conventions">ok</h2>')
         with self.assertRaises(preflight.SourceDefect):
             preflight.check_repository_links({url}, fetch=lambda _: '<h2 id="different">no</h2>')

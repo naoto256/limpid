@@ -10,7 +10,7 @@ The `def` keyword introduces a top-level definition. The five kinds are:
 def input <name> { ... }              // see Inputs
 def output <name> { ... }             // see Outputs
 def process <name> { ... }            // see Processing → User-defined Processes
-def function <name>(<args>) { expr }  // see Processing → User-defined Functions
+def function <name>(<args>) { expr }  // see Functions → User-defined Functions
 def pipeline <name> { ... }           // see Pipelines
 ```
 
