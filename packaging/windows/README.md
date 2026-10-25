@@ -1,17 +1,15 @@
 # Windows ZIP package
 
-This directory builds the Windows ZIP package for 0.9.0.
-Distribution artifacts do not establish full OS/service acceptance. Packaging
-is ZIP + PowerShell; MSI remains a future option.
+The Windows 0.9.0 package contains ZIP files and PowerShell installation scripts.
 
-Saved results from earlier Windows 11 ARM64 integration builds cover
-install, first start, service ACLs, Event Log collection and bookmark resume,
-control and exporter access, PARAMCHANGE, graceful STOP, upgrade, and automatic
-start after reboot. These are not a full-matrix rerun on every later candidate.
-See [Windows service](../../docs/src/operations/windows.md) for the integrated
-candidate's long-running SCM shutdown check and remaining limits.
-Windows 11 x64 and Windows Server 2022 or later x64 remain
-release targets until they complete the same acceptance matrix.
+Tests of earlier Windows 11 ARM64 builds covered installation, the virtual
+service account, Event Log resume, control and exporter access, reload, upgrade,
+and automatic start after reboot. These checks are not repeated in full for
+every build, and package availability alone does not establish full service
+acceptance. Windows 11 x64 and Windows Server 2022+ x64 have not completed
+the same service acceptance tests.
+See the [Windows service guide](https://naoto256.github.io/limpid/docs/operations/windows.html)
+for operation and current limits.
 
 Run `install.ps1` from elevated 64-bit PowerShell after extracting the package.
 The binaries require the Microsoft Visual C++ runtime for their
@@ -53,23 +51,7 @@ administrator must be provisioned for the service identity before use: owner
 must be NT SERVICE\limpid and grants must be restricted to that identity,
 SYSTEM and Administrators. The daemon refuses broad or reparse-point keys.
 
-Test matrix: Windows 11 x64/ARM64; Windows Server 2022+ x64. Only actually
-tested combinations may be advertised as tested. Security and provider-specific
+Security and provider-specific
 channels can impose additional read permissions; an input startup failure is
 fatal and must be resolved explicitly. The service is set to Automatic, but the
 package does not configure SCM recovery actions after unexpected termination.
-
-For each unqualified architecture, test installation, first start, startup failure, PARAMCHANGE,
-STOP with queued events, upgrade, and uninstall on an elevated test machine.
-Verify the service stays stopped after initial installation; its account can
-read config and write state/logs; an unrelated standard user cannot connect to
-the control pipe or read LTP keys; and upgrade/uninstall preserve existing
-configuration and bookmarks. Native foreground tests do not establish SCM
-behavior. Debug candidate archives are for validation, not release assets.
-
-The tag-driven release workflow builds x64 and ARM64 MSVC ZIPs with Kafka
-support alongside the Debian packages. Archives are named
-`limpid-<version>-<target>.zip`; the release-level `SHA256SUMS` covers each ZIP
-and Debian package, while the ZIP's own manifest covers its three binaries.
-The release is created only after all build jobs succeed. Native build checks
-do not replace the acceptance matrix above.

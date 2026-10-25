@@ -1,9 +1,9 @@
 //! Snippet-header schema (parse + lint) — file facade plus member contracts.
 //!
 //! The schema is documented in
-//! `packaging/snippets/README.md` § *Authoring conventions > Header
-//! schema*. File-level metadata declares `Facade`, `Category` (parser
-//! only), and `Test corpus`. Every facade process/function has a
+//! `CONTRIBUTING.md` § *Authoring conventions*. File-level metadata declares
+//! `Facade`, `Category` (parser only), and `Test corpus`. Every facade
+//! process/function has a
 //! directly-adjacent member block carrying its authored contract.
 //!
 //! The kind is determined by the file's parent directory
