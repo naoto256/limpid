@@ -74,8 +74,6 @@ A few we have already covered:
 
 - **Vendor parsers in your hands.** Vendor-specific logic (CEF parsing, FortiGate quirks, OCSF schema mapping) lives in `.limpid` snippets you edit on your timeline. A vendor adds a field — you fix it in one file and `SIGHUP`. No Ruby plugin ABI, no Rust recompile, no waiting on the daemon team.
 
-And here is the half that should make you grin — daily operations the alternatives simply cannot match, the kind of thing that changes how you live with a log pipeline:
-
 - **You can watch the pipeline work, live.** `limpidctl tap output security_lake --json` streams events as they leave for the destination (source, ingress, egress bytes). `limpidctl tap process compose_ocsf --json` shows the workspace state at that pipeline hop. No pause, no traffic duplication, no second tool. Every pipeline is its own debugger.
 
   ```text
