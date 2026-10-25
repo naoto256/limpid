@@ -13,8 +13,7 @@ normal in-memory output queue.
 | C | `syslog.parse`, JSON parse, two regex extractions, and a conditional | 156,887.0 |
 | D | `syslog.parse`, JSON parse, OCSF Authentication object composition, and `to_json` | 251,190.0 |
 
-These are aggregate results from a benchmark slice allowed to run on CPUs
-14–15 of a Linux aarch64 Parallels VM. They are not single-core results and
+These are aggregate v0.8.0 measurements on Linux aarch64, limited to two CPUs. They are not single-core results and
 should not be treated as capacity guarantees for other machines or production
 traffic.
 

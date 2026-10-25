@@ -112,9 +112,9 @@ Protect the raw archive, error log, backups, tap access, and diagnostics. Replay
 
 ## Verified with a running daemon
 
-This configuration was exercised with a real limpid 0.9.0 process on macOS and a loopback HTTP receiver, not just pipeline test mode. The eight synthetic input lines produced the following results:
+For the eight synthetic input lines, expect the following results:
 
-| Check                                           | Observed result                                                                |
+| Check                                           | Expected result                                                                |
 | ----------------------------------------------- | ------------------------------------------------------------------------------ |
 | Allowed login and logout events                 | Two HTTP requests, each containing exactly `event_id`, `action`, and `outcome` |
 | Fake email, token, free text, and nested copies | Absent from both HTTP bodies                                                   |
@@ -122,4 +122,7 @@ This configuration was exercised with a real limpid 0.9.0 process on macOS and a
 | Original archive                                | All eight original lines matched, independent of output order                  |
 | Shutdown                                        | Normal exit code 0                                                             |
 
-As a negative control, replacing the new document with `to_json(workspace.audit)` caused the receiver assertion to fail on the leaked extra fields. That deliberately unsafe variant was sent only to the loopback test receiver. No real secrets or production events were used. This check does not establish Windows behavior, remote destination acceptance, or production retention and recovery guarantees.
+Replacing the new document with `to_json(workspace.audit)` would include the
+extra fields that the receiver check rejects. The example does not establish
+Windows behavior, remote destination acceptance, or production retention and
+recovery guarantees.

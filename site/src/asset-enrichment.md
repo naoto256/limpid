@@ -103,4 +103,8 @@ Before replacing the file output with an external destination, review whether de
 
 ## Validation scope
 
-All three Event envelopes were injected into a real limpid 0.9.0 daemon on macOS. The output preserved each original message and sender, matched both known inventories exactly, and left the unknown asset as `{ "known": false }`. The error log stayed empty and the process exited normally with code 0. Contradictory hostnames in the message did not affect the mappings. This does not certify sender authenticity, NAT behavior, or a production inventory source.
+Expected results: each original message and sender are preserved, both known
+inventories match, and the unknown asset remains `{ "known": false }`.
+Contradictory hostnames in the message must not affect the mappings. These
+checks do not certify sender authenticity, NAT behavior, or a production
+inventory source.

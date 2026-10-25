@@ -193,15 +193,17 @@ Keep requests below 1,000,000 bytes; `batch_size` counts events, not bytes. Chec
 
 ### Validation scope
 
-With limpid 0.9.0, executable checks read the configuration and single-line Event directly from this article. Raw and parsed JSON, raw and parsed OTLP, and the optional OTLP wire-body override passed through running local senders and receivers with expected contents, counts, and normal exit. These local checks replace only the destination, key placeholder, ports, and private paths; they do not establish cloud acceptance.
+The four main configurations were sent to New Relic's US endpoints. The
+stored records matched the synthetic inputs as shown below:
 
-The four main configurations were also run on Windows against the US New Relic endpoints using the documented `inject --json` form, current UTC timestamps and unique synthetic markers. Each reported one successful write, zero failures, and normal exit. The existing service and configuration were unchanged. The account owner retrieved all four stored records from New Relic; their unique markers, message bodies, fields and timestamps were compared with the injected fixtures:
-
-| Configuration | Confirmed stored result                                                                                                                                                                                                                                      |
+| Configuration | Stored field layout                                                                                                                                                                                                                                          |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Raw JSON      | Full syslog line, `route=json`, `service=syslog-forwarder`, and `newrelic.source=api.logs`. The stored timestamp is ingestion time, not the date in the message.                                                                                             |
 | Parsed JSON   | Full syslog line, dotted `source.ip`/`source.port` and `destination.ip`/`destination.port`, `rule.name=Example.Signature`, and `severity_number=19`. The event time remains a separate `event_time_unix_nano` field; the stored timestamp is ingestion time. |
-| Raw OTLP      | Full syslog line, `route=otlp`, `service.name=syslog-forwarder`, and `newrelic.source=api.logs.otlp`. The stored timestamp was `08:07:42.258 UTC`; this configuration uses receipt time rather than parsing the date in the message.                         |
+| Raw OTLP      | Full syslog line, `route=otlp`, `service.name=syslog-forwarder`, and `newrelic.source=api.logs.otlp`. This configuration uses receipt time rather than parsing the date in the message.                                                                      |
 | Parsed OTLP   | CEF body without the syslog wrapper, source/destination fields, Fortinet observer attributes, `rule.name=Example.Signature`, and `severity.number=19`. The stored timestamp matches the parsed device time.                                                  |
 
-For example, the parsed JSON record retained device time `08:07:31.000 UTC` in `event_time_unix_nano`, while New Relic stored `08:07:32.064 UTC` as its timestamp. Do not treat that custom field as an instruction to replace New Relic's timestamp. The optional NRQL query was not used for this comparison. These one-event checks do not establish production volume, long-term recovery, or coverage of every FortiGate category.
+In parsed JSON, `event_time_unix_nano` retains device time separately from
+New Relic's ingestion timestamp. Do not treat that custom field as an
+instruction to replace New Relic's timestamp. These examples do not establish
+production volume, long-term recovery, or coverage of every FortiGate category.

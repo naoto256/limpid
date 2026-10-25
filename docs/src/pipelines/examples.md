@@ -1,6 +1,6 @@
 # Pipeline Examples
 
-Real-world configuration examples from production deployments.
+Worked configuration examples for common routing and forwarding tasks.
 
 ## Firewall log archival with source-based routing
 
