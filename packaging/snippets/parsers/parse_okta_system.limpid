@@ -101,8 +101,10 @@ def function okta_first_target(targets, wanted) {
     find(targets) { |t| t.type == wanted }
 }
 
-// Okta `published` is RFC 3339 with millisecond precision and a
-// trailing `Z`. The built-in primitive handles that directly.
+// Okta's LogEvent schema declares `published` as string/date-time.
+// Its examples use milliseconds and Z, but the schema does not restrict
+// every value to that precision or suffix. The RFC 3339 parser handles it.
+// See https://github.com/okta/okta-management-openapi-spec/blob/a5311d441491e6401421cf75343bb1f2081d6c7a/dist/current/management-minimal.yaml
 def function okta_time(s) {
     switch true {
         s == null { null }

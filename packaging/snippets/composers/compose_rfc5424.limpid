@@ -61,8 +61,9 @@
 // ---------------------------------------------------------------------------
 // Helper: PRI arithmetic (facility * 8 + severity). Bridges pass in the
 // two byte-string fields from their upstream; the function is pure. Both
-// arguments may be null — the coalesce fallbacks apply per RFC 5424 § 6.2.1
-// convention (unknown facility → 1 user, unknown severity → 6 informational).
+// arguments may be null. This helper chooses facility 1 (user) and
+// severity 6 (informational) as its fallbacks; RFC 5424 section 6.2.1
+// defines the PRI arithmetic and ranges, not these default choices.
 // ---------------------------------------------------------------------------
 
 def function rfc5424_pri_from(facility_str, severity_str) {

@@ -3,10 +3,8 @@
 This page exists so that an issue starting with *"why doesn't limpid set
 `service.name` automatically?"* or *"OTLP says X, you should do X,"* can
 be answered with a link instead of a thread. The OTLP specification is
-public, several major implementations interpret it differently, and the
-community has well-formed factions on a handful of points. limpid took
-positions on each of those points; this page is where those positions
-are written down with the reasoning attached.
+public. This page distinguishes its wire requirements from limpid's
+choices for forwarding logs, with the reasoning for those choices.
 
 The reference docs for *how to use* OTLP in limpid are elsewhere:
 
@@ -66,12 +64,14 @@ emitting a burst.
 
 Two structural facts of proto3 matter for the rest of this page:
 
-1. **`repeated` fields concat = merge.** Sending one `ResourceLogs` with
-   ten records and sending ten singleton `ResourceLogs` produce the
-   same set of records at the receiver; only the framing differs. The
-   spec calls this out explicitly.
-2. **The schema is immutable on the wire.** Fields are tagged; adding
-   new ones is backward-compatible by design.
+1. **Repeated fields concatenate when protobuf messages are merged.**
+   The [Protobuf encoding guide](https://github.com/protocolbuffers/protocolbuffers.github.io/blob/7a68ef28113f81f7ce7eabf72df89bc105e5cf13/content/programming-guides/encoding.md)
+   describes this parsing rule. limpid can keep records in separate entries
+   or shared groups, subject to its schema-URL grouping rules (§4.5).
+2. **Field numbers support compatible schema evolution.** Adding fields
+   is a binary wire-safe change under the rules in the
+   [Proto3 guide](https://github.com/protocolbuffers/protocolbuffers.github.io/blob/7a68ef28113f81f7ce7eabf72df89bc105e5cf13/content/programming-guides/proto3.md).
+   This does not make an entire schema immutable or every change safe.
 
 The `Export` RPC returns an `ExportLogsServiceResponse` whose only
 field is an optional `partial_success` carrying:
@@ -85,7 +85,8 @@ ExportLogsPartialSuccess {
 
 This is the protocol's mechanism for the receiver to say *"I accepted N
 of M records; here is the count of the ones I refused, and a message."*
-The intent and the actual usage diverge, which is the topic of §4.
+A populated partial-success response can also carry a warning with zero
+rejected records; see §3.3.
 
 ---
 
@@ -94,20 +95,17 @@ The intent and the actual usage diverge, which is the topic of §4.
 A few points the spec *is* explicit about, where casual readings get
 them wrong. limpid's behaviour follows the spec on these.
 
-### 3.1 External Logs: Resource describes the source, not the agent
+### 3.1 Resource describes the source of the log
 
-The OTLP Logs Data Model has a section titled
-[*"External Logs"*](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/data-model.md#how-opentelemetry-handles-external-logs)
-that addresses the case limpid is in:
+The Logs Data Model's [Resource field in specification v1.40.0](https://github.com/open-telemetry/opentelemetry-specification/blob/v1.40.0/specification/logs/data-model.md#field-resource)
+says:
 
-> When receiving logs from sources outside the SDK, the Resource should
-> describe **the source of the logs, not the agent that collected
-> them.**
+> Describes the source of the log, aka resource.
 
-`service.name` in this case is the application / device that produced
-the log line, not the limpid daemon that received it on UDP/514. The
-reading is unambiguous. limpid follows it (see §5.4 on why this means
-limpid does not auto-set the value).
+The same section says that Resource is optional and may contain information
+about the emitting application or the infrastructure where it runs. It does
+not prescribe limpid's source-adapter policy for a relay aggregating logs
+from multiple devices; that design choice is explained in §4.1 and §5.4.
 
 ### 3.2 SeverityNumber is a number, not text
 
@@ -122,77 +120,63 @@ should look at `severity_number`; one that wants to display the
 original token uses `severity_text`. limpid emits both when both are
 known and otherwise leaves the unknown one empty (see §5.5).
 
-### 3.3 partial_success is *not* a retry primitive
+### 3.3 partial_success does not permit retrying the request
 
-The spec is quiet on what a sender should do with `rejected_log_records`,
-but it gives the field a clear definition:
+The [OTLP specification in opentelemetry-proto v1.5.0](https://github.com/open-telemetry/opentelemetry-proto/blob/v1.5.0/docs/specification.md),
+under **Partial Success** for gRPC and HTTP, prohibits retrying the request
+when the response contains a populated `partial_success`.
 
-> The number of rejected log records. A `rejected_log_records` of `0`
-> indicates full success.
+The [logs response definition in the same release](https://github.com/open-telemetry/opentelemetry-proto/blob/v1.5.0/opentelemetry/proto/collector/logs/v1/logs_service.proto)
+describes `rejected_log_records` as:
 
-Being *rejected* is a terminal state for those records as far as the
-receiver is concerned: they were validated, found unacceptable, and
-dropped. This is distinct from a transport failure (5xx, connection
-refused, timeout) where the receiver never had a chance to validate.
+> The number of rejected log records.
 
-The OpenTelemetry Collector's `otlp` exporter explicitly does not retry
-the rejected subset on its own; it surfaces the partial-success in
-metrics and (depending on configuration) propagates the failure to its
-own sender. limpid does the same — see §5.6.
+Zero means that the request was fully accepted, but a populated response
+may still carry a warning. A nonzero count does not identify the rejected
+records or establish that every rejection was caused by invalid content.
+Nor does a transport error prove that the receiver processed nothing.
+
+limpid does not automatically construct a new request from an inferred
+rejected subset. Its count-based recovery policy is described in §5.6.
 
 ---
 
-## 4. Where the spec is ambiguous, and the ecosystem disagrees
+## 4. Forwarding choices in limpid
 
-These are the points where a community member writing an issue is
-most likely to assume a different interpretation than limpid's. Each
-gets its own subsection.
+The following choices describe limpid's forwarding model. They are not
+additional requirements imposed on other OTLP implementations.
 
 ### 4.1 Whose attributes go on the Resource
 
-The "Resource describes the source" rule above is unambiguous *if* you
-know the source's identity. In a real forwarder the identity has to
-come from somewhere. There are three popular sources:
+limpid chooses to describe the original event source, rather than fill in
+its own relay identity, when building Resource attributes for aggregated
+logs. This is a forwarding policy, not a quoted rule about agents from the
+Logs Data Model. Source identity must come from documented payload fields
+or explicit operator knowledge; it cannot be inferred from the receiving
+forwarder's hostname.
 
 | Source | What it produces | limpid policy |
 |---|---|---|
-| Auto-detection | `host.name = $(hostname)`, `service.name` from a config or env | Rejected for aggregated external logs |
+| Forwarder auto-detection | The receiving daemon's host or service identity | Not used to label aggregated external sources |
 | Per-source adapter | Source-backed identity placed per Event | Packaged canonical path |
-| Post-adapter adjustment | Deployment-known target attributes | Explicit deployment seam |
+| Post-adapter adjustment | Operator-known target attributes | Explicit adjustment after the adapter |
 
-The OTel Collector's `host` and `resource` processors lean heavily on
-auto-detection — it Just Works for the common case where one collector
-runs on one host serving one service. It does the wrong thing for a
-forwarder that aggregates dozens of source devices: every record
-inherits the *forwarder's* `host.name`, contradicting External Logs
-guidance.
-
-The community has not converged. limpid takes the position that the
-generic input and composer do not know enough to make this call
-correctly. Each OTLP-capable raw-source parser has a sibling
+The generic input and composer do not know enough to identify the original
+source. Each OTLP-capable raw-source parser has a sibling
 `<source>_to_otlp` adapter that places source-backed identity per Event
-(§5.4). A
-deployment may adjust that adapter output afterward when it owns
-additional facts.
+(§5.4). An operator may adjust that adapter output afterward when it owns
+additional facts. This choice does not imply that other Resource policies
+are prohibited by the specification.
 
 ### 4.2 What goes in `body`
 
-`LogRecord.body` is an `AnyValue` — it can be `string`, `bool`, `int`,
-`double`, `bytes`, an array, or a kvlist (nested map). The spec
-permits all of these, and different ecosystems use different shapes:
+`LogRecord.body` is an `AnyValue`. The [v1.5.0 common message definitions](https://github.com/open-telemetry/opentelemetry-proto/blob/v1.5.0/opentelemetry/proto/common/v1/common.proto)
+allow string, bool, int, double, bytes, array, and key/value-list variants.
+That range does not prescribe one Body shape for every destination.
 
-- **The fluent ecosystem** (fluentd, fluent-bit) tends to put a
-  flat-or-nested key/value structure as `kvlist_value`, treating
-  `body` as the primary parsed payload.
-- **The OTel SDK ecosystem** tends to put a human-readable line as
-  `string_value` and reserve attributes for structured metadata.
-- **The "log-as-JSON" ecosystem** (most cloud platforms) puts a JSON
-  string in `string_value` because their backends parse it
-  downstream regardless.
-
-limpid does not pick one globally. The parser-owned source adapter
-builds the AnyValue shape the destination expects. See §5.7 for the
-post-adapter adjustment convention.
+limpid's parser-owned source adapter builds the shape required by its
+input and destination contract. See §5.7 for an explicit post-adapter
+adjustment.
 
 ### 4.3 Whether the originating timestamp is in `time_unix_nano` or `observed_time_unix_nano`
 
@@ -203,12 +187,10 @@ post-adapter adjustment convention.
 | `time_unix_nano` | When the event occurred, as claimed by the source |
 | `observed_time_unix_nano` | When the receiver observed the event |
 
-For a forwarder, "the source" is the upstream device that produced
-the syslog / cef / kafka message; "the receiver" is whichever
-component is currently holding the Event. Many implementations
-collapse them — the OTel Collector's `journald` receiver, for
-example, sets only `time_unix_nano` from the journal entry's
-`__REALTIME_TIMESTAMP` and leaves `observed_time_unix_nano` empty.
+The [v1.5.0 LogRecord definition](https://github.com/open-telemetry/opentelemetry-proto/blob/v1.5.0/opentelemetry/proto/logs/v1/logs.proto)
+distinguishes event time from the time the collection system observed the
+event. limpid preserves that distinction when it parses a source timestamp
+and assigns its own input receive time.
 
 limpid's snippet convention is:
 
@@ -222,54 +204,34 @@ limpid's snippet convention is:
   The Event receive timestamp is therefore the default observation
   time, while an explicit earlier observation point can override it.
 
-The spec is comfortable with this split; the practice in the wild is
-not consistent.
+These defaults are limpid's policy; a source-backed earlier observation
+point can be retained through the explicit override.
 
 ### 4.4 What `Scope` means for forwarded logs
 
-`InstrumentationScope` is "the *library* that emitted the log." For an
-SDK this is meaningful — `io.opentelemetry.slf4j` vs `okhttp3`, etc.
-For a forwarder receiving syslog from a network device, there may be no
-source-backed library identity. Implementations handle this differently:
+The [Instrumentation Scope glossary in specification v1.40.0](https://github.com/open-telemetry/opentelemetry-specification/blob/v1.40.0/specification/glossary.md)
+describes a logical unit that emits telemetry. It can identify a library,
+module, package, or class; it is not restricted to a library name.
 
-- **Skip it.** Some receivers leave `scope` unset, producing a
-  `ScopeLogs` with `scope: null`. This is technically valid but most
-  backends flag it.
-- **Synthesise from the receiver name.** OTel Collector's
-  `filelog` receiver sets `scope.name = "filelog"`,
-  `scope.version = collector version`. Functional but conveys nothing
-  about the actual log.
-- **Synthesise from the parser.** Some pipelines set
-  `scope.name = "syslog"` or the vendor (`"fortinet.fortigate"`).
-  This is more useful for filtering downstream.
-
-limpid's per-source adapters set Scope only when the source exposes a
-logger or instrumentation identity. Otherwise `compose_otlp` emits a
-singleton ScopeLogs with no scope data on the wire (`scope: None` in the
-proto). A deployment-owned identity may be supplied through an explicit
+For forwarded logs, limpid's per-source adapters set Scope only when the
+source exposes a logger or instrumentation identity. Otherwise
+`compose_otlp` emits a singleton ScopeLogs with no scope data. A
+deployment-owned identity may be supplied through an explicit
 post-adapter adjustment. The composer does not synthesize one.
 
-### 4.5 Concat vs merge in batches (`batch_level`)
+### 4.5 Separate entries vs shared groups in batches (`batch_level`)
 
-Because `repeated ResourceLogs` is concat-equals-merge on the wire,
-a sender has freedom: send one `ResourceLogs` per Event, or merge
-same-Resource Events into one entry, or merge same-(Resource, Scope)
-into one ScopeLogs. All three produce the same set of records at the
-receiver.
+The [v1.5.0 logs message definitions](https://github.com/open-telemetry/opentelemetry-proto/blob/v1.5.0/opentelemetry/proto/logs/v1/logs.proto)
+use repeated ResourceLogs, ScopeLogs, and LogRecord fields. limpid can keep
+one ResourceLogs per Event or share Resource/Scope metadata between
+matching events. Its `batch_level = none | resource | scope` settings keep
+the records while changing envelope grouping. An entry with an empty
+`schema_url` may adopt a matching entry's non-empty `schema_url`; entries
+with different non-empty URLs remain separate.
 
-The OTel Collector's exporter merges aggressively (smallest wire form).
-Some bespoke senders do pure concat (smallest CPU). limpid offers
-all three as `batch_level = none | resource | scope` and documents
-that they are semantically identical at the wire. See [§ batch_level
-on the output reference page](./outputs/otlp_http.md#batch_level) for the
-operational tradeoff and §5.1 for the underlying wire ↔ CPU
-trade that motivates the choice.
-
-The reason this is in §4 (ambiguous) rather than §3 (clear) is that
-the spec does not *require* either form, but a strict reading of "a
-batch is a set of records grouped by Resource and Scope" makes the
-merged form feel more natural, and some receivers' debug logs assume
-it.
+This is limpid's wire-size versus grouping-work tradeoff, rather than a
+quoted specification definition of a batch. See [the output reference](./outputs/otlp_http.md#batch_level)
+for the equality and schema-URL rules.
 
 ---
 
@@ -341,15 +303,17 @@ to inspect / mutate the contents.
 
 **Why bytes, not a structured value.** Principle 3 of limpid's
 design says "only `egress` crosses hop boundaries." The bytes are
-already the canonical wire form; storing the decoded struct *and*
+already in limpid's selected wire representation; storing a decoded value and
 re-encoding at every hop wastes work and creates a chance of
 drift between the in-memory and on-the-wire representations.
 Bytes on the hop, decode-on-demand in the snippet.
 
-**Why protobuf, not JSON.** OTLP/JSON is a real wire format (the
-`http_json` protocol) but the protobuf form is more compact, decodes
-faster, and is the canonical form in the spec. The output transport
-re-encodes on the way out if the configured protocol is `http_json`.
+**Why protobuf, not JSON.** The [OTLP specification](https://github.com/open-telemetry/opentelemetry-proto/blob/v1.5.0/docs/specification.md)
+defines both encodings. limpid chooses protobuf for its internal hop
+contract so that both output protocols consume the same egress format.
+The HTTP output re-encodes it when configured for `http_json`. This is a
+representation choice, not a specification ranking or a performance
+guarantee.
 
 ### 5.3 Source time vs `received_at`
 
@@ -375,7 +339,7 @@ the adapter output before composition.
 Timezone interpretation follows the source contract. A vendor-defined
 zone wins. Device-local timestamps and timestamps whose specification
 leaves the zone undocumented both default to the limpid host's system
-timezone (the device most likely shares the host's zone). Parsers
+timezone. Parsers
 that accept local timestamps expose a source-specific timezone override;
 their headers document the exact default and accepted values.
 
@@ -388,20 +352,16 @@ limpid does **not** auto-detect `host.name`, `service.name`,
 `<source>_to_otlp` adapter places source-backed identity into
 `workspace.lsis.shed.otlp.resource.attributes` per Event.
 
-**Why no auto-detect.** As §4.1 notes, the OTel Collector's
-auto-detect is correct for one common case (one collector =
-one host = one service) and silently wrong for the case limpid
-exists for (one forwarder = many sources). A device-aggregating
-forwarder that auto-set `host.name` to its own hostname would
-violate External Logs guidance for every record it emits.
+**Why no auto-detect.** limpid can aggregate records from many sources.
+Copying its own hostname or service name onto all of them would identify
+the relay rather than distinguish those sources. Avoiding that automatic
+substitution is limpid's design choice (§4.1), not an additional OTLP
+requirement.
 
-The right value comes from the parser: a CEF line carries the
-device hostname in `dvchost`; a syslog line carries the source
-in the HOSTNAME field; a Kafka record carries it as a key.
-A source adapter extracts that and writes it into Resource attributes
-per record. The forwarder's identity (who
-relayed) is unrelated and uninteresting; the source's identity (who
-emitted) is what `host.name` and `service.name` should describe.
+A source adapter places known source identity into Resource attributes per
+record. For example, the packaged CEF adapter takes `host.name` from the
+enclosing syslog HOSTNAME. If it has no source-backed value, limpid does
+not invent one from the forwarder's identity.
 
 Deployment-owned facts may replace or extend an adapter slot in an
 explicit block immediately after the adapter. That is a target-specific
@@ -436,12 +396,11 @@ hard transport failures (connection refused, 5xx, gRPC `UNAVAILABLE`,
 timeout). It does **not** retry just the rejected subset surfaced
 through `partial_success`.
 
-**Why.** As §3.3 notes, `rejected_log_records` is a terminal state
-for those records — the receiver validated and refused them. Retrying
-doesn't change validity; it would just re-deliver the same records
-to the same receiver and get the same rejection. A "selective
-retry" mechanism would imply the rejection was transient, which the
-spec does not say.
+**Why.** As §3.3 explains, a populated partial-success response prohibits
+retrying that request. The response reports a count rather than record
+identities. limpid therefore does not infer a rejected subset to resend
+automatically; it exposes the loss for operator review. A rejected count
+does not by itself establish the cause or permanence of each rejection.
 
 **What limpid does today.** The rejected subset is split out
 into `events_failed` (separate from `events_written`) so the loss is
@@ -464,11 +423,10 @@ routing, not in-pipeline retry shape.
 OTLP `body` accepts string / int / bool / double / bytes / array /
 kvlist. limpid's snippet author chooses, per pipeline:
 
-- **string** for a JSON-encoded payload (typical when downstream
-  parses on its end — most cloud SaaS backends)
-- **string** for a human-readable line (typical for archival / search)
-- **kvlist** for structured composition where the receiver natively
-  understands the OTLP attribute model (the OTel-native path)
+- **string** for a JSON-encoded payload when the destination contract
+  calls for parsing JSON from the Body
+- **string** for a human-readable line
+- **kvlist** for a structured body when the destination accepts that shape
 
 A source adapter chooses the normal Body variant. A cloud-bound
 deployment that intentionally wraps composed OCSF JSON changes that
@@ -542,18 +500,18 @@ JSON-string path is intentional for cloud-SaaS-bound pipelines (§5.7).
 
 ### *"OTLP says I should retry rejected records — why doesn't limpid?"*
 
-OTLP doesn't say that. It says receivers can report
-`rejected_log_records` to indicate they refused some subset. The
-sender's behaviour on receiving that report is unspecified, and the
-"retry just the rejects" interpretation contradicts the
-field's terminal-state semantics. See §3.3 and §5.6.
+The specification prohibits retrying a request after a populated
+partial-success response. It supplies a rejected count, not record
+identities. limpid does not construct a new request from an inferred
+subset; its recovery policy is described in §3.3 and §5.6.
 
 ### *"Why does the source adapter author Resource attributes? OTel Collector handles this for me."*
 
-Because OTel Collector's auto-detection is correct for one common
-deployment shape and wrong for limpid's primary one (multi-source
-forwarder). See §4.1 and §5.4. If a deployment owns additional stable
-identity, add it through the post-adapter adjustment seam.
+limpid deliberately leaves source identity to the adapter for its
+multi-source forwarding use case (§4.1 and §5.4). That policy does not
+claim that the Collector's other Resource choices violate OTLP. If an
+operator owns additional stable identity, add it through an explicit
+post-adapter adjustment.
 
 ### *"Why is `received_at` not the event time?"*
 
@@ -569,15 +527,10 @@ that source-specific placement decision.
 
 ### *"limpid is not OTel-conformant because it does X / does not do Y."*
 
-There is no single "OTel-conformant" definition for a forwarder
-component. The OpenTelemetry project ships a SDK conformance suite
-(for instrumentation libraries) and a Collector receiver test suite
-(for receivers); neither targets a forwarder/relay use case. limpid
-implements the OTLP wire protocol fully and follows the spec where
-it is unambiguous (§3) and reasoned positions where it is
-ambiguous (§4 → §5). If you have a *specific* spec citation that
-limpid contradicts, that is a real bug — open an issue with the
-section reference and the wire trace.
+This page documents the supported logs transports and limpid's forwarding
+choices; it is not a blanket conformance certification. Report a suspected
+contradiction with a specific specification version, section, and wire
+trace so that the behavior can be checked against that requirement.
 
 ---
 

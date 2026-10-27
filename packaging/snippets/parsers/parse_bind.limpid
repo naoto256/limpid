@@ -27,7 +27,7 @@
 //           or use a custom parser when that assumption does not hold.
 //           Two typical bridges are shown below.
 //
-//           - file tail (most common — limpid runs on the DNS server):
+//           - file tail (limpid runs on the DNS server):
 //                 { workspace.bind = { body: ingress, pid: null, hostname: hostname(), timezone: "America/New_York" } } | parse_bind | compose_ocsf | ocsf_to_egress
 //
 //           - syslog transport (named logs via syslog instead of file):

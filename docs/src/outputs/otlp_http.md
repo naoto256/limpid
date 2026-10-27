@@ -59,7 +59,7 @@ Quoting does not bypass HTTP name restrictions.
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `peer { endpoint tls{...} }` or `peers { peer { ... } ... }` | yes (one of) | — | One or more peer blocks. See [§ peers](#peers) below. |
-| `protocol` | no | `http_protobuf` | `http_protobuf` (canonical OTLP wire form) or `http_json` (OTLP/JSON canonical mapping). |
+| `protocol` | no | `http_protobuf` | `http_protobuf` (OTLP protobuf) or `http_json` (OTLP JSON). |
 | `batch_size` | no | `1` | Flush after this many Events. `1` ships every Event immediately. |
 | `batch_timeout` | no | `5s` | Flush deferred Events after this duration. |
 | `batch_level` | no | `none` | One of `none` / `resource` / `scope`. See [§ batch_level](#batch_level). |
@@ -133,7 +133,12 @@ def pipeline otlp_relay {
 
 ## `batch_level`
 
-OTLP receivers accept an `ExportLogsServiceRequest` with multiple `ResourceLogs` entries, even when several share the same `Resource` or `(Resource, Scope)` pair. The proto3 `repeated` semantics make a "pure concat" batch (one entry per Event) and a merged batch (entries collapsed by Resource / Scope) **semantically identical** at the receiver — same set of LogRecords arrive, only the framing differs.
+The [OTLP logs schema in v1.5.0](https://github.com/open-telemetry/opentelemetry-proto/blob/v1.5.0/opentelemetry/proto/logs/v1/logs.proto)
+allows multiple ResourceLogs and ScopeLogs entries. limpid can send one
+entry per Event or share metadata between matching entries. Its grouping
+modes keep the LogRecords while changing envelope grouping. An entry with
+an empty `schema_url` may adopt a matching entry's non-empty `schema_url`,
+as described below.
 
 | `batch_level` | Wire form | CPU | Wire size |
 |---------------|-----------|-----|-----------|
@@ -154,7 +159,10 @@ for recovery and duplicate-delivery limits.
 
 ## Notes
 
-- `http_protobuf` is the canonical OTLP wire form; `http_json` serializes per the OTLP/JSON canonical mapping (camelCase, u64-as-string, bytes-as-hex).
+- `http_protobuf` uses binary protobuf. `http_json` follows the
+  [OTLP JSON mapping in v1.5.0](https://github.com/open-telemetry/opentelemetry-proto/blob/v1.5.0/docs/specification.md):
+  camelCase keys, decimal-string 64-bit integer fields, hex trace/span IDs, and
+  base64 for general bytes values.
 - `verify false` skips certificate verification — development only. limpid emits a warning once per `https://` peer at startup when `verify false` is in effect so the misconfiguration is greppable in the daemon log. Has no effect on `http://` endpoints (no TLS to verify).
 - Graceful shutdown uses a bounded final drain; see the common [disposition contract](./README.md#disposition-contract) and [shutdown guarantees and recovery limits](../operations/error-log.md#graceful-shutdown-guarantees-and-known-limitations).
 - **`partial_success.rejected_log_records` attribution is approximate.** The OTLP response reports a rejected *count* for the batch, not the identity of each rejected log record. When the rejected count is non-zero, limpid resolves the accepted prefix as `Delivered` and routes the trailing N entries (where N = `rejected_log_records`) through the common [recovery and disposition contract](./README.md#disposition-contract). A saved DLQ copy requires a configured, successful write; the tail is not unconditionally `Recovered`. Treat those DLQ entries as a batch-level rejection split into per-event records for replay, not as proof that the collector selected those exact events — the collector did not identify them. Metric totals (`events_written`, `events_failed`) are accurate; per-event attribution is not.

@@ -15,12 +15,14 @@
 //   TRACE   → 8
 //   anything else → 99 (Other)
 //
-// PATCH is not in OCSF 1.3.0's enumeration and routes to 99 (the
-// next OCSF revision is expected to add it; revisit then).
+// PATCH is not in OCSF 1.3.0's enumeration and routes to 99.
+// See https://github.com/ocsf/ocsf-schema/blob/v1.3.0/events/network/http.json
 //
-// Method strings are upstream-as-emitted (uppercase by HTTP spec).
-// Lowercase / mixed-case method strings (rare, non-compliant) fall
-// through to 99.
+// RFC 9110 section 9.1 defines method tokens as case-sensitive; uppercase
+// standard method names are a convention, not a rule for every extension.
+// This mapper recognizes the uppercase names above. Other tokens,
+// including differently cased names, fall through to 99.
+// See https://www.rfc-editor.org/rfc/rfc9110#section-9.1
 
 // Function: http_method_activity_id
 // Summary: HTTP request method → OCSF 4002 HTTP Activity `activity_id` (spec-standard enumeration, vendor-independent).

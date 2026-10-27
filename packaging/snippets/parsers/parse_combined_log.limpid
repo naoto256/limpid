@@ -26,7 +26,7 @@
 //
 // Bridges —  transport-agnostic. Three typical bridges:
 //
-//           - file tail (most common — limpid runs on the web server):
+//           - file tail (limpid runs on the web server):
 //                 { workspace.combined_log = { body: ingress, hostname: hostname() } } | parse_combined_log | compose_ocsf | ocsf_to_egress
 //
 //           - syslog transport (rsyslog forwarding access logs):

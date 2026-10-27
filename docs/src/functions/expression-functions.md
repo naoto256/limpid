@@ -186,8 +186,9 @@ these primitives are just the proto3 ↔ HashLit bridge.
 
 HashLit shape mirrors the proto3 message tree with snake_case keys
 so authors write directly against the OTLP spec. The JSON form
-applies the canonical OTLP/JSON conventions (camelCase, u64-as-string,
-bytes-as-hex) at the wire boundary.
+applies the [OTLP/JSON mapping in v1.5.0](https://github.com/open-telemetry/opentelemetry-proto/blob/v1.5.0/docs/specification.md)
+at the wire boundary: camelCase keys and decimal-string 64-bit integer fields;
+trace/span IDs use hex, while general bytes values use base64.
 
 This is the low-level function shape. Packaged pipelines use
 `parse_<source> | <source>_to_otlp | compose_otlp | otlp_to_egress`,
@@ -246,7 +247,8 @@ def process redact_pii {
 
 ### otlp.encode_resourcelog_json(hashlit) → String
 
-Encode as canonical OTLP/JSON (camelCase, u64-as-string, bytes-as-hex).
+Encode as OTLP/JSON: camelCase keys, decimal-string 64-bit integer fields, hex
+trace/span IDs, and base64 for general bytes values.
 For **standalone OTLP/JSON serialisation** — e.g. shipping OTLP/JSON
 manually through `output http` to a non-OTLP-aware HTTP receiver.
 
@@ -487,11 +489,19 @@ parse_datetime_rfc3339("2026-04-30T01:23:45.123456+00:00")
 parse_datetime_rfc3339("2026-04-30T01:23:45.123456789+0900")
 ```
 
-RFC 3339 is the strict internet-friendly profile of ISO 8601 used by RFC 5424 syslog timestamps, OTLP, OCSF `time` fields, AWS CloudTrail `eventTime`, and most modern cloud audit logs. The format is:
+[RFC 3339](https://www.rfc-editor.org/rfc/rfc3339) defines an Internet
+profile of ISO 8601, used by RFC 5424 syslog timestamps and CloudTrail
+`eventTime`. OTLP timestamps instead use epoch nanoseconds; OCSF 1.3.0
+`time` uses epoch milliseconds (see its [timestamp type](https://github.com/ocsf/ocsf-schema/blob/v1.3.0/dictionary.json)).
+Those integer wire fields are not inputs to this string parser. Its
+accepted timestamp syntax is:
 
 ```limpid
 YYYY-MM-DDTHH:MM:SS[.fractional](Z | ±HH:MM | ±HHMM)
 ```
+
+The compact `±HHMM` offset is an accepted extension; strict RFC 3339 uses
+`±HH:MM` or `Z`.
 
 All three offset forms (`Z`, `+00:00`, `+0000`) are accepted — this is what `strptime` with `%z` cannot do alone (chrono rejects the bare `Z` literal under `%z`). Sub-second precision is preserved up to nanoseconds.
 
@@ -508,7 +518,9 @@ parse_datetime_rfc2822("Thu, 30 Apr 2026 01:23:45 +0000")
 parse_datetime_rfc2822("30 Apr 2026 01:23:45 -0500")
 ```
 
-For modern internet datetimes (RFC 5424 syslog, OTLP, OCSF, cloud audit logs) use `parse_datetime_rfc3339` instead.
+For RFC 3339 text, such as RFC 5424 syslog timestamps, use
+`parse_datetime_rfc3339` instead. Convert integer epoch fields according
+to their documented unit rather than passing them to a string parser.
 
 ### timestamp()
 

@@ -253,11 +253,10 @@ Every parser's docstring records:
 Highlights (security devices / cloud audit first, server / host
 systems below):
 
-- **PAN-OS** parsers account for four wire-format quirks
-  relative to the legacy CEF documentation
-  (severity is 1-5 not 0-10, `cs1=Rule` not Threat Category,
-  `signature_id` carries the threat name not `cs2`,
-  `SourceLocation` is GeoIP not hostname).
+- **PAN-OS** parsers have separate input contracts. The CEF parser
+  expects header severity 1–5 and the threat name in `signature_id`.
+  The syslog CSV parser reads `SourceLocation` as GeoIP data, not a
+  hostname. Normalize a different export to the chosen parser's contract.
 - **ASA** verified against the miroslav-siklosi/Syslog-Generator
   synthetic corpus (5000 lines, 96 distinct message IDs); auth
   event IDs (605004 / 605005 / 611101 / 611103 / 109001 / 109005 /
