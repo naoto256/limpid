@@ -4,7 +4,10 @@ Keep the original syslog line and add searchable context before sending it direc
 
 ## Configure the Datadog destination
 
-Use an API key from the Datadog organization that should receive the logs. Both examples use **AP1**; choose the endpoint for your organization's Datadog site, not the web application's URL. JSON and OTLP have different intake hosts. See the [Send logs API](https://docs.datadoghq.com/api/latest/logs/#send-logs) and [OTLP logs intake](https://docs.datadoghq.com/opentelemetry/setup/otlp_ingest/logs/) for the corresponding endpoints and payload requirements.
+Use an API key from the Datadog organization that should receive the logs. Both examples use **AP1**; choose the endpoint for your organization's Datadog site, not the web application's URL. JSON and OTLP have different intake hosts. See the [Send logs API](https://docs.datadoghq.com/api/latest/logs/) and [OTLP logs intake](https://docs.datadoghq.com/opentelemetry/setup/otlp_ingest/logs/) for the corresponding endpoints and payload requirements.
+
+The JSON endpoint requirements summarize **Send logs** in the linked API
+reference, retrieved on 2026-10-27. Check that reference for current limits.
 
 Use the static header objects shown below. `DD_API_KEY` is not the same header as `DD-API-KEY`; the lowercase `dd-api-key` spelling in the OTLP example is equivalent because HTTP header names are case-insensitive.
 

@@ -9,6 +9,10 @@ Send logs directly to CloudWatch Logs over HTTPS. Choose a JSON document when yo
 | Payload                     | One JSON object per event | OTLP protobuf |
 | Original line in CloudWatch | `message`                 | `body`        |
 
+The authentication, structured-JSON, and OTLP endpoint requirements below
+summarize AWS documentation retrieved on 2026-10-27. Check the linked pages
+for current regional availability and service requirements.
+
 ## Prepare CloudWatch
 
 In the destination AWS account and region, create a log group such as `/applications/syslog` and a log stream such as `incoming`. Choose an appropriate retention period.

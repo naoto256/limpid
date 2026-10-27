@@ -6,31 +6,17 @@
 //
 // Azure Activity Log JSON parser
 //
-// Wire —        JSON — one Activity Log event per `ingress`. Azure emits
-//              Activity Log records in two delivery shapes (event hub
-//              vs. log analytics export):
+// Wire — One normalized Activity Log event per `ingress`, with scalar
+// category, operationName, level, resultType, resourceId, caller, and time,
+// plus the nested identity.claims and properties fields used below.
+// Azure's REST/portal, diagnostic export, and Log Analytics schemas are
+// different; their records are not interchangeable inputs to this parser.
+// An upstream consumer must unwrap batches and normalize the selected
+// export into this input shape before handing individual records to limpid.
+// The Activity Log schema reference documents this distinction.
+// https://github.com/MicrosoftDocs/azure-monitor-docs/blob/4f0f83829c037533d91bf003792e9e66d5f3a8e8/articles/azure-monitor/fundamentals/activity-log-schema.md
 //
-//                - Event Hub diagnostic settings ("Send to event hub") —
-//                  events arrive wrapped as `{"records":[{...}, ...]}`
-//                  batches. The Event Hub / Kafka / Functions consumer
-//                  upstream of limpid is expected to unwrap the array
-//                  into one record per ingress (the standard pattern
-//                  documented by Microsoft Learn "Stream Azure
-//                  monitoring data to an event hub"). Handle the
-//                  array-of-records unwrap at the transport layer,
-//                  not here.
-//                - Log Analytics export ("Send to Log Analytics" →
-//                  AzureActivity table export, or the legacy
-//                  Insights/Activity REST API) — events arrive as a
-//                  flat top-level JSON object per record, no wrapping.
-//
-//              Both shapes carry the same per-record schema (top-level
-//              `category`, `operationName`, `level`, `resultType`, `resourceId`,
-//              `caller`, `time`, plus nested `identity.claims.*` and
-//              `properties.*`). This parser reads the flat per-record
-//              form and is agnostic to which of the two delivery
-//              shapes produced it.
-//
+
 // Sample input (Administrative, user caller, write verb):
 //   {"time":"2026-04-29T10:00:00.1234567Z","resourceId":"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/RG1/PROVIDERS/MICROSOFT.COMPUTE/VIRTUALMACHINES/VM1","operationName":"MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE","category":"Administrative","level":"Informational","resultType":"Success","resultSignature":"Succeeded.","durationMs":1234,"callerIpAddress":"203.0.113.10","correlationId":"...","identity":{"authorization":{"scope":"...","action":"Microsoft.Compute/virtualMachines/write"},"claims":{"aud":"https://management.core.windows.net/","iss":"https://sts.windows.net/.../","upn":"alice@example.com","name":"Alice Example","appid":"...","ipaddr":"203.0.113.10"}},"caller":"alice@example.com","properties":{"statusCode":"Created","serviceRequestId":"..."}}
 

@@ -129,3 +129,5 @@ geoip {
 ```
 
 Requires a [MaxMind GeoLite2 City database](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data).
+This summarizes MaxMind's GeoLite2 documentation retrieved on 2026-10-27;
+check that page for current access and licensing requirements.

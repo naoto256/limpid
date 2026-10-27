@@ -74,7 +74,8 @@ This example assumes Loki is reachable locally without authentication. The loopb
 
 The original syslog header and message stay in `ingress`, so both are stored as the Loki log line. The input expects a valid syslog message, not arbitrary text. The fixed `job` label keeps stream cardinality bounded; do not turn request IDs, arbitrary messages, or client IPs into labels. Add a few stable labels only when they are useful for querying.
 
-See the [Loki HTTP API](https://grafana.com/docs/loki/latest/reference/loki-http-api/) for the JSON push format and [label guidance](https://grafana.com/docs/loki/latest/get-started/labels/) for stream design.
+The JSON push-format summary follows the Loki HTTP API documentation
+retrieved on 2026-10-27. See the [Loki HTTP API](https://grafana.com/docs/loki/latest/reference/loki-http-api/) for the JSON push format and [label guidance](https://grafana.com/docs/loki/latest/get-started/labels/) for stream design.
 
 ## Configure the receiving side
 

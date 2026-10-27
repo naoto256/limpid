@@ -61,17 +61,24 @@ def process parse_cef {
 // adapter is legitimate here — unlike the vendor severity dialects
 // (FortiGate's 1-8, PAN-OS's 1-5) that need their own adapters.
 //
-// Severity — the CEF specification defines header Severity with two
-// valid notations: an integer 0-10 reflecting event importance, grouped
-// as 0-3 Low / 4-6 Medium / 7-8 High / 9-10 Very-High, and the string
-// values Unknown / Low / Medium / High / Very-High naming those groups
-// directly. The OTel Logs Data Model defines SeverityNumber bands
+// Severity — this mapper follows the SmartConnectors 8.4.3 CEF guide
+// v26 (October 2023), Header Field Definitions: integers 0-10, grouped
+// as 0-3 Low / 4-6 Medium / 7-8 High / 9-10 Very-High, and the strings
+// Unknown / Low / Medium / High / Very-High. The SmartConnectors 24.3
+// guide v27 (July 2024) instead defines 0 as Unknown and 1-3 as Low.
+// The mapping below retains v26's treatment of 0; it is not a claim
+// that the two editions have identical severity semantics.
+// For v26, see https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors-8.4/pdfdoc/cef-implementation-standard/cef-implementation-standard.pdf
+// For v27, see https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors-24.3/pdfdoc/cef-implementation-standard/cef-implementation-standard.pdf
+// The OTel Logs Data Model v1.40.0 defines SeverityNumber bands
 // INFO 9-12 / WARN 13-16 / ERROR 17-20 / FATAL 21-24, with unspecified
 // band-internal steps available for finer source scales. The Data Model
 // appendix carries no official CEF mapping example, so this table
 // follows the Data Model body's mapping principles — place each source
 // band on a target band, order finer values inside the band, and give a
-// single band-wide value the band's smallest number:
+// single band-wide value the band's smallest number. See:
+// https://github.com/open-telemetry/opentelemetry-specification/blob/v1.40.0/specification/logs/data-model.md
+//
 //
 //   CEF band            CEF value → SeverityNumber
 //   Low       (0-3)     0 → 9   1 → 10   2 → 11   3 → 12   (INFO..INFO4)
@@ -84,7 +91,7 @@ def process parse_cef {
 //                       "Unknown" → unset (no importance claim to map)
 //
 // Low maps to INFO (not TRACE/DEBUG — CEF 0 is a least-important event,
-// not diagnostic verbosity), Very-High to FATAL; consecutive CEF values
+// not diagnostic verbosity in the v26 mapping), Very-High to FATAL; consecutive CEF values
 // take consecutive numbers from each band floor, so the integer mapping
 // is order-preserving and injective — distinct source severities remain
 // distinguishable after conversion. String values are matched exactly

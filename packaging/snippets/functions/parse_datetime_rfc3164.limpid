@@ -24,10 +24,10 @@
 //      internal device-local fallback used when the slot is unset. See each
 //      parser's guard comment for the full rationale.
 //
-// For modern senders (RFC 5424 syslog, OTLP, OCSF, AWS CloudTrail,
-// most cloud audit logs) use the built-in `parse_datetime_rfc3339`
-// directly — it accepts the `Z` literal and any numeric offset
-// transparently.
+// For RFC 3339 text (such as RFC 5424 syslog timestamps), use the
+// built-in `parse_datetime_rfc3339`. Integer epoch fields need their
+// documented unit instead: OTLP uses nanoseconds; OCSF 1.3.0 uses
+// milliseconds (ocsf-schema v1.3.0 dictionary.json timestamp_t).
 
 def function parse_datetime_rfc3164_in_timezone(text, timezone) {
     let now_ts   = timestamp()

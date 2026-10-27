@@ -98,7 +98,7 @@ The following is a **schema fragment**, not a complete AMP deployment template. 
 }
 ```
 
-Microsoft's [record-map troubleshooting guide](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/pipeline-troubleshoot#check-the-record-map-schema-mapping) documents `body`, `time_unix_nano`, and `attributes.{fieldName}` as mapping sources, and requires a mapping for `TimeGenerated`. This example explicitly uses limpid's receipt time, not the device's event time. If device event time is required, use a source adapter that parses it and retain that timestamp instead.
+Microsoft's [record-map troubleshooting guide](https://github.com/MicrosoftDocs/azure-monitor-docs/blob/4f0f83829c037533d91bf003792e9e66d5f3a8e8/articles/azure-monitor/data-collection/pipeline-troubleshoot.md#check-the-record-map-schema-mapping) documents `body`, `time_unix_nano`, and `attributes.{fieldName}` as mapping sources, and requires a mapping for `TimeGenerated`. This example explicitly uses limpid's receipt time, not the device's event time. If device event time is required, use a source adapter that parses it and retain that timestamp instead.
 
 For standard CommonSecurityLog ingestion, Microsoft's [AMP configuration guide](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/pipeline-configure-cli) documents the `Microsoft-CommonSecurityLog-FullyFormed` stream and standard-table configuration. Its fully formed path can omit explicit record mapping when the required schema is already supplied. This recipe makes a selected field contract visible; it does not claim that every AMP configuration requires an explicit map or that these selected columns alone constitute a complete standard-table schema.
 

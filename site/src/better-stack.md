@@ -2,6 +2,10 @@
 
 Send the original syslog line directly to Better Stack over HTTPS. Use JSON for a message with a few searchable fields, or OTLP for an OpenTelemetry log body, resource, and attributes. Neither route needs an intermediate collector.
 
+The setup and ingestion requirements below summarize Better Stack's
+source setup, HTTP ingestion, and OpenTelemetry documentation retrieved
+on 2026-10-27. Check the linked pages for current service requirements.
+
 ## Configure the Better Stack source
 
 In Better Stack, open **Sources** and choose **Connect source**. Give the source a name and select the platform matching the data you will send: HTTP for the JSON route, or follow the OpenTelemetry setup for OTLP. Platform selection controls automatic parsing; do not select a device-specific format merely because a syslog line is carried inside the message. See [source setup](https://betterstack.com/docs/logs/logging-start/) and [OpenTelemetry ingestion](https://betterstack.com/docs/logs/open-telemetry/).

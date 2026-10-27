@@ -27,8 +27,8 @@
 //           auditd daemon's. Extracted from the body.
 // Bridges —  transport-agnostic. Three typical bridges:
 //
-//           - file tail (most common — `audisp-syslog` writes
-//             `/var/log/audit/audit.log` and limpid tails it):
+//           - file tail (limpid reads audit records from
+//             `/var/log/audit/audit.log`):
 //                 { workspace.auditd = { body: ingress, hostname: hostname() } } | parse_auditd | compose_ocsf | ocsf_to_egress
 //
 //           - syslog transport (audispd-syslog plugin):

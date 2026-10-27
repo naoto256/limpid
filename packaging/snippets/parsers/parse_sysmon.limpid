@@ -14,9 +14,15 @@
 //           event channel (handled by `parse_winevent_json`); Sysmon
 //           is opt-in (deploy + config XML) but produces strictly
 //           richer telemetry for EDR / SIEM correlation.
-// Wire —     Sysmon events arrive as Windows Event Log records, which
-//           a forwarder (NXLog / Vector / Winlogbeat) ships as JSON.
-//           The relevant fields are —
+// Wire — This parser expects the normalized JSON fields listed below.
+//           Sysmon produces Windows Event Log records; a forwarder must
+//           translate its own export envelope to this input contract.
+//           NXLog, Vector, and Winlogbeat exports are not assumed to share
+//           these field names without configuration or normalization.
+//           The event IDs below follow Microsoft's Sysmon
+//           documentation; the JSON envelope is this parser's contract.
+//           https://github.com/MicrosoftDocs/sysinternals/blob/d46b5bfa4b1151a3dbcf568152cb56a4a9f7c032/sysinternals/downloads/sysmon.md
+//           Expected fields are —
 //             EventID        — Sysmon-specific (1=ProcessCreate,
 //                              3=NetworkConnect, 11=FileCreate, …)
 //             Channel        — "Microsoft-Windows-Sysmon/Operational"
@@ -26,7 +32,7 @@
 //                              (Image, CommandLine, ProcessId, etc.)
 // Bridges —  Sysmon JSON typically arrives via:
 //
-//           - NXLog / Vector / Winlogbeat over TCP/syslog (most common):
+//           - Normalized JSON over TCP/syslog:
 //                 process parse_syslog | {
 //                     workspace.sysmon = {
 //                         body:     parse_json(workspace.syslog.msg),

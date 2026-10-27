@@ -2,6 +2,10 @@
 
 Receive mixed syslog traffic on one TCP listener, assign separate facilities to CEF and non-CEF messages, and forward both to Azure Monitor Agent (AMA). The facility split gives the two data collection rules (DCRs) distinct filters: CEF goes to CommonSecurityLog and other syslog messages go to Syslog.
 
+The connector, facility, and listener requirements below summarize
+Microsoft's CEF/Syslog via AMA documentation retrieved on 2026-10-27.
+Check the linked pages for current agent and connector requirements.
+
 ## Configure the two DCRs
 
 AMA collection rules select syslog facilities and severity levels, both encoded in PRI. Create a DCR through each Microsoft Sentinel connector and associate both with the machine running AMA:
@@ -13,7 +17,7 @@ AMA collection rules select syslog facilities and severity levels, both encoded 
 
 The pipeline below assigns local0.info to messages containing `CEF:` and local1.info to everything else. Rewriting PRI alone does not select a table: the connector and matching DCR complete the routing. Do not also collect local0 in the Syslog DCR, or another overlapping rule, if you want to avoid duplicate collection.
 
-Microsoft documents the [facility separation and duplication risk](https://learn.microsoft.com/en-us/azure/sentinel/cef-syslog-ama-overview#data-ingestion-duplication-avoidance) and the [connector and DCR setup procedure](https://learn.microsoft.com/en-us/azure/sentinel/connect-cef-syslog-ama). In the portal, selecting LOG_INFO also includes higher-severity messages; this example deliberately rewrites every message to info.
+See **Data ingestion duplication avoidance** in Microsoft's [CEF/Syslog overview](https://learn.microsoft.com/en-us/azure/sentinel/cef-syslog-ama-overview) for facility separation, and the [connector and DCR setup guide](https://learn.microsoft.com/en-us/azure/sentinel/connect-cef-syslog-ama) for configuration. In the portal, selecting LOG_INFO also includes higher-severity messages; this example deliberately rewrites every message to info.
 
 ## Forward through a disk-backed queue
 

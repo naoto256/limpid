@@ -71,7 +71,7 @@ Keep `batch_size 1` for this configuration: each event already contains its acti
 
 ### HTTP success is not per-document success
 
-Elasticsearch can return HTTP 200 with `errors: true` and failed entries in `items`. limpid's generic HTTP output checks the HTTP status; it does **not** interpret Elasticsearch's item-level results. A mapping rejection can therefore be acknowledged at the transport layer without the document being indexed. A disk queue does not close that gap. Where per-document recovery is required, use a Bulk-aware ingestion component and monitor rejected items. See the [Bulk API response contract](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-bulk).
+Elasticsearch can return HTTP 200 with `errors: true` and failed entries in `items`. limpid's generic HTTP output checks the HTTP status; it does **not** interpret Elasticsearch's item-level results. A mapping rejection can therefore be acknowledged at the transport layer without the document being indexed. A disk queue does not close that gap. Where per-document recovery is required, use a Bulk-aware ingestion component and monitor rejected items. See the [Bulk API response contract](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-bulk) (API reference retrieved on 2026-10-27).
 
 ### Parse FortiGate fields before indexing
 

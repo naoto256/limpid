@@ -12,14 +12,19 @@
 //           The de-facto OSS pair with Zeek for network detection +
 //           protocol telemetry.
 // Wire —     One JSON object per line. Every event has top-level
-//           `timestamp` (RFC 3339 with TZ offset), `event_type`
+//           `timestamp` (EVE event time), `event_type`
 //           (`alert` / `dns` / `http` / `tls` / `flow` / `fileinfo` /
 //           `dhcp` / `smb` / `ssh` / `ftp` / `smtp` / `stats` / …),
 //           and 5-tuple fields when applicable (`src_ip`, `src_port`,
 //           `dest_ip`, `dest_port`, `proto`). The type-specific
 //           payload lives under a sub-object named after the
 //           event_type (e.g. `alert.signature`, `dns.rrname`,
-//           `http.url`). See https://docs.suricata.io/en/latest/output/eve/eve-json-format.html
+//           `http.url`). Suricata 7.0.7 documents offsets such as +0100,
+//           which are not the colon-separated offsets of strict RFC 3339.
+//           Some documented examples also omit the offset. Do not assume
+//           every EVE timestamp is accepted by the RFC 3339 primitive;
+//           check or normalize the timestamp form of your chosen export.
+//           See https://docs.suricata.io/en/suricata-7.0.7/output/eve/eve-json-format.html
 // Bridges —  Suricata typically writes EVE to a JSONL file
 //           (`/var/log/suricata/eve.json`) or ships it over syslog.
 //
