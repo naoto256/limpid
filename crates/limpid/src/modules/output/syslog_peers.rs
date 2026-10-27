@@ -542,6 +542,30 @@ impl RotatingPeers {
         start
     }
 
+    /// Select an eligible peer for this batch, retaining cooldown preference
+    /// and fallback without ever revisiting a permanently failed peer.
+    pub async fn select_excluding(&self, excluded: &[usize]) -> Option<usize> {
+        if excluded.is_empty() {
+            return Some(self.select().await);
+        }
+        let n = self.cooldown_until.len();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let now = Instant::now();
+        let mut fallback = None;
+        for offset in 0..n {
+            let candidate = (start + offset) % n;
+            if excluded.contains(&candidate) {
+                continue;
+            }
+            fallback.get_or_insert(candidate);
+            let guard = self.cooldown_until[candidate].lock().await;
+            if guard.is_none_or(|until| until <= now) {
+                return Some(candidate);
+            }
+        }
+        fallback
+    }
+
     /// Reset the peer's cooldown so future selections pick it freely.
     pub async fn mark_success(&self, idx: usize) {
         *self.cooldown_until[idx].lock().await = None;

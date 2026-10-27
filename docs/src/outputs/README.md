@@ -44,6 +44,50 @@ def output reliable {
 
 `retry` is accepted by every output type. Retry-exhausted payloads are saved to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below) only when configured and successfully written. When `error_log` is unset, ordinary retry-exhaustion recovery emits a payload-free error summary and resolves as `Recovered`; ambiguous shutdown recovery instead holds disk-queue positions as `Dropped` (see the disposition contract below) — `events_failed` counts every terminal failure once, disk vs memory queue agnostic. An operator who wants payload metadata or the full JSONL on the tracing side opts in explicitly via `control { error_log_fallback "meta" | "full" }`; that setting only takes effect when `error_log` is also configured (see [Recovery (error_log)](#recovery-error_log) for the ladder).
 
+### HTTP and OTLP failure classification
+
+`http` and `otlp_http` retry connection failures, timeouts, and HTTP 429,
+502, 503, or 504. Other unsuccessful status codes, including other 4xx/5xx
+and disallowed redirects, permanently exclude that peer for the current
+batch. Another configured peer is tried immediately, without a backoff
+sleep or spending the transient retry budget. A permanent response does
+not prevent that peer from receiving future batches.
+
+`otlp_grpc` retries CANCELLED, DEADLINE_EXCEEDED, ABORTED, OUT_OF_RANGE,
+UNAVAILABLE, and DATA_LOSS. RESOURCE_EXHAUSTED is retryable only with
+`google.rpc.RetryInfo`; other statuses permanently exclude that peer for
+the current batch. See the gRPC and HTTP **Failures** sections of the
+[OTLP specification in opentelemetry-proto v1.5.0](https://github.com/open-telemetry/opentelemetry-proto/blob/v1.5.0/docs/specification.md).
+These rules classify a response from one peer. Trying another configured
+peer after a permanent failure is limpid's failover policy, rather than
+an additional requirement imposed by that specification.
+
+For retryable HTTP responses, `Retry-After` accepts seconds or an HTTP-date.
+For retryable gRPC statuses, `RetryInfo.retry_delay` supplies the delay.
+A valid delay replaces the next backoff sleep, capped by `retry.max_wait`.
+Past dates and zero delays allow an immediate retry. For a failure already
+classified as retryable, absent or malformed delay hints use configured
+backoff. RESOURCE_EXHAUSTED without decodable `RetryInfo` is permanent,
+so it does not reach that fallback. Hints cannot extend the attempt budget,
+and shutdown still interrupts retry sleeps. Permanent failures do not
+honor retry hints or retry the same peer within that batch, even if a
+later peer fails transiently and triggers another send round.
+
+The batch goes to recovery when every peer has failed permanently, or
+a retryable failure exhausts `retry.max_attempts`. The budget counts send
+rounds ending in a retryable failure, including the initial round;
+immediate failover past permanent responses can contact additional peers
+within one round. Shutdown uses one bounded send round, allowing permanent
+failover within the existing overall deadline but no transient retries.
+Recovery after every peer fails permanently uses the same error-log,
+fallback, and queue-disposition rules as exhausted retries. A shutdown
+send that is cancelled or times out leaves delivery ambiguous; see the
+[disposition contract](#disposition-contract). Each permanent peer failure emits a warning
+with the peer index and full cause chain, even if failover later succeeds.
+If every peer fails permanently, the recovery reason includes each peer's
+permanent failure summary. HTTP 400, 408, and 500, for example, visit each
+peer at most once per batch while preserving failover to healthy peers.
+
 ### Disposition contract
 
 Every event handed to an output resolves to one of three dispositions:
@@ -92,7 +136,7 @@ nothing. See [output recovery](../operations/error-log.md#output-flavor).
 
 The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) block names a JSONL file that catches payloads the queue/retry chain could not place. Three sink-side paths feed it as Output-flavor records (`kind: "output"`):
 
-- the output's `retry { ... }` budget was exhausted,
+- the output's `retry { ... }` budget was exhausted, or every configured HTTP/OTLP peer failed permanently,
 - a batched output (`http`, `otlp_http`, `otlp_grpc`) failed to flush its remaining buffer during **graceful shutdown** (one record per still-parked event; see the shutdown caveat below), or exited through the fail-stop wedge with parked buffer entries (one ambiguous-disposition record per parked event),
 - the runtime could not hand an event to the output's queue at the pipeline → output boundary (queue closed, disk-queue write error, unknown output).
 

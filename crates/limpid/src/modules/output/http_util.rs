@@ -107,9 +107,117 @@ pub(crate) async fn error_snippet(
     }
 }
 
+/// Request construction errors are deterministic; connection and timeout
+/// failures can recover. Preserve diagnostic context without losing policy.
+pub(crate) fn request_error(error: reqwest::Error, context: String) -> super::batched::SendError {
+    let permanent = error.is_builder();
+    let error = anyhow::Error::new(error).context(context);
+    if permanent {
+        super::batched::SendError::Permanent(error)
+    } else {
+        super::batched::SendError::retryable(error)
+    }
+}
+
+/// OTLP retryable HTTP statuses, also used by the generic HTTP output.
+/// All other unsuccessful responses, including redirects, are terminal.
+pub(crate) fn status_error(
+    status: reqwest::StatusCode,
+    retry_after: Option<std::time::Duration>,
+    error: anyhow::Error,
+) -> super::batched::SendError {
+    if matches!(status.as_u16(), 429 | 502 | 503 | 504) {
+        super::batched::SendError::Retryable { error, retry_after }
+    } else {
+        super::batched::SendError::Permanent(error)
+    }
+}
+
+/// Parse both Retry-After forms. The flusher clamps hints to max_wait.
+/// Invalid hints fall back to exponential backoff; past dates mean zero.
+pub(crate) fn retry_after(
+    headers: &reqwest::header::HeaderMap,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        let seconds = value.parse::<u64>().unwrap_or(u64::MAX);
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    Some(date.duration_since(now).unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::output::batched::SendError;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn deterministic_request_build_errors_are_permanent() {
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .header("x-test", "invalid\nvalue")
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            request_error(error, "invalid request".to_string()),
+            SendError::Permanent(_)
+        ));
+    }
+
+    #[test]
+    fn http_status_classification_matches_otlp() {
+        for code in 300..600 {
+            let error = status_error(
+                reqwest::StatusCode::from_u16(code).unwrap(),
+                Some(Duration::from_secs(9)),
+                anyhow::anyhow!("response failed"),
+            );
+            if matches!(code, 429 | 502 | 503 | 504) {
+                assert!(
+                    matches!(error, SendError::Retryable { retry_after: Some(d), .. }
+                    if d == Duration::from_secs(9)),
+                    "{code}"
+                );
+            } else {
+                assert!(matches!(error, SendError::Permanent(_)), "{code}");
+            }
+        }
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let parse = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+            retry_after(&headers, now)
+        };
+        assert_eq!(parse("25"), Some(Duration::from_secs(25)));
+        assert_eq!(parse("0"), Some(Duration::ZERO));
+        assert_eq!(
+            parse("99999999999999999999999999"),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        assert_eq!(
+            parse(&httpdate::fmt_http_date(now + Duration::from_secs(30))),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse(&httpdate::fmt_http_date(now - Duration::from_secs(30))),
+            Some(Duration::ZERO)
+        );
+        for bad in ["", "soon", "-1", "+1", "1.5"] {
+            assert_eq!(parse(bad), None);
+        }
+        assert_eq!(retry_after(&reqwest::header::HeaderMap::new(), now), None);
+    }
 
     fn snippet(location: &str) -> String {
         let mut headers = reqwest::header::HeaderMap::new();

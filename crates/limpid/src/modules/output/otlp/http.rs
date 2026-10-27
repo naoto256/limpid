@@ -59,7 +59,9 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::output::batched::{BatchSinkPolicy, BatchedSink, SendOutcome};
+use crate::modules::output::batched::{
+    BatchSinkPolicy, BatchedSink, SendError, SendOutcome, SendState, send_with_peer_failover,
+};
 use crate::modules::output::http_util::{
     ERROR_BODY_BYTE_CAP, error_snippet, location_snippet, read_body_capped,
 };
@@ -506,18 +508,16 @@ impl BatchSinkPolicy for OtlpHttpSinkPolicy {
     /// (cooldown is measured from failure time so a slow 30s
     /// HTTP_REQUEST_TIMEOUT failure cannot record an already-expired
     /// cooldown).
-    async fn send(&self, req: &ExportLogsServiceRequest) -> Result<SendOutcome> {
-        let idx = self.rotation.select().await;
-        match send_once(&self.peers[idx], self, req).await {
-            Ok(outcome) => {
-                self.rotation.mark_success(idx).await;
-                Ok(outcome)
-            }
-            Err(e) => {
-                self.rotation.mark_failure(idx).await;
-                Err(e)
-            }
-        }
+    async fn send(
+        &self,
+        req: &ExportLogsServiceRequest,
+        state: &mut SendState,
+    ) -> Result<SendOutcome, SendError> {
+        let outcome = send_with_peer_failover(&self.rotation, state, |idx| {
+            send_once(&self.peers[idx], self, req)
+        })
+        .await?;
+        Ok(outcome)
     }
 }
 
@@ -525,16 +525,18 @@ async fn send_once(
     peer: &HttpPeer,
     policy: &OtlpHttpSinkPolicy,
     req: &ExportLogsServiceRequest,
-) -> Result<SendOutcome> {
+) -> Result<SendOutcome, SendError> {
     let body = match policy.protocol {
         HttpProtocol::Protobuf => {
             let mut buf = Vec::with_capacity(req.encoded_len());
-            req.encode(&mut buf)
-                .map_err(|e| anyhow!("output otlp_http: protobuf encode failed: {e}"))?;
+            req.encode(&mut buf).map_err(|e| {
+                SendError::permanent(anyhow!("output otlp_http: protobuf encode failed: {e}"))
+            })?;
             buf
         }
-        HttpProtocol::Json => serde_json::to_vec(req)
-            .map_err(|e| anyhow!("output otlp_http: JSON encode failed: {e}"))?,
+        HttpProtocol::Json => serde_json::to_vec(req).map_err(|e| {
+            SendError::permanent(anyhow!("output otlp_http: JSON encode failed: {e}"))
+        })?,
     };
     let body_len = body.len();
     let mut http_req = peer
@@ -545,10 +547,12 @@ async fn send_once(
     for (k, v) in &policy.headers {
         http_req = http_req.header(k, v);
     }
-    let resp = http_req
-        .send()
-        .await
-        .with_context(|| format!("output otlp_http: POST {} failed", peer.endpoint))?;
+    let resp = http_req.send().await.map_err(|error| {
+        super::super::http_util::request_error(
+            error,
+            format!("output otlp_http: POST {} failed", peer.endpoint),
+        )
+    })?;
     policy.metrics.bytes_written.inc_by(body_len as u64);
     let status = resp.status();
     if !status.is_success() {
@@ -557,14 +561,20 @@ async fn send_once(
         // line; gzip / brotli / deflate get a placeholder so the
         // daemon log doesn't fill with replacement-char soup (limpid's
         // reqwest is built without those decompression features).
+        let delay =
+            super::super::http_util::retry_after(resp.headers(), std::time::SystemTime::now());
         let snippet = error_snippet(resp, ERROR_BODY_BYTE_CAP, 500).await;
-        bail!(
-            "output otlp_http: {} returned HTTP {}{} — {}",
-            peer.endpoint,
-            status.as_u16(),
-            location,
-            snippet
-        );
+        return Err(super::super::http_util::status_error(
+            status,
+            delay,
+            anyhow!(
+                "output otlp_http: {} returned HTTP {}{} — {}",
+                peer.endpoint,
+                status.as_u16(),
+                location,
+                snippet
+            ),
+        ));
     }
     // Parse the response body for `partial_success.rejected_log_records`.
     // The OTLP/HTTP spec guarantees the body is an
@@ -1310,7 +1320,7 @@ def output test {{
         use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
 
         async fn fail(_: axum::body::Bytes) -> impl IntoResponse {
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::SERVICE_UNAVAILABLE
         }
         async fn ok(_: axum::body::Bytes) -> impl IntoResponse {
             StatusCode::OK
@@ -2209,7 +2219,56 @@ def output test {{
             "constructor must store the exact Arc passed in"
         );
     }
-
+    #[tokio::test]
+    async fn response_status_and_retry_after_reach_typed_send_result() {
+        use axum::{Router, http::StatusCode, routing::post};
+        for code in [400, 401, 408, 429, 500, 502, 503, 504] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/",
+                post(move || async move {
+                    (
+                        StatusCode::from_u16(code).unwrap(),
+                        [("retry-after", "9")],
+                        "rejected",
+                    )
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let mut properties = one_peer_props(&format!("http://{addr}/"));
+            properties.push(prop_str("protocol", "http_protobuf"));
+            let output = OtlpHttpOutput::from_properties(
+                "retry-test",
+                &mp(&properties),
+                &crate::modules::BuildContext::for_testing(),
+            )
+            .unwrap();
+            let result = output
+                .sink
+                .inner
+                .policy
+                .send(
+                    &ExportLogsServiceRequest::default(),
+                    &mut SendState::default(),
+                )
+                .await;
+            let error = result.unwrap_err();
+            if matches!(code, 429 | 502 | 503 | 504) {
+                assert!(
+                    matches!(error, SendError::Retryable { retry_after: Some(delay), .. }
+                    if delay == Duration::from_secs(9)),
+                    "{code}"
+                );
+            } else {
+                assert!(matches!(error, SendError::Permanent(_)), "{code}");
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
     #[tokio::test]
     async fn redirects_fail_without_forwarding_and_preserve_events_in_dlq() {
         use axum::{Router, http::StatusCode, routing::any};

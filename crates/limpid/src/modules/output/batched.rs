@@ -169,6 +169,89 @@ pub(crate) struct SendOutcome {
     pub rejected: u64,
 }
 
+/// Whether another attempt can change the outcome. Transports classify
+/// protocol status while the shared flusher owns bounded retry pacing.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SendError {
+    #[error("{0:#}")]
+    Permanent(#[source] anyhow::Error),
+    #[error("{error:#}")]
+    Retryable {
+        #[source]
+        error: anyhow::Error,
+        retry_after: Option<Duration>,
+    },
+}
+
+impl SendError {
+    pub(crate) fn retryable(error: impl Into<anyhow::Error>) -> Self {
+        Self::Retryable {
+            error: error.into(),
+            retry_after: None,
+        }
+    }
+
+    pub(crate) fn permanent(error: impl Into<anyhow::Error>) -> Self {
+        Self::Permanent(error.into())
+    }
+}
+
+/// Per-batch peer exclusions survive retryable attempts but never leak
+/// into the next batch. The actor owns this state alongside the prepared body.
+#[derive(Default)]
+pub(crate) struct SendState {
+    permanently_failed: Vec<usize>,
+    permanent_errors: Vec<String>,
+}
+
+/// Permanent failures skip that peer for this batch and immediately try
+/// another. Retryable failures return to the actor for bounded pacing.
+pub(crate) async fn send_with_peer_failover<T, F, Fut>(
+    rotation: &super::syslog_peers::RotatingPeers,
+    state: &mut SendState,
+    mut send: F,
+) -> Result<T, SendError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<T, SendError>>,
+{
+    let mut idx = rotation
+        .select_excluding(&state.permanently_failed)
+        .await
+        .ok_or_else(|| SendError::permanent(anyhow::anyhow!("all peers failed permanently")))?;
+    loop {
+        match send(idx).await {
+            Ok(outcome) => {
+                rotation.mark_success(idx).await;
+                return Ok(outcome);
+            }
+            Err(SendError::Permanent(error)) => {
+                tracing::warn!(
+                    "batched output peer {idx} failed permanently: {error:#}; excluding this peer for the current batch"
+                );
+                state
+                    .permanent_errors
+                    .push(format!("peer {idx}: {error:#}"));
+                rotation.mark_failure(idx).await;
+                state.permanently_failed.push(idx);
+                match rotation.select_excluding(&state.permanently_failed).await {
+                    Some(next) => idx = next,
+                    None => {
+                        return Err(SendError::permanent(error.context(format!(
+                            "all peers failed permanently: {}",
+                            state.permanent_errors.join("; "),
+                        ))));
+                    }
+                }
+            }
+            Err(error @ SendError::Retryable { .. }) => {
+                rotation.mark_failure(idx).await;
+                return Err(error);
+            }
+        }
+    }
+}
+
 /// The per-transport surface of a batched output. Everything the
 /// skeleton cannot know: payload rendering, batch preparation, and
 /// one send attempt (including peer selection + cooldown, typically
@@ -196,10 +279,14 @@ pub(crate) trait BatchSinkPolicy: Send + Sync + 'static {
     /// is deterministic, so re-attempting it cannot succeed).
     fn prepare(&self, payloads: Vec<Self::Payload>) -> Result<Self::Prepared>;
 
-    /// One send attempt. Retry pacing, shutdown races, and disposition
-    /// handling belong to the skeleton — implementations just pick a
-    /// peer, ship, and record peer cooldown state.
-    async fn send(&self, prepared: &Self::Prepared) -> Result<SendOutcome>;
+    /// One send round, including immediate failover past permanent
+    /// responses. The batch's state excludes those peers on later rounds.
+    /// Transient retry pacing, shutdown races and disposition remain here.
+    async fn send(
+        &self,
+        prepared: &Self::Prepared,
+        state: &mut SendState,
+    ) -> Result<SendOutcome, SendError>;
 }
 
 /// Batched-output skeleton: buffer + flusher actor + shutdown
@@ -742,8 +829,10 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
     /// has its disposition committed before this returns. Render
     /// failures route the offending event to DLQ on its own
     /// (resolve_recovered); the rest proceed to the send loop.
-    /// Transport failures consume the per-flush retry budget; on
-    /// exhaust the whole shippable subset is routed to DLQ.
+    /// Retryable failures consume the per-flush retry budget. Permanent
+    /// peer failures skip to another peer without retrying that peer;
+    /// exhaustion of all peers or the transient budget routes the full
+    /// shippable subset to the DLQ.
     async fn flush_events(&self, batch: Vec<ParkedEvent>) {
         if batch.is_empty() {
             return;
@@ -775,6 +864,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 return;
             }
         };
+        let mut send_state = SendState::default();
         let mut attempt = 0u32;
         let mut wait = self.retry.initial_wait;
         // Distinguishes "retry budget exhausted, transport reported
@@ -788,6 +878,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         // that lets a partial-wire success be replayed and
         // double-delivered.
         let mut shutdown_cancelled_send = false;
+        let mut permanent_failure = false;
         let final_err = loop {
             // Race the transport against the shutdown signal. A
             // stalled peer (= TCP accepted but never responds) holds
@@ -802,7 +893,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
             // forces Dropped rather than Recovered.
             let send_outcome = tokio::select! {
                 biased;
-                res = self.policy.send(&prepared) => Some(res),
+                res = self.policy.send(&prepared, &mut send_state) => Some(res),
                 _ = self.wait_until_shutdown() => None,
             };
             match send_outcome {
@@ -817,7 +908,15 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                         "shutdown cancelled in-flight send (collapsed retry budget)"
                     );
                 }
-                Some(Err(e)) => {
+                Some(Err(SendError::Permanent(error))) => {
+                    attempt += 1;
+                    permanent_failure = true;
+                    break error;
+                }
+                Some(Err(SendError::Retryable {
+                    error: e,
+                    retry_after,
+                })) => {
                     attempt += 1;
                     self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
@@ -834,14 +933,15 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     if self.is_shutting_down.load(Ordering::Acquire) {
                         break e;
                     }
+                    let retry_wait = retry_after.unwrap_or(wait).min(self.retry.max_wait);
                     tracing::warn!(
-                        "{} '{}': flush attempt {}/{} failed: {} — retrying in {:?}",
+                        "{} '{}': flush attempt {}/{} failed: {:#} — retrying in {:?}",
                         self.policy.kind(),
                         self.name,
                         attempt,
                         self.retry.max_attempts,
                         e,
-                        wait
+                        retry_wait
                     );
                     // Race the sleep against a shutdown wake. The
                     // bare check before the sleep only catches a
@@ -870,7 +970,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     // pacing survives incoming traffic; only shutdown
                     // is allowed to short-circuit it.
                     tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
+                        _ = tokio::time::sleep(retry_wait) => {}
                         _ = self.wait_until_shutdown() => {}
                     }
                     wait = self.retry.next_wait(wait);
@@ -909,7 +1009,12 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
             )
             .await;
         } else {
-            let reason = format!("flush failed after {} attempts: {}", attempt, final_err);
+            let reason = if permanent_failure {
+                let unit = if attempt == 1 { "attempt" } else { "attempts" };
+                format!("flush failed: permanent failure after {attempt} {unit}: {final_err:#}")
+            } else {
+                format!("flush failed after {attempt} attempts: {final_err:#}")
+            };
             for (ev, ack, _permit) in shippable {
                 let __dlq_outcome = crate::modules::route_event_to_dlq(
                     self.error_log.as_ref(),
@@ -978,7 +1083,9 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
             .await;
             return;
         }
-        let send_outcome = tokio::time::timeout(remaining, self.policy.send(&prepared)).await;
+        let mut send_state = SendState::default();
+        let send_outcome =
+            tokio::time::timeout(remaining, self.policy.send(&prepared, &mut send_state)).await;
         match send_outcome {
             Ok(Ok(outcome)) => {
                 self.resolve_send_success(shippable, outcome).await;
@@ -1021,6 +1128,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
 
 #[cfg(test)]
 mod tests {
+    use super::{SendState, send_with_peer_failover};
     use std::collections::VecDeque;
     use std::future;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1031,7 +1139,7 @@ mod tests {
     use anyhow::Result;
     use bytes::Bytes;
 
-    use super::{BatchSinkPolicy, BatchedSink, SendOutcome, flusher_actor_loop};
+    use super::{BatchSinkPolicy, BatchedSink, SendError, SendOutcome, flusher_actor_loop};
     use crate::error_log::ErrorLogFallback;
     use crate::event::Event;
     use crate::metrics::OutputMetrics;
@@ -1041,12 +1149,15 @@ mod tests {
     enum SendAction {
         Success,
         Fail,
+        PermanentFailure,
+        RetryAfter(Duration),
         Pending,
     }
 
     #[derive(Default)]
     struct RecordingState {
         requests: Vec<Vec<usize>>,
+        attempt_times: Vec<tokio::time::Instant>,
         actions: VecDeque<SendAction>,
     }
 
@@ -1060,6 +1171,7 @@ mod tests {
             Self {
                 state: Arc::new(StdMutex::new(RecordingState {
                     requests: Vec::new(),
+                    attempt_times: Vec::new(),
                     actions: actions.into_iter().collect(),
                 })),
             }
@@ -1088,15 +1200,32 @@ mod tests {
             Ok(payloads)
         }
 
-        async fn send(&self, prepared: &Self::Prepared) -> Result<SendOutcome> {
+        async fn send(
+            &self,
+            prepared: &Self::Prepared,
+            _state: &mut SendState,
+        ) -> Result<SendOutcome, SendError> {
             let action = {
                 let mut state = self.state.lock().expect("recording policy state");
                 state.requests.push(prepared.clone());
+                state.attempt_times.push(tokio::time::Instant::now());
                 state.actions.pop_front().unwrap_or(SendAction::Success)
             };
             match action {
                 SendAction::Success => Ok(SendOutcome::default()),
-                SendAction::Fail => anyhow::bail!("scripted transport failure"),
+                SendAction::Fail => Err(SendError::retryable(anyhow::anyhow!(
+                    "scripted transport failure"
+                ))),
+                SendAction::PermanentFailure => Err(SendError::permanent(
+                    anyhow::anyhow!(tonic::Status::invalid_argument(
+                        "scripted permanent failure"
+                    ))
+                    .context("scripted export failed"),
+                )),
+                SendAction::RetryAfter(delay) => Err(SendError::Retryable {
+                    error: anyhow::anyhow!("scripted throttle"),
+                    retry_after: Some(delay),
+                }),
                 SendAction::Pending => future::pending().await,
             }
         }
@@ -1469,5 +1598,131 @@ mod tests {
                 .contains("route_shutdown_batch_ambiguous_to_dlq("),
             "flush_events_at_shutdown Elapsed arm must call the ambiguous DLQ helper"
         );
+    }
+    #[test]
+    fn retry_hints_override_backoff_and_are_capped() {
+        for (first, expected) in [
+            (
+                SendAction::RetryAfter(Duration::from_secs(3600)),
+                Duration::from_secs(5),
+            ),
+            (SendAction::RetryAfter(Duration::ZERO), Duration::ZERO),
+            (SendAction::Fail, Duration::from_secs(2)),
+        ] {
+            let policy = RecordingPolicy::with_actions([first, SendAction::Success]);
+            let state = Arc::clone(&policy.state);
+            let sink = sink_without_actor_with(
+                1,
+                policy,
+                RetryConfig {
+                    max_attempts: 3,
+                    initial_wait: Duration::from_secs(2),
+                    max_wait: Duration::from_secs(5),
+                    ..RetryConfig::default()
+                },
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (ack, receiver) = QueueAckHandle::for_test();
+                sink.inner.flush_events(vec![(event(0), ack, None)]).await;
+                assert_delivered_once(vec![receiver]).await;
+                let state = state.lock().unwrap();
+                assert_eq!(state.requests.len(), 2);
+                assert_eq!(state.attempt_times[1] - state.attempt_times[0], expected);
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_peer_exclusions_survive_transient_retries() {
+        let rotation = crate::modules::output::syslog_peers::RotatingPeers::new(3);
+        let mut state = SendState::default();
+        let calls = std::sync::Mutex::new(Vec::new());
+        let mut transient_attempts = 0;
+        for attempt in 0..3 {
+            let result = send_with_peer_failover(&rotation, &mut state, |idx| {
+                calls.lock().unwrap().push(idx);
+                let outcome = if idx == 1 {
+                    transient_attempts += 1;
+                    if transient_attempts == 3 {
+                        Ok(())
+                    } else {
+                        Err(SendError::retryable(anyhow::anyhow!("temporary")))
+                    }
+                } else {
+                    Err(SendError::permanent(anyhow::anyhow!("permanent")))
+                };
+                std::future::ready(outcome)
+            })
+            .await;
+            if attempt < 2 {
+                assert!(matches!(result, Err(SendError::Retryable { .. })));
+            } else {
+                result.unwrap();
+            }
+        }
+        assert_eq!(*calls.lock().unwrap(), [0, 1, 2, 1, 1]);
+        assert_eq!(state.permanently_failed, [0, 2]);
+    }
+
+    #[test]
+    fn permanent_failure_reaches_dlq_without_retry_or_wait() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("permanent.jsonl");
+        let policy = RecordingPolicy::with_actions([SendAction::PermanentFailure]);
+        let state = Arc::clone(&policy.state);
+        let metrics = OutputMetrics::for_testing();
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
+        let sink = BatchedSink::new(
+            policy,
+            "permanent-test",
+            1,
+            Duration::from_secs(60),
+            RetryConfig {
+                max_attempts: 5,
+                initial_wait: Duration::from_secs(3600),
+                ..RetryConfig::default()
+            },
+            Some(Arc::new(crate::error_log::ErrorLogWriter::new(
+                path.clone(),
+            ))),
+            ErrorLogFallback::Off,
+            Arc::clone(&metrics),
+            shutdown_rx,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let original = event(0);
+            let (ack, receiver) = QueueAckHandle::for_test();
+            let before = tokio::time::Instant::now();
+            sink.inner
+                .flush_events(vec![(original.clone(), ack, None)])
+                .await;
+            assert_dispositions_once(vec![receiver], &[AckDisposition::Recovered]).await;
+            assert_eq!(tokio::time::Instant::now() - before, Duration::ZERO);
+            assert_eq!(state.lock().unwrap().requests.len(), 1);
+            assert_eq!(metrics.retries.load(Ordering::Relaxed), 0);
+            assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 1);
+            let contents = tokio::fs::read_to_string(path).await.unwrap();
+            let record: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+            assert_eq!(
+                record["event"]["key"],
+                original.key().hyphenated().to_string()
+            );
+            let reason = record["reason"].as_str().unwrap();
+            assert!(reason.starts_with("flush failed: permanent failure after 1 attempt: "));
+            assert!(reason.contains("scripted export failed"));
+            assert!(reason.contains(
+                &tonic::Status::invalid_argument("scripted permanent failure").to_string()
+            ));
+        });
     }
 }

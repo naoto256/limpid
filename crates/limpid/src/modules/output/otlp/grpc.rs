@@ -61,7 +61,9 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::output::batched::{BatchSinkPolicy, BatchedSink, SendOutcome};
+use crate::modules::output::batched::{
+    BatchSinkPolicy, BatchedSink, SendError, SendOutcome, SendState, send_with_peer_failover,
+};
 use crate::modules::output::syslog_peers::{RotatingPeers, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
@@ -385,19 +387,49 @@ impl BatchSinkPolicy for OtlpGrpcSinkPolicy {
     /// (cooldown is measured from failure time so a slow 30s
     /// GRPC_REQUEST_TIMEOUT failure cannot record an already-expired
     /// cooldown).
-    async fn send(&self, req: &ExportLogsServiceRequest) -> Result<SendOutcome> {
-        let idx = self.rotation.select().await;
-        match send_once(&self.peers[idx], self, req).await {
-            Ok(outcome) => {
-                self.metrics.bytes_written.inc_by(req.encoded_len() as u64);
-                self.rotation.mark_success(idx).await;
-                Ok(outcome)
-            }
-            Err(e) => {
-                self.rotation.mark_failure(idx).await;
-                Err(e)
-            }
-        }
+    async fn send(
+        &self,
+        req: &ExportLogsServiceRequest,
+        state: &mut SendState,
+    ) -> Result<SendOutcome, SendError> {
+        let outcome = send_with_peer_failover(&self.rotation, state, |idx| {
+            send_once(&self.peers[idx], self, req)
+        })
+        .await?;
+        self.metrics.bytes_written.inc_by(req.encoded_len() as u64);
+        Ok(outcome)
+    }
+}
+
+fn classify_status(status: tonic::Status, endpoint: &str) -> SendError {
+    use tonic::Code;
+    use tonic_types::StatusExt;
+    let info = status.get_details_retry_info();
+    let retryable = match status.code() {
+        Code::Cancelled
+        | Code::DeadlineExceeded
+        | Code::Aborted
+        | Code::OutOfRange
+        | Code::Unavailable
+        | Code::DataLoss => true,
+        Code::ResourceExhausted => info.is_some(),
+        Code::Ok
+        | Code::Unknown
+        | Code::InvalidArgument
+        | Code::NotFound
+        | Code::AlreadyExists
+        | Code::PermissionDenied
+        | Code::Unauthenticated
+        | Code::FailedPrecondition
+        | Code::Unimplemented
+        | Code::Internal => false,
+    };
+    let retry_after = info.and_then(|info| info.retry_delay);
+    let error = anyhow!(status).context(format!("output otlp_grpc: export to {} failed", endpoint));
+    if retryable {
+        SendError::Retryable { error, retry_after }
+    } else {
+        SendError::Permanent(error)
     }
 }
 
@@ -405,7 +437,7 @@ async fn send_once(
     peer: &GrpcPeer,
     policy: &OtlpGrpcSinkPolicy,
     req: &ExportLogsServiceRequest,
-) -> Result<SendOutcome> {
+) -> Result<SendOutcome, SendError> {
     let mut client = LogsServiceClient::new(peer.channel.clone());
     let mut request = tonic::Request::new(req.clone());
     let metadata = request.metadata_mut();
@@ -436,13 +468,13 @@ async fn send_once(
     let response = tokio::time::timeout(GRPC_REQUEST_TIMEOUT, client.export(request))
         .await
         .map_err(|_| {
-            anyhow!(
+            SendError::retryable(anyhow!(
                 "output otlp_grpc: export to {} timed out after {:?}",
                 peer.endpoint,
                 GRPC_REQUEST_TIMEOUT
-            )
+            ))
         })?
-        .with_context(|| format!("output otlp_grpc: export to {} failed", peer.endpoint))?;
+        .map_err(|status| classify_status(status, &peer.endpoint))?;
     // The receiver may report `partial_success.rejected_log_records`.
     // Logged here as a warning AND propagated to the caller via
     // `SendOutcome.rejected` so the flush path can split the batch's
@@ -1583,5 +1615,151 @@ def output test {{
             Arc::ptr_eq(stored, &writer),
             "constructor must store the exact Arc passed in"
         );
+    }
+    #[test]
+    fn grpc_status_classification_requires_retry_info_for_resource_exhaustion() {
+        use tonic::Code;
+        use tonic_types::{ErrorDetails, StatusExt};
+        for code in [
+            Code::Cancelled,
+            Code::DeadlineExceeded,
+            Code::Aborted,
+            Code::OutOfRange,
+            Code::Unavailable,
+            Code::DataLoss,
+        ] {
+            assert!(
+                matches!(
+                    classify_status(tonic::Status::new(code, "retry"), "collector"),
+                    SendError::Retryable {
+                        retry_after: None,
+                        ..
+                    }
+                ),
+                "{code:?}"
+            );
+        }
+        for code in [
+            Code::Unknown,
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+            Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::Unimplemented,
+            Code::Internal,
+        ] {
+            assert!(
+                matches!(
+                    classify_status(tonic::Status::new(code, "terminal"), "collector"),
+                    SendError::Permanent(_)
+                ),
+                "{code:?}"
+            );
+        }
+        let status = tonic::Status::with_error_details(
+            Code::ResourceExhausted,
+            "recoverable",
+            ErrorDetails::with_retry_info(Some(Duration::from_secs(25))),
+        );
+        assert!(
+            matches!(classify_status(status, "collector"), SendError::Retryable {
+            retry_after: Some(d), .. } if d == Duration::from_secs(25))
+        );
+        let status = tonic::Status::with_error_details(
+            Code::ResourceExhausted,
+            "recoverable",
+            ErrorDetails::with_retry_info(None),
+        );
+        assert!(matches!(
+            classify_status(status, "collector"),
+            SendError::Retryable { .. }
+        ));
+        let status = tonic::Status::with_error_details(
+            Code::InvalidArgument,
+            "invalid",
+            ErrorDetails::with_retry_info(Some(Duration::from_secs(25))),
+        );
+        assert!(matches!(
+            classify_status(status, "collector"),
+            SendError::Permanent(_)
+        ));
+        let malformed = tonic::Status::with_details(
+            Code::ResourceExhausted,
+            "invalid details",
+            Bytes::from_static(&[0xff]),
+        );
+        assert!(matches!(
+            classify_status(malformed, "collector"),
+            SendError::Permanent(_)
+        ));
+    }
+    #[tokio::test]
+    async fn grpc_wire_status_preserves_retry_info_classification() {
+        use tonic::Code;
+        use tonic_types::{ErrorDetails, StatusExt};
+        struct RejectLogs(tonic::Status);
+        #[tonic::async_trait]
+        impl LogsService for RejectLogs {
+            async fn export(
+                &self,
+                _: tonic::Request<ExportLogsServiceRequest>,
+            ) -> std::result::Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status>
+            {
+                Err(self.0.clone())
+            }
+        }
+        let cases = [
+            (tonic::Status::invalid_argument("invalid payload"), false),
+            (tonic::Status::resource_exhausted("non-recoverable"), false),
+            (
+                tonic::Status::with_error_details(
+                    Code::ResourceExhausted,
+                    "recoverable",
+                    ErrorDetails::with_retry_info(Some(Duration::from_secs(7))),
+                ),
+                true,
+            ),
+        ];
+        for (status, retryable) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let server = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(LogsServiceServer::new(RejectLogs(status)))
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+            let output = OtlpGrpcOutput::from_properties(
+                "retry-test",
+                &mp(&one_peer_props(&format!("http://{addr}"))),
+                &crate::modules::BuildContext::for_testing(),
+            )
+            .unwrap();
+            let error = output
+                .sink
+                .inner
+                .policy
+                .send(
+                    &ExportLogsServiceRequest::default(),
+                    &mut SendState::default(),
+                )
+                .await
+                .unwrap_err();
+            if retryable {
+                assert!(
+                    matches!(error, SendError::Retryable { retry_after: Some(d), .. }
+                    if d == Duration::from_secs(7))
+                );
+            } else {
+                assert!(matches!(error, SendError::Permanent(_)));
+            }
+            server.abort();
+            let _ = server.await;
+        }
     }
 }

@@ -389,12 +389,26 @@ parser also preserved exact source text in
 `SeverityText`, after the corresponding shed override. Missing values
 are omitted from the encoded LogRecord.
 
-### 5.6 Retry: transport-level only
+### 5.6 Retry: whole requests only
 
-The output module retries the *whole* `ExportLogsServiceRequest` on
-hard transport failures (connection refused, 5xx, gRPC `UNAVAILABLE`,
-timeout). It does **not** retry just the rejected subset surfaced
-through `partial_success`.
+The output modules retry the prepared `ExportLogsServiceRequest` for
+connection failures, timeouts, and retryable status responses. For HTTP,
+only 429, 502, 503, and 504 are retryable; other unsuccessful statuses,
+including 408, 500, and received redirects, permanently exclude that peer
+for this batch. The gRPC status rules, including the requirement for a
+retry-delay hint with resource exhaustion, are detailed in
+[HTTP and OTLP failure classification](./outputs/README.md#http-and-otlp-failure-classification).
+
+A permanent failure immediately tries the next configured peer, without
+spending the retryable-failure round budget. Exclusions survive transient
+retries and reset for the next batch. Exhausting that budget or permanently
+failing at every peer enters output recovery, whose saved copy and queue
+progress follow the [recovery contract](./outputs/README.md#disposition-contract).
+Neither a retry nor a recovery label proves that the receiver stored
+nothing; retrying a request can duplicate delivery.
+
+A populated `partial_success` response is not retried. limpid also does
+not automatically resend an inferred rejected subset.
 
 **Why.** As §3.3 explains, a populated partial-success response prohibits
 retrying that request. The response reports a count rather than record

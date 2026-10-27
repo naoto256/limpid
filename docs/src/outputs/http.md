@@ -4,7 +4,14 @@ Sends events to one or more HTTP/HTTPS endpoints. Supports batching, gzip compre
 
 Works with Elasticsearch Bulk API, Splunk HEC, Datadog, Grafana Loki, and any generic HTTP endpoint.
 
-Redirects are not followed. All 3xx responses are failures and use the normal retry and DLQ path; errors include a sanitized `Location` destination when present (userinfo, query and fragment removed; capped at 200 characters plus a truncation marker). Configure the final endpoint directly.
+Redirects are not followed. A 3xx response permanently excludes that peer
+for the current batch: it is not retried on that peer, but another
+configured peer is tried immediately. The batch enters output recovery
+when every peer fails permanently or the retryable-failure budget is
+exhausted. Errors retain a sanitized `Location` when present (userinfo,
+query, and fragment removed; capped at 200 characters plus a truncation
+marker). Configure the final endpoint directly. See [failure classification](./README.md#http-and-otlp-failure-classification)
+and the [recovery contract](./README.md#recovery-error_log).
 
 ## Configuration
 
@@ -72,7 +79,15 @@ Each `peer` block configures one target endpoint:
 | `tls.ca` | no | Custom CA certificate file (PEM) for this peer. Falls back to the system root store if omitted. |
 | `tls.cert`, `tls.key` | no (paired) | Client certificate and private key for mTLS, as separate PEM files (chmod 600 the key). Both must be present together. |
 
-On each send the rotation picks the next available peer (cooldown expired) and tries it. On failure that peer is marked cooled-down for ~5 s and subsequent sends rotate past it until the cooldown expires. When every peer is currently cooled the rotation falls back to the cursor start — the output's per-flush retry loop then handles re-delivery without dropping the drained batch.
+Each send round starts at the next eligible peer, preferring peers whose
+cooldown has expired. Failures cool that peer for about 5 seconds. A
+permanent failure immediately fails over to another peer and excludes the
+failed peer for the rest of this batch. A retryable failure returns to the
+configured retry budget and backoff, retaining those exclusions. If all
+remaining peers are cooled, an eligible peer is still selected; cooldown
+never overrides a permanent exclusion. Recovery begins when every peer
+has failed permanently or the retryable-failure budget is exhausted. See
+[failure classification](./README.md#http-and-otlp-failure-classification).
 
 ### headers block
 
@@ -104,7 +119,8 @@ or retry backoff completes. Otherwise, the flusher sends a partial batch when
 its current `batch_timeout` wait ends. That wait starts at the beginning of
 each flusher loop; arrivals during the wait do not restart it.
 
-A failed send retries the prepared batch within the configured retry budget.
+A retryable send failure retries the prepared batch within the configured
+round budget; permanent peer failures follow the failover rules above.
 See [Queue and retry](./README.md#queue-and-retry) for the policy and the risk
 of duplicate delivery when replaying an error-log record.
 
