@@ -42,15 +42,18 @@
 //!
 //! ### Round-robin + cooldown
 //!
-//! On each send the rotation picks the next available peer (cooldown
-//! expired) and tries it. On failure that peer is marked cooled-down
-//! for `PEER_COOLDOWN` (5 s, shared with the syslog / otlp outputs)
-//! and subsequent sends rotate past it until the cooldown expires.
-//! Within a single send the rotation falls back to the cursor start
-//! when every peer is cooled (single-peer retry path) — the output's
-//! own retry loop (driven by `retry { ... }`) then handles re-delivery
-//! on persistent failure. The queue layer advances its cursor when the
-//! ack handle resolves, not when `consume` returns.
+//! Each send round starts with the next available peer. A permanent
+//! failure immediately selects another peer in the same round and
+//! excludes the failed peer for the rest of the batch. A retryable
+//! failure returns to the per-flush retry loop; `retry { ... }` bounds
+//! those rounds. Exclusions reset for each new batch.
+//!
+//! Failed peers also enter a 5-second cooldown. Among peers not
+//! excluded for this batch, rotation falls back to the cursor start
+//! when every candidate is cooled. The retry budget bounds repeated
+//! retryable failures; cooldown does not permanently exclude a peer.
+//! The queue cursor advances when the ack handle resolves, not when
+//! `consume` returns.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -178,16 +181,17 @@ struct HttpPeer {
 
 /// Transport policy plugged into the shared [`BatchedSink`] skeleton:
 /// render = verbatim (byte-preserving) `event.egress` bytes,
-/// prepare = newline join + optional gzip, send = one attempt against
-/// the next rotation candidate. Buffering, retry, and the shutdown
-/// lifecycle live in `crate::modules::output::batched`. Binary payload
-/// fidelity is pinned by `http_output_forwards_non_utf8_egress_verbatim` —
+/// prepare = newline join + optional gzip, send = one round with
+/// immediate failover past permanent peers. Buffering, retry, and
+/// the shutdown lifecycle live in `crate::modules::output::batched`.
+/// Binary payload fidelity is pinned by
+/// `http_output_forwards_non_utf8_egress_verbatim` —
 /// do NOT re-introduce a `from_utf8_lossy` here.
 struct HttpSinkPolicy {
     peers: Vec<HttpPeer>,
-    /// Round-robin cursor + per-peer failure cooldown; one candidate
-    /// per send attempt. See `RotatingPeers` for the selection and
-    /// cooldown contract.
+    /// Round-robin cursor + per-peer failure cooldown; each selection
+    /// returns one candidate, and a round can select additional peers
+    /// after permanent failures. See `RotatingPeers` for the contract.
     rotation: RotatingPeers,
     method: reqwest::Method,
     content_type: String,
@@ -675,7 +679,7 @@ mod tests {
         }
     }
 
-    /// Single-attempt `retry { max_attempts 1 ... }` block so tests
+    /// Single-round `retry { max_attempts 1 ... }` block so tests
     /// driving a failing peer don't churn through the default 5-attempt
     /// retry budget (which would also sleep on each backoff). Retry
     /// lives inside the output, so tests that used to assert "first
@@ -2730,8 +2734,8 @@ def output o {{
         (addr, server)
     }
 
-    /// Regression for the panic root cause: at shutdown the single send
-    /// attempt MUST be wrapped in a bounded timeout, otherwise an
+    /// Regression for the panic root cause: at shutdown the send round
+    /// MUST be wrapped in a bounded timeout, otherwise an
     /// unreachable peer (TCP accepts but never replies) outlasts the
     /// runtime's 10s shutdown deadline, the task is aborted, and the
     /// in-flight `shippable: Vec<(Event, QueueAckHandle)>` is dropped

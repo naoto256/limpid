@@ -489,16 +489,17 @@ impl<C> PeerList<C> {
 }
 
 /// Cursor-driven single-candidate peer rotation with per-peer failure
-/// cooldown. Shared by the batched HTTP / OTLP outputs, whose retry
-/// loop wants exactly one candidate per send attempt (`select` →
-/// attempt → `mark_success` / `mark_failure`).
+/// cooldown. Shared by the batched HTTP / OTLP outputs. Each selection
+/// returns one candidate (`select` → transport attempt →
+/// `mark_success` / `mark_failure`); a send round can select another
+/// candidate immediately after a permanent failure.
 ///
 /// This is deliberately NOT merged with [`PeerList::write_with_rotation_at`]:
 /// that helper tries *every* available peer within one call and owns
 /// the per-peer connection state, while this type hands out one index
 /// at a time and leaves the transport attempt to the caller — the
-/// batched outputs' retry budget (not the rotation) is what drives
-/// re-attempts there.
+/// batched outputs' send round drives permanent-peer failover, while
+/// the retry budget drives later rounds after retryable failures.
 pub struct RotatingPeers {
     /// Round-robin cursor. Incremented per selection so successive
     /// sends start at successive peers.

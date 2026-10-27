@@ -36,14 +36,16 @@
 //!
 //! ### Round-robin + cooldown
 //!
-//! On each flush, peers are tried in round-robin order. A peer that
-//! fails the request is marked cooled-down for `PEER_COOLDOWN` (5s,
-//! shared with the syslog outputs) and skipped on subsequent flushes
-//! until the cooldown expires. The `retry { … }` block controls the
-//! per-flush retry budget; within one budget the rotation transparently
-//! picks the next available peer. If every peer is currently cooled
-//! the rotation falls back to the cursor start — the retry budget,
-//! not the cooldown, protects the single-peer-just-failed case.
+//! Each send round starts with the next available peer. A permanent
+//! failure immediately selects another peer in the same round and
+//! excludes the failed peer for the rest of the batch. A retryable
+//! failure returns to the per-flush retry loop; `retry { ... }` bounds
+//! those rounds. Exclusions reset for each new batch.
+//!
+//! Failed peers also enter a 5-second cooldown. Among peers not
+//! excluded for this batch, rotation falls back to the cursor start
+//! when every candidate is cooled. The retry budget bounds repeated
+//! retryable failures; cooldown does not permanently exclude a peer.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,15 +88,15 @@ struct GrpcPeer {
 /// Transport policy plugged into the shared [`BatchedSink`] skeleton:
 /// render = refcount bump on the per-event ResourceLogs proto bytes,
 /// prepare = decode + `batch_level` merge into one
-/// `ExportLogsServiceRequest`, send = one attempt against the next
-/// rotation candidate. Buffering, retry (the shared `RetryConfig`
-/// vocabulary spliced in by the queue layer), and the shutdown
-/// lifecycle live in `crate::modules::output::batched`.
+/// `ExportLogsServiceRequest`, send = one round with immediate
+/// failover past permanent peers. Buffering, retry (the shared
+/// `RetryConfig` vocabulary spliced in by the queue layer), and the
+/// shutdown lifecycle live in `crate::modules::output::batched`.
 struct OtlpGrpcSinkPolicy {
     peers: Vec<GrpcPeer>,
-    /// Round-robin cursor + per-peer failure cooldown; one candidate
-    /// per send attempt. See `RotatingPeers` for the selection and
-    /// cooldown contract.
+    /// Round-robin cursor + per-peer failure cooldown; each selection
+    /// returns one candidate, and a round can select additional peers
+    /// after permanent failures. See `RotatingPeers` for the contract.
     rotation: RotatingPeers,
     batch_level: BatchLevel,
     headers: Vec<(String, String)>,
@@ -1323,7 +1325,7 @@ def output test {{
         // before the batch fills or before the actor's batch_timeout
         // wake, `shutdown()` must signal/join the actor and
         // final-drain any leftover buffer with one bounded send
-        // attempt (or DLQ drain).
+        // round (or DLQ drain).
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1448,7 +1450,7 @@ def output test {{
         let mut props = one_peer_props(endpoint);
         props.push(prop_int("batch_size", 100));
         props.push(prop_str("batch_timeout", "30s"));
-        // Single attempt + minimal wait so the shutdown flush against
+        // Single retry round + minimal wait so the shutdown flush against
         // an unreachable peer completes quickly.
         props.push(Property::Block {
             key: "retry".into(),

@@ -1,7 +1,7 @@
 //! Shared actor skeleton for the batched network outputs (`http`,
 //! `otlp_http`, `otlp_grpc`). The three sinks differ only in how an
 //! event becomes a payload, how a drained batch becomes one wire
-//! request, and how a single send attempt is performed — everything
+//! request, and how a send round is performed — everything
 //! else (buffering, the flusher actor, the retry loop, the shutdown
 //! lifecycle, ack-handle resolution, DLQ routing, metrics) is the
 //! same protocol and lives here so a lifecycle fix lands once instead
@@ -507,7 +507,7 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
     /// (`flush_events`' exponential backoff loop) which the shutdown
     /// contract forbids. The buffer holds the handle until
     /// `shutdown()` resolves it via `flush_events_at_shutdown`'s
-    /// bounded single attempt + DLQ route.
+    /// bounded single send round + DLQ route.
     ///
     /// Permit acquisition is bypassed here (permit = `None`): the
     /// queue consumer's shutdown drain already bounds peak RAM
@@ -572,9 +572,9 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
         //    late for the actor's last iteration. The actor's own
         //    in-flight batch was already resolved by `flush_events`
         //    before the actor exited. `flush_events_at_shutdown`
-        //    gives each hard-capped chunk at most one send attempt,
+        //    gives each hard-capped chunk at most one send round,
         //    sharing one bounded deadline across the entire drain,
-        //    then routes the rest to DLQ + Recovered.
+        //    then routes the rest through the DLQ disposition rules.
         let leftover = std::mem::take(&mut *self.inner.batch.lock().await);
         let deadline = tokio::time::Instant::now() + crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT;
         for batch in hard_capped_batches(leftover, self.batch_size) {
@@ -722,7 +722,7 @@ async fn flusher_actor_loop<P: BatchSinkPolicy>(inner: Arc<SinkShared<P>>, batch
             // success, Recovered on retry-exhausted DLQ). It checks
             // `is_shutting_down` between retry attempts so a
             // shutdown signal collapses the retry budget to one
-            // attempt instead of burning the full backoff window.
+            // round instead of burning the full backoff window.
             inner.flush_events(batch).await;
         }
     }
