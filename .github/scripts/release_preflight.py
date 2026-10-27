@@ -153,7 +153,7 @@ def check_book(book):
             if href.startswith(REPOSITORY_PREFIX):
                 # Deliberately selected book-external document references only.
                 destination = url.path
-                if destination.endswith(("/CHANGELOG.md", "/packaging/snippets/README.md")):
+                if destination.endswith(("/CHANGELOG.md", "/packaging/snippets/README.md", "/CONTRIBUTING.md")):
                     repository_links.add(href)
             if url.scheme or url.netloc:
                 continue

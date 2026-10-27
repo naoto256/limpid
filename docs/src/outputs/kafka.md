@@ -167,8 +167,19 @@ Routing decisions stay in the pipeline body; the output configs stay static and 
 ## Notes
 
 - rdkafka handles batching and compression internally — no manual batch configuration needed (unlike [http](./http.md)).
-- During graceful shutdown, pending messages wait according to librdkafka's `queue_timeout` and `message.timeout.ms` (30 seconds); there is no additional outer five-second limit. Undelivered messages use the ambiguous DLQ path: a disk queue holds its cursor (`Dropped`), while a memory queue advances (`Recovered`). When `error_log` is configured, both retain a record for reconciliation.
-- The internal delivery timeout (`message.timeout.ms`) is 30 seconds. If a message can't be delivered within that time, it's returned as an error and the output's `retry { ... }` budget handles re-delivery. On retry exhaustion the payload routes to `control { error_log "..." }` as an Output-flavor DLQ record; see [Outputs → Recovery (error_log)](./README.md#recovery-error_log).
+- During ordinary processing, shutdown observed before a message is
+  submitted abandons that send attempt and uses normal output recovery.
+  Ordinary retry exhaustion and shutdown during retry backoff also use
+  normal recovery; they are not the shutdown-drain path.
+- The final shutdown drain runs only for memory queues. Messages are
+  submitted and wait under librdkafka's `queue_timeout` and
+  `message.timeout.ms` (30 seconds). A failed drain send has ambiguous
+  delivery state and resolves as `Recovered`; the memory queue advances.
+  Disk queues skip this drain and leave unread entries for next-start
+  replay. See the common [disposition contract](./README.md#disposition-contract).
+  Recovery records are attempted only when `error_log` is configured and
+  retain payloads only when the writes succeed.
+- The internal delivery timeout (`message.timeout.ms`) is 30 seconds. If a message can't be delivered within that time, it's returned as an error and the output's `retry { ... }` budget handles re-delivery. On retry exhaustion, a configured `control { error_log "..." }` saves an Output-flavor DLQ record only if its write succeeds; see [Outputs → Recovery (error_log)](./README.md#recovery-error_log).
 
 ## Example
 

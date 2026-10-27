@@ -446,8 +446,8 @@ spec does not say.
 **What limpid does today.** The rejected subset is split out
 into `events_failed` (separate from `events_written`) so the loss is
 visible on dashboards, **and the trailing N events (N =
-`rejected_log_records`) are routed to `control { error_log }` as
-Output-flavor DLQ records** (`reason = "collector reported
+`rejected_log_records`) enter output recovery**. When a configured
+`control { error_log }` write succeeds, it saves Output-flavor DLQ records (`reason = "collector reported
 partial_success rejection"`) for inspection and operator-driven
 replay — sharing the same dead-letter sink as retry-exhausted /
 shutdown-flush payloads. Attribution is approximate (the OTLP

@@ -173,7 +173,10 @@ class ReleasePreflightTests(unittest.TestCase):
 
     def test_repository_fragment_and_selected_destinations(self):
         url = preflight.REPOSITORY_PREFIX + "main/CONTRIBUTING.md#authoring-conventions"
-        preflight.check_repository_links({url}, fetch=lambda _: '<h2 id="user-content-authoring-conventions">ok</h2>')
+        (self.root / "index.html").write_text(f'<a href="{url}">Authoring guide</a>')
+        links = preflight.check_book(self.root)
+        self.assertEqual(links, {url})
+        preflight.check_repository_links(links, fetch=lambda _: '<h2 id="user-content-authoring-conventions">ok</h2>')
         with self.assertRaises(preflight.SourceDefect):
             preflight.check_repository_links({url}, fetch=lambda _: '<h2 id="different">no</h2>')
 

@@ -626,16 +626,15 @@ pub async fn finalize_shutdown_singleton_disposition(
 ///   an operator can reconcile with the DLQ record.
 /// - Memory queue: `Dropped` folds to `Recovered` inside
 ///   `resolve_ack_from_dlq_outcome` (memory has no replay path);
-///   the loss is unavoidable but the DLQ record still captured
-///   what would have shipped.
+///   no queue replay is possible. A recovery copy exists only if
+///   the configured DLQ write succeeds.
 ///
 /// `Ok(())` still counts as `Delivered` with the usual metric bump.
 ///
-/// The DLQ record is written for operator visibility (even though
-/// the outcome is forced to `Dropped`), so reconciliation between
-/// the wedged position and the downstream is possible from the
-/// DLQ file when configured. The tracing-side fallback line is
-/// shaped by the operator's `error_log_fallback` ladder — a
+/// A configured DLQ write is attempted for operator visibility
+/// (even though the outcome is forced to `Dropped`). Reconciliation
+/// from that file requires the write to succeed. The tracing-side
+/// fallback line is shaped by the operator's `error_log_fallback` ladder — a
 /// `journalctl | jq` reconciliation path only exists on the
 /// explicit `Full` opt-in; `Off` (default) and `Meta` do not
 /// carry the payload bytes reconciliation would need. The DLQ
@@ -792,9 +791,8 @@ pub async fn route_shutdown_batch_to_dlq(
 /// records, the DLQ record replays via `limpidctl inject output`, and
 /// the operator has no signal that the two paths overlap.
 ///
-/// This variant writes the DLQ record for the operator's audit trail
-/// (reconciliation between wedged position and downstream is only
-/// possible when the payload survives durably) but forces the
+/// This variant attempts a configured DLQ write for the operator's
+/// audit trail; a saved copy requires that write to succeed. It forces the
 /// failure disposition to `Dropped` regardless of the DLQ-write
 /// outcome:
 ///
@@ -803,14 +801,12 @@ pub async fn route_shutdown_batch_to_dlq(
 ///   reconcile the DLQ record against the downstream before the
 ///   same batch is retried.
 /// - Memory queue: `Dropped` folds to `Recovered` inside
-///   `resolve_ack_from_dlq_outcome` (no replay path exists so the
-///   loss is unavoidable, but the DLQ record still captures what
-///   would have shipped).
+///   `resolve_ack_from_dlq_outcome` (no queue replay path exists).
+///   A recovery copy exists only if the configured DLQ write succeeds.
 ///
 /// The `no error_log` branch mirrors the plain helper: dispatch
-/// through `emit_dlq_tracing_fallback` (payload-free summary by
-/// default under the operator's declared no-recovery contract;
-/// `Meta` / `Full` shape only on explicit opt-in), then resolve
+/// through `emit_dlq_tracing_fallback` (payload-free summary; the
+/// fallback setting is ignored when `error_log` is unset), then resolve
 /// the ack. Even without a file DLQ the disposition is forced to
 /// `Dropped` so operators do not silently lose the ambiguity
 /// signal on a disk queue — the tracing line is a best-effort

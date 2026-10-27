@@ -38,8 +38,8 @@ limpid --debug --config /etc/limpid/limpid.conf
 | Flag | Description |
 |------|-------------|
 | `--config <path>` | Main configuration file (default: `/etc/limpid/limpid.conf`) |
-| `--check` | Validate configuration and exit. Exit codes: `0` clean, `1` errors, `2` warnings present with `--strict-warnings`. |
-| `--strict-warnings` | When combined with `--check`, treat any warning (recovery readiness, etc.) as a non-zero exit (`2`). Useful in CI to gate on warnings without failing on the absence of warnings. |
+| `--check` | Validate configuration and exit. Exit codes: `0` clean, `1` errors (including errors with warnings), `2` warnings only with `--strict-warnings`. |
+| `--strict-warnings` | With `--check`, exit `2` for warnings only without changing diagnostic levels. Errors take precedence and exit `1`, even when warnings are also present. |
 | `--ultra-strict` | When combined with `--check`, promote unknown-identifier warnings to errors. This is the only opt-in lint upgrade today and is *not* a generic style-level fail-on-warn; for "any warning fails CI" use `--strict-warnings`. |
 | `--graph[=mermaid\|dot\|ascii]` | Print the configured pipeline graph (nodes + edges) and exit. Format defaults to `mermaid`; `dot` (Graphviz) and `ascii` are also accepted. Composes with `--check`: validation runs first, the graph is printed on success. |
 | `--test-pipeline <name>` | Test a named pipeline with sample data |

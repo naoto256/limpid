@@ -100,8 +100,9 @@ before customising it; package upgrades replace files under
 See the [pack
 README](https://github.com/naoto256/limpid/blob/main/packaging/snippets/README.md#slot-registry--composed-layer)
 for the full composed / shed slot registries and the LSIS layer
-contracts. The same README defines the authoring schema: each file declares a
-`Facade`, and every listed process or function has an adjacent contract block.
+contracts. The [authoring guide](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions)
+defines the header schema: each file declares a `Facade`, and every listed
+process or function has an adjacent contract block.
 Private dispatch leaves remain unlisted and need no public header.
 
 ### Filters

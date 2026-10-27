@@ -1004,10 +1004,14 @@ pub enum BackoffStrategy {
 pub enum AckDisposition {
     /// Event was durably shipped to its destination.
     Delivered,
-    /// Event was routed to the DLQ (`error_log`).
+    /// Terminal failure handling completed and the queue may advance.
+    /// This does not certify a saved DLQ copy: an unset error log and
+    /// memory-queue recovery-write failures also resolve this way.
     Recovered,
-    /// Event was dropped without explicit disposition (bug / panic /
-    /// shutdown fallthrough). Should not occur on healthy paths.
+    /// No Delivered or Recovered acknowledgement completed, or a disk
+    /// recovery path deliberately withheld Recovered (failed DLQ write
+    /// or ambiguous shutdown delivery). A DLQ copy may still exist.
+    /// Unresolved handles also produce this on panic or task abort.
     Dropped,
 }
 

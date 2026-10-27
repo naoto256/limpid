@@ -36,7 +36,7 @@ named output queue and processing continues.
 
 Each output has an async queue. Pipelines run synchronously (one event at a time), but outputs are decoupled via queues so downstream bottlenecks don't block the pipeline.
 
-When an output exhausts its retries or shutdown can't drain the queue in time, the payload is persisted as JSONL to the daemon-wide `control { error_log "..." }` sink rather than being silently dropped. The recovery story is part of the daemon, not a per-output afterthought — see [Error Log (DLQ)](./operations/error-log.md).
+When output recovery handles retry exhaustion or a shutdown-drain failure, it attempts to save the payload as JSONL to the configured `control { error_log "..." }` sink. A replayable file copy requires a successful write; shutdown task aborts can bypass recovery handling. The recovery story is part of the daemon, not a per-output afterthought — see [Error Log (DLQ)](./operations/error-log.md).
 
 ## At a glance
 
