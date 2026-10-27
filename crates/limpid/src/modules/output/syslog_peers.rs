@@ -489,16 +489,17 @@ impl<C> PeerList<C> {
 }
 
 /// Cursor-driven single-candidate peer rotation with per-peer failure
-/// cooldown. Shared by the batched HTTP / OTLP outputs, whose retry
-/// loop wants exactly one candidate per send attempt (`select` →
-/// attempt → `mark_success` / `mark_failure`).
+/// cooldown. Shared by the batched HTTP / OTLP outputs. Each selection
+/// returns one candidate (`select` → transport attempt →
+/// `mark_success` / `mark_failure`); a send round can select another
+/// candidate immediately after a permanent failure.
 ///
 /// This is deliberately NOT merged with [`PeerList::write_with_rotation_at`]:
 /// that helper tries *every* available peer within one call and owns
 /// the per-peer connection state, while this type hands out one index
 /// at a time and leaves the transport attempt to the caller — the
-/// batched outputs' retry budget (not the rotation) is what drives
-/// re-attempts there.
+/// batched outputs' send round drives permanent-peer failover, while
+/// the retry budget drives later rounds after retryable failures.
 pub struct RotatingPeers {
     /// Round-robin cursor. Incremented per selection so successive
     /// sends start at successive peers.
@@ -540,6 +541,30 @@ impl RotatingPeers {
             }
         }
         start
+    }
+
+    /// Select an eligible peer for this batch, retaining cooldown preference
+    /// and fallback without ever revisiting a permanently failed peer.
+    pub async fn select_excluding(&self, excluded: &[usize]) -> Option<usize> {
+        if excluded.is_empty() {
+            return Some(self.select().await);
+        }
+        let n = self.cooldown_until.len();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let now = Instant::now();
+        let mut fallback = None;
+        for offset in 0..n {
+            let candidate = (start + offset) % n;
+            if excluded.contains(&candidate) {
+                continue;
+            }
+            fallback.get_or_insert(candidate);
+            let guard = self.cooldown_until[candidate].lock().await;
+            if guard.is_none_or(|until| until <= now) {
+                return Some(candidate);
+            }
+        }
+        fallback
     }
 
     /// Reset the peer's cooldown so future selections pick it freely.

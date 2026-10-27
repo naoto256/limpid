@@ -42,15 +42,18 @@
 //!
 //! ### Round-robin + cooldown
 //!
-//! On each send the rotation picks the next available peer (cooldown
-//! expired) and tries it. On failure that peer is marked cooled-down
-//! for `PEER_COOLDOWN` (5 s, shared with the syslog / otlp outputs)
-//! and subsequent sends rotate past it until the cooldown expires.
-//! Within a single send the rotation falls back to the cursor start
-//! when every peer is cooled (single-peer retry path) — the output's
-//! own retry loop (driven by `retry { ... }`) then handles re-delivery
-//! on persistent failure. The queue layer advances its cursor when the
-//! ack handle resolves, not when `consume` returns.
+//! Each send round starts with the next available peer. A permanent
+//! failure immediately selects another peer in the same round and
+//! excludes the failed peer for the rest of the batch. A retryable
+//! failure returns to the per-flush retry loop; `retry { ... }` bounds
+//! those rounds. Exclusions reset for each new batch.
+//!
+//! Failed peers also enter a 5-second cooldown. Among peers not
+//! excluded for this batch, rotation falls back to the cursor start
+//! when every candidate is cooled. The retry budget bounds repeated
+//! retryable failures; cooldown does not permanently exclude a peer.
+//! The queue cursor advances when the ack handle resolves, not when
+//! `consume` returns.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,7 +66,9 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::output::batched::{BatchSinkPolicy, BatchedSink, SendOutcome};
+use crate::modules::output::batched::{
+    BatchSinkPolicy, BatchedSink, SendError, SendOutcome, SendState, send_with_peer_failover,
+};
 use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet, location_snippet};
 use crate::modules::output::syslog_peers::{RotatingPeers, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output};
@@ -176,16 +181,17 @@ struct HttpPeer {
 
 /// Transport policy plugged into the shared [`BatchedSink`] skeleton:
 /// render = verbatim (byte-preserving) `event.egress` bytes,
-/// prepare = newline join + optional gzip, send = one attempt against
-/// the next rotation candidate. Buffering, retry, and the shutdown
-/// lifecycle live in `crate::modules::output::batched`. Binary payload
-/// fidelity is pinned by `http_output_forwards_non_utf8_egress_verbatim` —
+/// prepare = newline join + optional gzip, send = one round with
+/// immediate failover past permanent peers. Buffering, retry, and
+/// the shutdown lifecycle live in `crate::modules::output::batched`.
+/// Binary payload fidelity is pinned by
+/// `http_output_forwards_non_utf8_egress_verbatim` —
 /// do NOT re-introduce a `from_utf8_lossy` here.
 struct HttpSinkPolicy {
     peers: Vec<HttpPeer>,
-    /// Round-robin cursor + per-peer failure cooldown; one candidate
-    /// per send attempt. See `RotatingPeers` for the selection and
-    /// cooldown contract.
+    /// Round-robin cursor + per-peer failure cooldown; each selection
+    /// returns one candidate, and a round can select additional peers
+    /// after permanent failures. See `RotatingPeers` for the contract.
     rotation: RotatingPeers,
     method: reqwest::Method,
     content_type: String,
@@ -532,30 +538,23 @@ impl BatchSinkPolicy for HttpSinkPolicy {
         }
     }
 
-    /// One send attempt against the next rotation candidate. A peer
-    /// that fails is cooled down for `PEER_COOLDOWN` and skipped on
-    /// subsequent sends; when every peer is cooled the rotation falls
-    /// back to the cursor start — the skeleton's per-flush retry loop
-    /// then handles longer-term re-delivery without dropping the
-    /// batch. Plain HTTP has no partial-success concept, so success
-    /// reports `rejected: 0` (= the whole batch is Delivered).
-    async fn send(&self, body: &Vec<u8>) -> Result<SendOutcome> {
-        let idx = self.rotation.select().await;
-        let peer = &self.peers[idx];
-        match send_once(peer, self, body).await {
-            Ok(()) => {
-                self.rotation.mark_success(idx).await;
-                Ok(SendOutcome { rejected: 0 })
-            }
-            Err(e) => {
-                self.rotation.mark_failure(idx).await;
-                Err(e)
-            }
-        }
+    /// One send round, immediately failing over past permanent peers.
+    /// The batch excludes those peers on later rounds. Retryable
+    /// failures return to the skeleton's per-flush retry loop;
+    /// `RotatingPeers` manages selection and cooldown. Plain HTTP
+    /// has no partial-success concept, so success reports
+    /// `rejected: 0` (= the whole batch is Delivered).
+    async fn send(&self, body: &Vec<u8>, state: &mut SendState) -> Result<SendOutcome, SendError> {
+        send_with_peer_failover(&self.rotation, state, |idx| async move {
+            send_once(&self.peers[idx], self, body)
+                .await
+                .map(|()| SendOutcome { rejected: 0 })
+        })
+        .await
     }
 }
 
-async fn send_once(peer: &HttpPeer, policy: &HttpSinkPolicy, body: &[u8]) -> Result<()> {
+async fn send_once(peer: &HttpPeer, policy: &HttpSinkPolicy, body: &[u8]) -> Result<(), SendError> {
     let mut request = peer.client.request(policy.method.clone(), &peer.url);
 
     request = request.header("Content-Type", &policy.content_type);
@@ -568,11 +567,12 @@ async fn send_once(peer: &HttpPeer, policy: &HttpSinkPolicy, body: &[u8]) -> Res
         request = request.header(key.as_str(), value.as_str());
     }
 
-    let response = request
-        .body(body.to_vec())
-        .send()
-        .await
-        .with_context(|| format!("http output: request to {} failed", peer.url))?;
+    let response = request.body(body.to_vec()).send().await.map_err(|error| {
+        super::http_util::request_error(
+            error,
+            format!("http output: request to {} failed", peer.url),
+        )
+    })?;
     policy.metrics.bytes_written.inc_by(body.len() as u64);
 
     let status = response.status();
@@ -585,14 +585,19 @@ async fn send_once(peer: &HttpPeer, policy: &HttpSinkPolicy, body: &[u8]) -> Res
         // reqwest build), it substitutes a `<gzip-encoded body, N
         // bytes>` placeholder so the daemon log doesn't fill with
         // replacement-char soup.
+        let delay = super::http_util::retry_after(response.headers(), std::time::SystemTime::now());
         let snippet = error_snippet(response, ERROR_BODY_BYTE_CAP, 200).await;
-        anyhow::bail!(
-            "http output: {} returned {}{} — {}",
-            peer.url,
+        return Err(super::http_util::status_error(
             status,
-            location,
-            snippet
-        );
+            delay,
+            anyhow::anyhow!(
+                "http output: {} returned {}{} — {}",
+                peer.url,
+                status,
+                location,
+                snippet
+            ),
+        ));
     }
 
     Ok(())
@@ -674,7 +679,7 @@ mod tests {
         }
     }
 
-    /// Single-attempt `retry { max_attempts 1 ... }` block so tests
+    /// Single-round `retry { max_attempts 1 ... }` block so tests
     /// driving a failing peer don't churn through the default 5-attempt
     /// retry budget (which would also sleep on each backoff). Retry
     /// lives inside the output, so tests that used to assert "first
@@ -1099,10 +1104,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permanent_response_fails_over_once_per_peer_before_dlq() {
+        use axum::{Router, http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (codes, delivered) in [([500, 200], true), ([400, 400], false), ([401, 400], false)] {
+            let mut servers = Vec::new();
+            let mut urls = Vec::new();
+            let mut counts = Vec::new();
+            for code in codes {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                urls.push(format!("http://{}/", listener.local_addr().unwrap()));
+                let count = Arc::new(AtomicUsize::new(0));
+                counts.push(Arc::clone(&count));
+                let app = Router::new().route(
+                    "/",
+                    post(move || {
+                        let count = Arc::clone(&count);
+                        async move {
+                            count.fetch_add(1, Ordering::Relaxed);
+                            StatusCode::from_u16(code).unwrap()
+                        }
+                    }),
+                );
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap()
+                }));
+            }
+            let dir = tempfile::TempDir::new().unwrap();
+            let dlq_path = dir.path().join("failover.jsonl");
+            let ctx = crate::modules::BuildContext {
+                error_log: Some(Arc::new(crate::error_log::ErrorLogWriter::new(
+                    dlq_path.clone(),
+                ))),
+                ..crate::modules::BuildContext::for_testing()
+            };
+            let props = vec![
+                peers_block_with(urls.iter().map(|url| peer_block(url)).collect()),
+                prop_int("batch_size", 1),
+                fast_retry_block(),
+            ];
+            let output = HttpOutput::from_properties("test", &mp(&props), &ctx).unwrap();
+            let event = event_with("permanent-failover");
+            let disposition = consume_and_wait_disposition(&output, &event, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(
+                disposition,
+                if delivered {
+                    crate::queue::AckDisposition::Delivered
+                } else {
+                    crate::queue::AckDisposition::Recovered
+                }
+            );
+            assert_eq!(
+                counts
+                    .iter()
+                    .map(|count| count.load(Ordering::Relaxed))
+                    .collect::<Vec<_>>(),
+                [1, 1]
+            );
+            assert_eq!(
+                output
+                    .sink
+                    .inner
+                    .policy
+                    .metrics
+                    .retries
+                    .load(Ordering::Relaxed),
+                0
+            );
+            if delivered {
+                assert!(!dlq_path.exists());
+            } else {
+                let contents = tokio::fs::read_to_string(&dlq_path).await.unwrap();
+                let records: Vec<serde_json::Value> = contents
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(records.len(), 1);
+                assert_eq!(
+                    records[0]["event"]["key"],
+                    event.key().hyphenated().to_string()
+                );
+                let reason = records[0]["reason"].as_str().unwrap();
+                assert!(reason.contains("all peers failed permanently"));
+                assert!(reason.contains("peer 0:"));
+                assert!(reason.contains("peer 1:"));
+                assert!(reason.contains(&codes[0].to_string()));
+                assert!(reason.contains(&codes[1].to_string()));
+            }
+            if !delivered {
+                // A new batch must not inherit the previous batch's exclusions.
+                let next = consume_and_wait_disposition(
+                    &output,
+                    &event_with("new-batch"),
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+                assert_eq!(next, crate::queue::AckDisposition::Recovered);
+                assert_eq!(
+                    counts
+                        .iter()
+                        .map(|count| count.load(Ordering::Relaxed))
+                        .collect::<Vec<_>>(),
+                    [2, 2]
+                );
+            }
+            output.sink.shutdown().await.unwrap();
+            for server in servers {
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_peer_failures_keep_both_causes_after_retry_exhaustion() {
+        assert_mixed_peer_failure_causes(false).await;
+    }
+
+    #[tokio::test]
+    async fn mixed_peer_failures_keep_both_causes_at_shutdown() {
+        assert_mixed_peer_failure_causes(true).await;
+    }
+
+    async fn assert_mixed_peer_failure_causes(shutdown: bool) {
+        use axum::{Router, http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut servers = Vec::new();
+        let mut urls = Vec::new();
+        let mut counts = Vec::new();
+        for code in [StatusCode::BAD_REQUEST, StatusCode::SERVICE_UNAVAILABLE] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            urls.push(format!("http://{}/", listener.local_addr().unwrap()));
+            let count = Arc::new(AtomicUsize::new(0));
+            counts.push(Arc::clone(&count));
+            let app = Router::new().route(
+                "/",
+                post(move || {
+                    let count = Arc::clone(&count);
+                    async move {
+                        count.fetch_add(1, Ordering::Relaxed);
+                        code
+                    }
+                }),
+            );
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let dlq_path = dir.path().join("mixed-failures.jsonl");
+        let ctx = crate::modules::BuildContext {
+            error_log: Some(Arc::new(crate::error_log::ErrorLogWriter::new(
+                dlq_path.clone(),
+            ))),
+            ..crate::modules::BuildContext::for_testing()
+        };
+        let mut retry = fast_retry_block();
+        if let Property::Block { properties, .. } = &mut retry {
+            properties[0] = prop_int("max_attempts", 3);
+        }
+        let output = HttpOutput::from_properties(
+            "mixed-failures",
+            &mp(&[
+                peers_block_with(urls.iter().map(|url| peer_block(url)).collect()),
+                prop_int("batch_size", 1),
+                retry,
+            ]),
+            &ctx,
+        )
+        .unwrap();
+        let original = event_with("mixed-failure-payload");
+        let disposition = if shutdown {
+            let (ack, mut rx) = QueueAckHandle::for_test();
+            output.sink.consume_shutdown(&original, ack).await.unwrap();
+            output.sink.shutdown().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+        } else {
+            consume_and_wait_disposition(&output, &original, Duration::from_secs(2))
+                .await
+                .unwrap()
+        };
+        assert_eq!(disposition, crate::queue::AckDisposition::Recovered);
+        assert_eq!(
+            counts
+                .iter()
+                .map(|n| n.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            [1, if shutdown { 1 } else { 3 }]
+        );
+        let contents = tokio::fs::read_to_string(&dlq_path).await.unwrap();
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0]["event"]["key"],
+            original.key().hyphenated().to_string()
+        );
+        assert_eq!(records[0]["event"]["egress"], "mixed-failure-payload");
+        let reason = records[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("previous permanent peer failures: peer 0:"));
+        if !shutdown {
+            assert!(reason.starts_with("flush failed after 3 attempts:"));
+        }
+        assert!(reason.contains(&format!("{} returned 400", urls[0])));
+        assert!(reason.contains(&format!("http output: {} returned 503", urls[1])));
+        output.sink.shutdown().await.unwrap();
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn rotates_to_healthy_peer_when_first_fails() {
         use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
         async fn fail(_: axum::body::Bytes) -> impl IntoResponse {
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::SERVICE_UNAVAILABLE
         }
         async fn ok(_: axum::body::Bytes) -> impl IntoResponse {
             StatusCode::OK
@@ -1140,7 +1364,7 @@ mod tests {
                 .unwrap();
         assert!(
             matches!(disp1, crate::queue::AckDisposition::Recovered),
-            "first attempt should fail (peer A is 500) → Recovered, got {:?}",
+            "first attempt should fail (peer A is 503) → Recovered, got {:?}",
             disp1
         );
         // Second event goes to peer B (next in rotation, A cooled).
@@ -1440,7 +1664,7 @@ def output o {{
             .sink
             .inner
             .policy
-            .send(&body)
+            .send(&body, &mut SendState::default())
             .await
             .expect("verify false must accept the self-signed cert");
 
@@ -1469,7 +1693,7 @@ def output o {{
             .sink
             .inner
             .policy
-            .send(&body)
+            .send(&body, &mut SendState::default())
             .await
             .expect_err("default client must reject the self-signed cert");
         server.abort();
@@ -1576,7 +1800,7 @@ def output o {{
             .prepare(vec![bytes::Bytes::from_static(b"hello")])
             .unwrap();
         let err = policy
-            .send(&body)
+            .send(&body, &mut SendState::default())
             .await
             .expect_err("500 must surface as Err at the transport layer");
         server.abort();
@@ -1636,7 +1860,7 @@ def output o {{
             .prepare(vec![bytes::Bytes::from_static(b"hello")])
             .unwrap();
         let err = policy
-            .send(&body)
+            .send(&body, &mut SendState::default())
             .await
             .expect_err("502 must surface as Err at the transport layer");
         server.abort();
@@ -1660,7 +1884,7 @@ def output o {{
 
         async fn slow_fail() -> impl IntoResponse {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::SERVICE_UNAVAILABLE
         }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1760,7 +1984,7 @@ def output o {{
         // ack channel fires).
         use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
         async fn always_fail(_: axum::body::Bytes) -> impl IntoResponse {
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::SERVICE_UNAVAILABLE
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1950,7 +2174,7 @@ def output o {{
     async fn run_failing_collector() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
         async fn fail(_: axum::body::Bytes) -> impl IntoResponse {
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::SERVICE_UNAVAILABLE
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2148,7 +2372,7 @@ def output o {{
         }
         async fn handle(State(s): State<AppState>) -> impl IntoResponse {
             s.count.fetch_add(1, AtomicOrdering::Relaxed);
-            (StatusCode::INTERNAL_SERVER_ERROR, "")
+            (StatusCode::SERVICE_UNAVAILABLE, "")
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2510,8 +2734,8 @@ def output o {{
         (addr, server)
     }
 
-    /// Regression for the panic root cause: at shutdown the single send
-    /// attempt MUST be wrapped in a bounded timeout, otherwise an
+    /// Regression for the panic root cause: at shutdown the send round
+    /// MUST be wrapped in a bounded timeout, otherwise an
     /// unreachable peer (TCP accepts but never replies) outlasts the
     /// runtime's 10s shutdown deadline, the task is aborted, and the
     /// in-flight `shippable: Vec<(Event, QueueAckHandle)>` is dropped
@@ -3274,7 +3498,51 @@ def output o {{
             .unwrap();
         server.abort();
     }
-
+    #[tokio::test]
+    async fn response_status_and_retry_after_reach_typed_send_result() {
+        use axum::{Router, http::StatusCode, routing::post};
+        for code in [400, 401, 408, 429, 500, 502, 503, 504] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/",
+                post(move || async move {
+                    (
+                        StatusCode::from_u16(code).unwrap(),
+                        [("retry-after", "9")],
+                        "rejected",
+                    )
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let output = HttpOutput::from_properties(
+                "retry-test",
+                &mp(&[peer_block(&format!("http://{addr}/"))]),
+                &crate::modules::BuildContext::for_testing(),
+            )
+            .unwrap();
+            let result = output
+                .sink
+                .inner
+                .policy
+                .send(&b"record".to_vec(), &mut SendState::default())
+                .await;
+            let error = result.unwrap_err();
+            if matches!(code, 429 | 502 | 503 | 504) {
+                assert!(
+                    matches!(error, SendError::Retryable { retry_after: Some(delay), .. }
+                    if delay == Duration::from_secs(9)),
+                    "{code}"
+                );
+            } else {
+                assert!(matches!(error, SendError::Permanent(_)), "{code}");
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
     #[tokio::test]
     async fn redirects_fail_without_forwarding_and_preserve_events_in_dlq() {
         use axum::{Router, http::StatusCode, routing::any};

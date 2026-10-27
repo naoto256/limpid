@@ -73,6 +73,8 @@ compact_str = { version = "0.9", features = ["serde"] }
 opentelemetry-proto = { version = "0.32", features = ["logs", "gen-tonic", "with-serde"] }
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 prost = "0.14"
+tonic-types = "0.14"
+httpdate = "1"
 axum = "0.8"
 # axum-server with rustls support for the otlp_http TLS / mTLS path.
 # axum's bundled `axum::serve` is hardcoded to `TcpListener`; switching

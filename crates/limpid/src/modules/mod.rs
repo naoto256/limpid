@@ -434,7 +434,9 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// steady-state retry budget here — the runtime caps the entire
     /// shutdown sequence at `runtime::lifecycle::SHUTDOWN_TIMEOUT` (10s),
     /// and a retry loop that outlasts it will be killed mid-flight.
-    /// Use a single bounded attempt (e.g.
+    /// Use one bounded send round for batched outputs, including
+    /// immediate failover past permanent peers, or one bounded attempt
+    /// for unbatched outputs (e.g.
     /// `tokio::time::timeout(SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, ...)`)
     /// and route the unsent leftovers to the DLQ via
     /// `route_shutdown_batch_to_dlq`.
@@ -677,8 +679,9 @@ pub async fn finalize_shutdown_singleton_disposition_ambiguous(
     }
 }
 
-/// Shared shutdown-time disposition for a batch whose single best-effort
-/// send attempt failed (transport error or deadline elapsed). Every
+/// Shared shutdown-time disposition for a batch whose best-effort send
+/// round failed, or could not start because the deadline was exhausted.
+/// An in-flight timeout uses the separate ambiguous-send path. Every
 /// `(Event, QueueAckHandle)` entry is:
 ///
 /// 1. Routed to the DLQ when `error_log` is `Some`. A per-record DLQ

@@ -61,7 +61,7 @@ quoting does not bypass the protocol's name restrictions.
 | `batch_timeout` | no | `5s` | Flush deferred Events after this duration. |
 | `batch_level` | no | `none` | One of `none` / `resource` / `scope`. See [§ batch_level](#batch_level). |
 | `headers` | no | — | gRPC metadata added to every batch. Configured mixed-case keys (e.g. `Authorization`) are accepted and normalized to lowercase before sending; metadata name and value restrictions still apply. |
-| `retry { max_attempts initial_wait max_wait backoff }` | no | shared default (5 attempts, 1s → 60s exponential) | Per-flush retry budget. Inside one budget the rotation transparently picks the next available peer; the budget caps total attempts across all peers for a single batch. |
+| `retry { max_attempts initial_wait max_wait backoff }` | no | shared default (5 attempts, 1s → 60s exponential) | Per-flush retryable-failure round budget. Immediate failover past permanently failing peers can contact additional peers within a round. See [failure classification](./README.md#http-and-otlp-failure-classification). |
 
 ### peers
 
@@ -73,7 +73,15 @@ Each `peer` block configures one collector endpoint:
 | `tls.ca` | no | Custom CA certificate file (PEM) for this peer. Falls back to the system root store if omitted. |
 | `tls.cert`, `tls.key` | no (paired) | Client certificate and private key for mTLS, as separate PEM files (chmod 600 the key). Both must be present together. |
 
-On each flush, peers are tried in round-robin order. A peer that fails the request is marked cooled-down for ~5s and skipped on subsequent flushes until the cooldown expires. The cursor advances per flush so successive flushes start at successive peers; within one flush the `retry` budget protects against transient failures by rotating to the next available peer.
+Each send round starts at the next eligible peer, preferring peers whose
+cooldown has expired. Failures cool that peer for about 5 seconds. A
+permanent failure immediately fails over to another peer and excludes the
+failed peer for the rest of this batch. A retryable failure returns to the
+configured retry budget and backoff, retaining those exclusions. If all
+remaining peers are cooled, an eligible peer is still selected; cooldown
+never overrides a permanent exclusion. Recovery begins when every peer
+has failed permanently or the retryable-failure budget is exhausted. See
+[failure classification](./README.md#http-and-otlp-failure-classification).
 
 Every gRPC `Export` call is bounded by a 30s timeout. A peer that accepts the connection but never returns a HEADERS frame counts as a failure and yields to the next peer in the rotation.
 
@@ -93,15 +101,16 @@ Reaching `batch_size` wakes the flusher immediately; a current send or retry
 backoff completes before the next batch is sent. Otherwise, partial batches
 are sent when the current `batch_timeout` wait ends. Arrivals do not restart
 the wait.
-Failures retry the prepared batch; see [Queue and retry](./README.md#queue-and-retry)
+Retryable failures retry the prepared batch; see [Queue and retry](./README.md#queue-and-retry)
 for recovery and duplicate-delivery limits.
 
 ## Notes
 
-- `partial_success` on the response (rejected log records) bumps `events_failed` by the rejected count and attempts to save the trailing N events (where N = `rejected_log_records`) to a configured `control { error_log "..." }` as Output-flavor DLQ records with `reason = "collector reported partial_success rejection"`. The internal `retry { … }` block does not branch on `partial_success` — it retries the whole batch on transport failures only. Automatic retry of only rejected records is not supported.
+- `partial_success` on the response (rejected log records) bumps `events_failed` by the rejected count and attempts to save the trailing N events (where N = `rejected_log_records`) to a configured `control { error_log "..." }` as Output-flavor DLQ records with `reason = "collector reported partial_success rejection"`. The `retry { … }` block applies only to classified retryable failures, not a populated `partial_success` response. Automatic retry of only rejected records is not supported.
 - **`partial_success.rejected_log_records` attribution is approximate.** The OTLP response reports a rejected *count* for the batch, not the identity of each rejected log record. limpid resolves the accepted prefix as `Delivered` and routes the trailing N entries through the common [recovery and disposition contract](./README.md#disposition-contract). A saved DLQ copy requires a configured, successful write; the tail is not unconditionally `Recovered`. Treat those DLQ entries as a batch-level rejection split into per-event records for replay, not as proof that the collector selected those exact events — the collector did not identify them. Metric totals (`events_written`, `events_failed`) are accurate; per-event attribution is not.
 - On a transport-level **final** failure (retry budget exhausted), the drained batch is **not** restored to the in-memory buffer — all still-shippable events enter output recovery and `events_failed` is bumped accordingly. Output-flavor DLQ records are saved only when the configured `error_log` write succeeds.
 - Graceful shutdown uses a bounded final drain; see the common [disposition contract](./README.md#disposition-contract) and [shutdown guarantees and recovery limits](../operations/error-log.md#graceful-shutdown-guarantees-and-known-limitations).
+- Status classification and server delay hints — see [HTTP and OTLP failure classification](./README.md#http-and-otlp-failure-classification).
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).
 - Client TLS uses tonic's TLS integration (`ClientTlsConfig` backed by rustls with the ring provider). System root certificates are loaded via tonic's `tls-native-roots` feature; supply per-peer `tls { ca }` to add a custom CA on top.
 - For HTTP transport see [otlp_http](./otlp_http.md).

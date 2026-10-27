@@ -6,7 +6,14 @@ Each Event's `egress` is expected to be the singleton ResourceLogs protobuf byte
 
 > Why limpid's OTLP behaves the way it does — Resource attributes are source-adapter-owned rather than auto-detected, `partial_success` is not retried selectively, `batch_level` is wire-only and semantically null — is documented in [OTLP — design rationale](../otlp.md). The reference table below covers *how* to configure; the design page covers *why* the defaults are what they are.
 
-Redirects are not followed. All 3xx responses are failures and use the normal retry and DLQ path; errors include a sanitized `Location` destination when present (userinfo, query and fragment removed; capped at 200 characters plus a truncation marker). Configure the final endpoint directly.
+Redirects are not followed. A 3xx response permanently excludes that peer
+for the current batch: it is not retried on that peer, but another
+configured peer is tried immediately. The batch enters output recovery
+when every peer fails permanently or the retryable-failure budget is
+exhausted. Errors retain a sanitized `Location` when present (userinfo,
+query, and fragment removed; capped at 200 characters plus a truncation
+marker). Configure the final endpoint directly. See [failure classification](./README.md#http-and-otlp-failure-classification)
+and the [recovery contract](./README.md#recovery-error_log).
 
 ## Configuration
 
@@ -65,7 +72,7 @@ Quoting does not bypass HTTP name restrictions.
 | `batch_level` | no | `none` | One of `none` / `resource` / `scope`. See [§ batch_level](#batch_level). |
 | `headers` | no | — | HTTP request headers added to every batch. |
 | `verify` | no | `true` | Verify each peer's TLS certificate. `false` skips verification (development only). Applies to every peer. |
-| `retry { max_attempts initial_wait max_wait backoff }` | no | shared default (5 attempts, 1s → 60s exponential) | Per-flush retry budget. Inside one budget the rotation transparently picks the next available peer; the budget caps total attempts across all peers for a single batch. |
+| `retry { max_attempts initial_wait max_wait backoff }` | no | shared default (5 attempts, 1s → 60s exponential) | Per-flush retryable-failure round budget. Immediate failover past permanently failing peers can contact additional peers within a round. See [failure classification](./README.md#http-and-otlp-failure-classification). |
 
 ### peers
 
@@ -77,7 +84,15 @@ Each `peer` block configures one collector endpoint:
 | `tls.ca` | no | Custom CA certificate file (PEM) for this peer. Falls back to the system root store if omitted. |
 | `tls.cert`, `tls.key` | no (paired) | Client certificate and private key for mTLS, as separate PEM files (chmod 600 the key). Both must be present together. |
 
-On each flush, peers are tried in round-robin order. A peer that fails the request is marked cooled-down for ~5s and skipped on subsequent flushes until the cooldown expires. The cursor advances per flush so successive flushes start at successive peers; within one flush the `retry` budget protects against transient failures by rotating to the next available peer.
+Each send round starts at the next eligible peer, preferring peers whose
+cooldown has expired. Failures cool that peer for about 5 seconds. A
+permanent failure immediately fails over to another peer and excludes the
+failed peer for the rest of this batch. A retryable failure returns to the
+configured retry budget and backoff, retaining those exclusions. If all
+remaining peers are cooled, an eligible peer is still selected; cooldown
+never overrides a permanent exclusion. Recovery begins when every peer
+has failed permanently or the retryable-failure budget is exhausted. See
+[failure classification](./README.md#http-and-otlp-failure-classification).
 
 Every HTTP export is bounded by a 30s timeout (connect, TLS handshake, request send, response body). A peer that accepts the connection but never replies counts as a failure and yields to the next peer in the rotation.
 
@@ -154,7 +169,7 @@ Reaching `batch_size` wakes the flusher immediately; a current send or retry
 backoff completes before the next batch is sent. Otherwise, partial batches
 are sent when the current `batch_timeout` wait ends. Arrivals do not restart
 the wait.
-Failures retry the prepared batch; see [Queue and retry](./README.md#queue-and-retry)
+Retryable failures retry the prepared batch; see [Queue and retry](./README.md#queue-and-retry)
 for recovery and duplicate-delivery limits.
 
 ## Notes
@@ -166,5 +181,6 @@ for recovery and duplicate-delivery limits.
 - `verify false` skips certificate verification — development only. limpid emits a warning once per `https://` peer at startup when `verify false` is in effect so the misconfiguration is greppable in the daemon log. Has no effect on `http://` endpoints (no TLS to verify).
 - Graceful shutdown uses a bounded final drain; see the common [disposition contract](./README.md#disposition-contract) and [shutdown guarantees and recovery limits](../operations/error-log.md#graceful-shutdown-guarantees-and-known-limitations).
 - **`partial_success.rejected_log_records` attribution is approximate.** The OTLP response reports a rejected *count* for the batch, not the identity of each rejected log record. When the rejected count is non-zero, limpid resolves the accepted prefix as `Delivered` and routes the trailing N entries (where N = `rejected_log_records`) through the common [recovery and disposition contract](./README.md#disposition-contract). A saved DLQ copy requires a configured, successful write; the tail is not unconditionally `Recovered`. Treat those DLQ entries as a batch-level rejection split into per-event records for replay, not as proof that the collector selected those exact events — the collector did not identify them. Metric totals (`events_written`, `events_failed`) are accurate; per-event attribution is not.
+- Status classification and server delay hints — see [HTTP and OTLP failure classification](./README.md#http-and-otlp-failure-classification).
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).
 - For gRPC transport see [otlp_grpc](./otlp_grpc.md).
