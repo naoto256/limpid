@@ -9,7 +9,12 @@ limpid distinguishes two forms by where the implementation lives, but the call s
 | **Built-in primitive** (flat or namespaced) | Rust, ships with the daemon | [Built-in Functions](./expression-functions.md) |
 | **User-defined** (`def function`) | DSL, declared by the operator | [User-defined Functions](./user-defined.md) |
 
-Both use the same [call syntax](./expression-functions.md) — a call site like `f(args)` doesn't care whether `f` is a Rust primitive or an operator-authored DSL function. The analyzer arity-checks them uniformly, typos surface the same way (`unknown function`, near-match suggestion), and they're all callable from any expression context (process body, pipeline `if` condition, `output` template, HashLit value, function argument).
+Both use the same [call syntax](./expression-functions.md), and the analyzer
+checks arity for both forms. Unknown calls are diagnosed, but a near-match
+hint is not guaranteed: suggestion candidates come from flat built-in
+primitive names, not user-defined function names. Both forms can be called
+from expression contexts such as process bodies, pipeline conditions,
+output templates, object values, and function arguments.
 
 Where they differ:
 

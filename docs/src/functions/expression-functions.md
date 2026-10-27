@@ -19,7 +19,7 @@ This page is the reference for every built-in. Operators can also declare their 
 
 ## Call syntax
 
-Errors raised by these primitives (a `parse_json` on malformed input, a `regex_*` compile failure, …) propagate to the surrounding `try` block when one is in scope; without `try`, the error flows through the pipeline's error path and the event lands in the configured [error log](../operations/error-log.md) (DLQ), with `events_errored` incremented. The same routing applies to errors raised from inside user-defined functions and processes — primitive failure, [`error` statement](../processing/user-defined.md#error), or analyzer-detected runtime fault all share the one path.
+Errors raised by these primitives (a `parse_json` on malformed input, a `regex_*` compile failure, …) propagate to the surrounding `try` block when one is in scope; without `try`, the error follows the pipeline's error path: `events_errored` increments, and the daemon attempts to write the event to the configured [error log](../operations/error-log.md) (DLQ). A replayable file copy requires a successful write; without `error_log`, only a payload-free summary is logged. The same routing applies to errors raised from inside user-defined functions and processes — primitive failure, [`error` statement](../processing/user-defined.md#error), or analyzer-detected runtime fault all share the one path.
 
 ### Bare statements vs assignments
 

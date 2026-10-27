@@ -92,7 +92,7 @@ try {
 }
 ```
 
-Catches errors raised inside the `try` body — an unparseable `parse_json` input, a `to_int` overflow, a regex compile failure, or any other primitive that bails. The error message is bound to the reserved name `error` inside the `catch` block.
+Catches errors raised inside the `try` body — an unparseable `parse_json` input, a regex compile failure, or any other primitive that bails. The error message is bound to the reserved name `error` inside the `catch` block.
 
 ```limpid
 def process safe_parse_json {
@@ -142,7 +142,7 @@ def process parse_asa {
 }
 ```
 
-`drop` and `error` are deliberate opposites: `drop` is a silent discard (event counted as filtered-out, no DLQ entry), `error` is a loud signal (event preserved in the DLQ for operator inspection and replay). Reach for `error` when the parser hits vocabulary it does not handle — the loud-fail-fast policy that runs through the [snippet library](../snippets/README.md) is built on top of this statement.
+`drop` and `error` are deliberate opposites: `drop` is a silent discard (event counted as filtered-out, no DLQ entry), `error` is a loud signal that invokes error handling. A replayable DLQ copy requires a configured `error_log` and a successful write; without it, only a payload-free summary is logged. Reach for `error` when the parser hits vocabulary it does not handle — the loud-fail-fast policy that runs through the [snippet library](../snippets/README.md) is built on top of this statement.
 
 When `error` fires inside a `try` block, the catch body sees the message via the reserved name `error` — same surface as any other primitive that bails — so `try { ... error "msg" ... } catch { workspace.failure_reason = error }` works as expected.
 

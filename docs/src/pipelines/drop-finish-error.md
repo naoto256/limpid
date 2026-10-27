@@ -100,7 +100,7 @@ def pipeline main {
 | `drop` | `events_dropped` |
 | `finish` or end of pipeline (with output) | `events_finished` |
 | `finish` or end of pipeline (no output) | `events_discarded` |
-| `error "..."` (explicit) or process raised a runtime error | `events_errored` (+ DLQ write) |
+| `error "..."` (explicit) or process raised a runtime error | `events_errored` (+ configured error-log handling) |
 
 `events_discarded` indicates a possible misconfiguration — the event went through the pipeline but was never sent anywhere.
 
@@ -109,7 +109,18 @@ def pipeline main {
 - **Process body runtime errors** — regex compile failure, unknown identifier at runtime, type mismatch, or an explicit `error` statement inside a `def process` body.
 - **Pipeline-skeleton expression-evaluation errors and output enqueue failures** — failure to evaluate the condition expression of an `if` / `switch` / `error` at the pipeline level, plus output enqueue failures (queue closed, disk write error, unknown output).
 
-In every case the event is *not* forwarded downstream — at the failure point the runtime has no way to produce a correct egress, and forwarding the original `ingress` would silently turn wrap / enrichment bugs into data-shape regressions at the receiving SIEM. Instead, the event is routed to the [error log](../operations/error-log.md) so operators can inspect, fix the offending config, and replay.
+A process error stops further pipeline evaluation without forwarding the
+original `ingress` as a substitute result. Copies captured by earlier
+`output` statements are still handed to their queues. A pipeline-level
+expression error (in `if`, `switch`, or `error <expr>`) instead aborts that
+run before queue handoff, discarding its earlier captured output copies.
+An output enqueue failure affects the failed copy, while handoff to other
+outputs continues and successful copies remain queued. Each failed output
+gets its own Output-flavor recovery attempt. Process failures use the
+Process flavor. A replayable [error-log](../operations/error-log.md) record
+requires a configured `error_log` and a successful write. If `error_log`
+is unset, only a payload-free summary is logged; `error_log_fallback`
+applies only when a configured recovery-file write fails.
 
 `events_errored_unwritable` is the subset where the DLQ write itself failed (disk full, permissions, rotation race). The tracing line the runtime emits on that path is shaped by the operator's `error_log_fallback` [ladder](../operations/error-log.md#tracing-fallback-ladder-error_log_fallback) — payload-free summary by default, `"meta"` / `"full"` only on explicit opt-in — so the counter is the operator alarm signal for the loss rather than a durable trace of the payload, and a non-zero value means the replay path may be incomplete regardless of the ladder state.
 

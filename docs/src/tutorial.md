@@ -279,10 +279,13 @@ This is a bigger change than anything we have done so far — a new global block
 
 `limpid --check` parses the whole configuration, resolves every reference between modules and pipelines, and reports the first thing that doesn't add up — without binding any sockets or touching the running daemon.
 
+The diagnostic excerpt below omits the trailing guidance after the unknown
+process name; `…` marks the omitted text.
+
 ```bash
 $ limpid --check --config /etc/limpid/limpid.conf
 checking /etc/limpid/limpid.conf: 10 file(s), 1 input(s), 2 output(s), 24 process(es), 1 pipeline(s)
-Error: pipeline 'main': references unknown process 'dedup_fortigate_trafic'. Built-in processes were removed in v0.3.0 — use a DSL function (e.g. `syslog.parse(ingress)` as a statement) or define your own with `def process { ... }`.
+Error: pipeline 'main': references unknown process 'dedup_fortigate_trafic'. …
 ```
 
 Caught it. The pipeline reference is missing an `f` in `traffic`. Fix the typo in `pipelines/main.limpid`, run `--check` again:
