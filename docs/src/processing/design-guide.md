@@ -65,7 +65,8 @@ Every process has an implicit contract with its neighbours in the pipeline: *wha
 The shipped snippet pack declares its public surface in the canonical header
 schema: a file-level `Facade` plus adjacent per-member `Summary`, `Reads`,
 `Writes`, or `Signature` contracts described
-in the [authoring guide](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions).
+in the **Authoring conventions** section of the
+[contributor guide](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md).
 Inside a large file, private leaf-local `@requires` / `@produces` comments may
 add useful detail, but they do not replace a facade member block and the
 analyzer does not consume them.

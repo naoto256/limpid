@@ -100,7 +100,8 @@ before customising it; package upgrades replace files under
 See the [pack
 README](https://github.com/naoto256/limpid/blob/main/packaging/snippets/README.md#slot-registry--composed-layer)
 for the full composed / shed slot registries and the LSIS layer
-contracts. The [authoring guide](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions)
+contracts. The **Authoring conventions** section of the
+[contributor guide](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md)
 defines the header schema: each file declares a `Facade`, and every listed
 process or function has an adjacent contract block.
 Private dispatch leaves remain unlisted and need no public header.
@@ -301,7 +302,8 @@ conventions are:
   `Test corpus`; composer, filter, and function files declare `Facade` and
   `Test corpus`. Each public process declares `Process`, `Summary`, `Reads`,
   and `Writes`; each public function declares `Function`, `Summary`, and
-  `Signature`. See [authoring conventions](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md#authoring-conventions).
+  `Signature`. See **Authoring conventions** in the
+  [contributor guide](https://github.com/naoto256/limpid/blob/main/CONTRIBUTING.md).
   Keep samples anonymised with documentation domains and RFC 5737 addresses.
 - **Two-tier dispatch**: the top-level `def process parse_<vendor>`
   strips the wrapper and routes by header field (`switch
