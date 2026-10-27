@@ -204,6 +204,21 @@ pub(crate) struct SendState {
     permanent_errors: Vec<String>,
 }
 
+impl SendState {
+    fn include_permanent_causes(&self, error: anyhow::Error) -> anyhow::Error {
+        if self.permanent_errors.is_empty() {
+            error
+        } else {
+            // Shutdown DLQ helpers display only the outer error, so keep
+            // every cause in that display as well as steady-state reasons.
+            anyhow::anyhow!(
+                "previous permanent peer failures: {}; last failure: {error:#}",
+                self.permanent_errors.join("; ")
+            )
+        }
+    }
+}
+
 /// Permanent failures skip that peer for this batch and immediately try
 /// another. Retryable failures return to the actor for bounded pacing.
 pub(crate) async fn send_with_peer_failover<T, F, Fut>(
@@ -254,8 +269,8 @@ where
 
 /// The per-transport surface of a batched output. Everything the
 /// skeleton cannot know: payload rendering, batch preparation, and
-/// one send attempt (including peer selection + cooldown, typically
-/// via `syslog_peers::RotatingPeers`).
+/// one send round (including immediate failover past permanent peers,
+/// selection and cooldown via `syslog_peers::RotatingPeers`).
 #[async_trait::async_trait]
 pub(crate) trait BatchSinkPolicy: Send + Sync + 'static {
     /// Per-event payload buffered until flush.
@@ -977,6 +992,11 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 }
             }
         };
+        let final_err = if permanent_failure {
+            final_err
+        } else {
+            send_state.include_permanent_causes(final_err)
+        };
         self.metrics.in_retry.set(0);
         // Terminal disposition: split by why we left the loop.
         //
@@ -1031,11 +1051,12 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         }
     }
 
-    /// Shutdown single-attempt flush; never uses the steady-state retry
+    /// Shutdown single-round flush; never uses the steady-state retry
     /// budget. Render failures route per-event to DLQ as before,
     /// partial successes are honoured (the rejected tail goes to DLQ
     /// with the `partial_success` reason — distinct from transport
-    /// failure), and the shippable subset gets one send attempt
+    /// failure), and the shippable subset gets one send round with
+    /// immediate failover past permanent peers,
     /// wrapped in `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`. The `shippable`
     /// vector is held in this frame across the `timeout()` boundary so
     /// an `Elapsed` outcome does NOT drop it — otherwise the inner
@@ -1091,7 +1112,13 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 self.resolve_send_success(shippable, outcome).await;
             }
             Ok(Err(send_err)) => {
-                let err = anyhow::anyhow!("transport error: {}", send_err);
+                let err = match send_err {
+                    SendError::Retryable { error, .. } => {
+                        send_state.include_permanent_causes(error)
+                    }
+                    SendError::Permanent(error) => error,
+                };
+                let err = anyhow::anyhow!("transport error: {err:#}");
                 crate::modules::route_shutdown_batch_to_dlq(
                     self.error_log.as_ref(),
                     self.error_log_fallback,
@@ -1112,6 +1139,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     "deadline exceeded after {:?} during shutdown flush",
                     crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
                 );
+                let err = send_state.include_permanent_causes(err);
                 crate::modules::route_shutdown_batch_ambiguous_to_dlq(
                     self.error_log.as_ref(),
                     self.error_log_fallback,

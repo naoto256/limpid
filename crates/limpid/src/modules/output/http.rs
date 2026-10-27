@@ -534,13 +534,12 @@ impl BatchSinkPolicy for HttpSinkPolicy {
         }
     }
 
-    /// One send attempt against the next rotation candidate. A peer
-    /// that fails is cooled down for `PEER_COOLDOWN` and skipped on
-    /// subsequent sends; when every peer is cooled the rotation falls
-    /// back to the cursor start — the skeleton's per-flush retry loop
-    /// then handles longer-term re-delivery without dropping the
-    /// batch. Plain HTTP has no partial-success concept, so success
-    /// reports `rejected: 0` (= the whole batch is Delivered).
+    /// One send round, immediately failing over past permanent peers.
+    /// The batch excludes those peers on later rounds. Retryable
+    /// failures return to the skeleton's per-flush retry loop;
+    /// `RotatingPeers` manages selection and cooldown. Plain HTTP
+    /// has no partial-success concept, so success reports
+    /// `rejected: 0` (= the whole batch is Delivered).
     async fn send(&self, body: &Vec<u8>, state: &mut SendState) -> Result<SendOutcome, SendError> {
         send_with_peer_failover(&self.rotation, state, |idx| async move {
             send_once(&self.peers[idx], self, body)
@@ -1212,6 +1211,110 @@ mod tests {
             for server in servers {
                 server.abort();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_peer_failures_keep_both_causes_after_retry_exhaustion() {
+        assert_mixed_peer_failure_causes(false).await;
+    }
+
+    #[tokio::test]
+    async fn mixed_peer_failures_keep_both_causes_at_shutdown() {
+        assert_mixed_peer_failure_causes(true).await;
+    }
+
+    async fn assert_mixed_peer_failure_causes(shutdown: bool) {
+        use axum::{Router, http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut servers = Vec::new();
+        let mut urls = Vec::new();
+        let mut counts = Vec::new();
+        for code in [StatusCode::BAD_REQUEST, StatusCode::SERVICE_UNAVAILABLE] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            urls.push(format!("http://{}/", listener.local_addr().unwrap()));
+            let count = Arc::new(AtomicUsize::new(0));
+            counts.push(Arc::clone(&count));
+            let app = Router::new().route(
+                "/",
+                post(move || {
+                    let count = Arc::clone(&count);
+                    async move {
+                        count.fetch_add(1, Ordering::Relaxed);
+                        code
+                    }
+                }),
+            );
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let dlq_path = dir.path().join("mixed-failures.jsonl");
+        let ctx = crate::modules::BuildContext {
+            error_log: Some(Arc::new(crate::error_log::ErrorLogWriter::new(
+                dlq_path.clone(),
+            ))),
+            ..crate::modules::BuildContext::for_testing()
+        };
+        let mut retry = fast_retry_block();
+        if let Property::Block { properties, .. } = &mut retry {
+            properties[0] = prop_int("max_attempts", 3);
+        }
+        let output = HttpOutput::from_properties(
+            "mixed-failures",
+            &mp(&[
+                peers_block_with(urls.iter().map(|url| peer_block(url)).collect()),
+                prop_int("batch_size", 1),
+                retry,
+            ]),
+            &ctx,
+        )
+        .unwrap();
+        let original = event_with("mixed-failure-payload");
+        let disposition = if shutdown {
+            let (ack, mut rx) = QueueAckHandle::for_test();
+            output.sink.consume_shutdown(&original, ack).await.unwrap();
+            output.sink.shutdown().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+        } else {
+            consume_and_wait_disposition(&output, &original, Duration::from_secs(2))
+                .await
+                .unwrap()
+        };
+        assert_eq!(disposition, crate::queue::AckDisposition::Recovered);
+        assert_eq!(
+            counts
+                .iter()
+                .map(|n| n.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            [1, if shutdown { 1 } else { 3 }]
+        );
+        let contents = tokio::fs::read_to_string(&dlq_path).await.unwrap();
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0]["event"]["key"],
+            original.key().hyphenated().to_string()
+        );
+        assert_eq!(records[0]["event"]["egress"], "mixed-failure-payload");
+        let reason = records[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("previous permanent peer failures: peer 0:"));
+        if !shutdown {
+            assert!(reason.starts_with("flush failed after 3 attempts:"));
+        }
+        assert!(reason.contains(&format!("{} returned 400", urls[0])));
+        assert!(reason.contains(&format!("http output: {} returned 503", urls[1])));
+        output.sink.shutdown().await.unwrap();
+        for server in servers {
+            server.abort();
         }
     }
 

@@ -88,6 +88,12 @@ If every peer fails permanently, the recovery reason includes each peer's
 permanent failure summary. HTTP 400, 408, and 500, for example, visit each
 peer at most once per batch while preserving failover to healthy peers.
 
+Recovery reasons also retain earlier permanent peer failures alongside the
+last retryable failure when the round budget is exhausted. The same
+causes remain available if a later send is cancelled or times out,
+including during the bounded shutdown round. A saved DLQ copy still
+requires a configured, successful `error_log` write.
+
 ### Disposition contract
 
 Every event handed to an output resolves to one of three dispositions:

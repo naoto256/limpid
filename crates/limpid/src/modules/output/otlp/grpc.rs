@@ -382,7 +382,8 @@ impl BatchSinkPolicy for OtlpGrpcSinkPolicy {
         decode_drained_to_request(drained, self.batch_level)
     }
 
-    /// One send attempt against the next rotation candidate; see
+    /// One send round, immediately failing over past permanent peers.
+    /// The batch excludes those peers on later rounds. See
     /// `RotatingPeers` for the selection + cooldown contract
     /// (cooldown is measured from failure time so a slow 30s
     /// GRPC_REQUEST_TIMEOUT failure cannot record an already-expired
